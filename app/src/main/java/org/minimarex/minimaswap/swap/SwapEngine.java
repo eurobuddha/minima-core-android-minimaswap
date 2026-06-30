@@ -193,56 +193,88 @@ public final class SwapEngine {
     /** Probe both legs on-chain for one swap and report a plain-language status (why it's stuck / where it is). */
     public void inspect(String hash, InspectCb cb) {
         if (!ready()) { ui.post(() -> cb.report(java.util.Collections.singletonList("Wallet/node not ready yet — open the app and wait a moment."))); return; }
-        io.execute(() -> {
-            java.util.List<String> L = new java.util.ArrayList<>();
-            try {
-                SwapDb.Swap s = db.getSwap(hash);
-                if (s == null) { ui.post(() -> cb.report(java.util.Collections.singletonList("No record of this swap."))); return; }
-                boolean sell = "MINIMA_TO_ERC20".equals(s.direction);   // I sold MINIMA → counter leg is ETH USDT
-                boolean secretKnown = db.getSecret(hash) != null;
-                L.add((sell ? "Sell " : "Buy ") + s.sellAmount + " " + s.sellToken + " → " + s.buyAmount + " " + s.buyToken
-                        + "  ·  " + s.status.toLowerCase());
-
-                EthHtlc eth = new EthHtlc(rpc, wallet.creds(), net);
-
-                // my leg
-                if (s.myLegIsMinima) {
-                    L.add("• Your " + s.sellAmount + " MINIMA: locked — refundable at block " + s.myTimelock
-                            + (SwapDb.ST_REFUNDED.equals(s.status) ? " (refunded)" : ""));
-                } else {
-                    boolean stillLocked = eth.canCollect(s.contractId);
-                    L.add("• Your " + s.sellAmount + " " + s.sellToken + ": " + (stillLocked ? "locked on Ethereum" : "claimed or refunded"));
-                }
-
-                // counterparty leg — read by deterministic contractId via getContract (no eth_getLogs)
-                if (sell) {
-                    EthHtlc.Contract gc = eth.getContract(EthHtlc.contractId(hash));
-                    if (gc == null) {
-                        L.add("• Counterparty " + s.buyToken + " leg: NOT FOUND yet — the maker hasn't locked it, or your node hasn't seen it.");
-                    } else {
-                        boolean claimable = !gc.withdrawn && !gc.refunded;
-                        L.add("• Counterparty " + s.buyToken + " leg: FOUND " + EthWallet.format(gc.amount, decimalsOf(gc.tokenContract), 6)
-                                + " " + s.buyToken + (claimable ? " — claimable now" : (gc.withdrawn ? " — withdrawn (complete)" : " — refunded")));
-                        if (claimable) L.add("→ Claiming now (or tap Check now). Your " + s.buyToken + " arrives shortly.");
-                        else if (gc.refunded) L.add("→ The maker's leg timed out and was refunded; your MINIMA auto-refunds at block " + s.myTimelock + ".");
+        final SwapDb.Swap s = db.getSwap(hash);
+        if (s == null) { ui.post(() -> cb.report(java.util.Collections.singletonList("No record of this swap."))); return; }
+        // Read the Minima side first (async node.cmd), then the ETH side (blocking, on io), then report.
+        minima.currentBlock(new MinimaHtlc.BlockCb() {
+            @Override public void ok(int block) {
+                minima.scanMyHtlcCoins(coins -> {
+                    JSONObject myMinimaCoin = null, counterMinimaCoin = null;
+                    for (int i = 0; i < coins.length(); i++) {
+                        JSONObject c = coins.optJSONObject(i);
+                        if (c == null || !MinimaHtlc.normKey(MinimaHtlc.stateAt(c, 5)).equals(MinimaHtlc.normKey(hash))) continue;
+                        if (isMyOwnedKey(MinimaHtlc.stateAt(c, 0))) myMinimaCoin = c;        // a coin I locked
+                        if (isMyPublishKey(MinimaHtlc.stateAt(c, 4))) counterMinimaCoin = c; // a coin locked to me
                     }
-                } else {
-                    L.add("• Counterparty MINIMA leg: " + (secretKnown ? "secret known — claiming" : "waiting for the maker to lock / reveal the secret."));
-                }
-
-                L.add("• Secret: " + (secretKnown ? "known (you can claim)" : "not revealed yet"));
-
-                for (SwapDb.Event e : db.getEvents(hash)) {
-                    String n = e.note == null ? "" : e.note.toLowerCase();
-                    if (n.contains("mismatch") || n.contains("invalid") || n.contains("incorrect")
-                            || n.contains("too close") || n.contains("fail")) L.add("⚠ " + e.note);
-                }
-            } catch (Exception e) {
-                L.add("Check failed (RPC/node): " + e.getMessage());
+                    final JSONObject myMin = myMinimaCoin, cpMin = counterMinimaCoin;
+                    io.execute(() -> reportInspection(s, hash, block, myMin, cpMin, cb));
+                }, err -> io.execute(() -> reportInspection(s, hash, block, null, null, cb)));
             }
-            final java.util.List<String> out = L;
-            ui.post(() -> cb.report(out));
+            @Override public void err(String m) { io.execute(() -> reportInspection(s, hash, -1, null, null, cb)); }
         });
+    }
+
+    /** [io] compose the inspection report from the Minima coins (already scanned) + a live ETH getContract read. */
+    private void reportInspection(SwapDb.Swap s, String hash, int block, JSONObject myMin, JSONObject cpMin, InspectCb cb) {
+        java.util.List<String> L = new java.util.ArrayList<>();
+        try {
+            boolean sell = "MINIMA_TO_ERC20".equals(s.direction);   // I sold MINIMA → counter leg is ETH USDT
+            boolean secretKnown = db.getSecret(hash) != null;
+            L.add((sell ? "Sell " : "Buy ") + s.sellAmount + " " + s.sellToken + " → " + s.buyAmount + " " + s.buyToken
+                    + "  ·  " + s.status.toLowerCase());
+            EthHtlc eth = new EthHtlc(rpc, wallet.creds(), net);
+
+            // ---- my leg ----
+            if (s.myLegIsMinima) {
+                if (myMin != null) {
+                    int tl = parseInt(MinimaHtlc.stateAt(myMin, 3));
+                    L.add("• Your " + s.sellAmount + " MINIMA: LOCKED — refundable at block " + tl
+                            + (block > 0 ? " (~" + Math.max(0, (tl - block)) * 50 / 60 + " min)" : ""));
+                } else {
+                    L.add("• Your " + s.sellAmount + " MINIMA: not locked on-chain now — "
+                            + (SwapDb.ST_REFUNDED.equals(s.status) ? "refunded" : SwapDb.ST_COMPLETE.equals(s.status) ? "claimed by the counterparty (complete)" : "spent/claimed"));
+                }
+            } else {
+                boolean stillLocked = eth.canCollect(s.contractId);
+                L.add("• Your " + s.sellAmount + " " + s.sellToken + ": " + (stillLocked ? "LOCKED on Ethereum" : "claimed or refunded"));
+            }
+
+            // ---- counterparty leg ----
+            if (sell) {
+                // counter = ETH USDT to me — read by deterministic contractId (no eth_getLogs)
+                EthHtlc.Contract gc = eth.getContract(EthHtlc.contractId(hash));
+                if (gc == null) {
+                    L.add("• Counterparty " + s.buyToken + " leg: NOT FOUND yet — the maker hasn't locked it.");
+                } else {
+                    boolean claimable = !gc.withdrawn && !gc.refunded;
+                    L.add("• Counterparty " + s.buyToken + " leg: FOUND " + EthWallet.format(gc.amount, decimalsOf(gc.tokenContract), 6)
+                            + " " + s.buyToken + (claimable ? " — claimable now" : (gc.withdrawn ? " — withdrawn (complete)" : " — refunded")));
+                    if (claimable) L.add("→ Claiming on the next poll — your " + s.buyToken + " arrives shortly.");
+                    else if (gc.refunded) L.add("→ Maker's leg timed out & refunded; your MINIMA auto-refunds at block " + s.myTimelock + ".");
+                }
+            } else {
+                // counter = MINIMA to me — real on-chain check of the maker's lock
+                if (cpMin != null) {
+                    L.add("• Counterparty MINIMA leg: FOUND " + cpMin.optString("amount", "?") + " MINIMA — "
+                            + (secretKnown ? "claimable now (claiming on the next poll)" : "waiting for the secret"));
+                } else {
+                    L.add("• Counterparty MINIMA leg: NOT FOUND yet — the maker hasn't locked MINIMA (or it's <2 confirmations old).");
+                }
+            }
+
+            L.add("• Secret: " + (secretKnown ? "known (you can claim)" : "not revealed yet"));
+            for (SwapDb.Event e : db.getEvents(hash)) {
+                String n = e.note == null ? "" : e.note.toLowerCase();
+                if (n.contains("mismatch") || n.contains("invalid") || n.contains("incorrect")
+                        || n.contains("too close") || n.contains("fail")) L.add("⚠ " + e.note);
+            }
+            if (!SwapDb.ST_COMPLETE.equals(s.status) && !SwapDb.ST_REFUNDED.equals(s.status))
+                L.add("(swaps take a few minutes — ~90s polls + 2 confirmations + on-phone PoW per step)");
+        } catch (Exception e) {
+            L.add("Check failed (RPC/node): " + e.getMessage());
+        }
+        final java.util.List<String> out = L;
+        ui.post(() -> cb.report(out));
     }
 
     // ============================================================ watcher poll
