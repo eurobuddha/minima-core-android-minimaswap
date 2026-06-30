@@ -8,7 +8,7 @@ package org.minimarex.minimaswap.eth;
 public enum EthNet {
 
     MAINNET("Ethereum", 1L,
-            "https://eth.llamarpc.com",
+            "https://ethereum-rpc.publicnode.com",
             "0x67376c3bf3b5a336b14398920cfbc292013718ea",
             "https://etherscan.io/tx/",
             new Token[]{

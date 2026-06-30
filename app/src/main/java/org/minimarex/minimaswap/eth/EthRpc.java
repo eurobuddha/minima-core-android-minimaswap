@@ -19,14 +19,49 @@ import java.nio.charset.StandardCharsets;
  */
 public final class EthRpc {
 
-    private volatile String url;
+    /** Keyless mainnet endpoints to fall back to when the primary is down/rate-limited (verified live).
+     *  A single public node returning a 5xx/HTML body must not block reads or broadcasts. */
+    private static final String[] FALLBACKS = {
+            "https://ethereum-rpc.publicnode.com",
+            "https://eth.drpc.org",
+            "https://1rpc.io/eth",
+    };
 
-    public EthRpc(String url) { this.url = url; }
-    public void setUrl(String url) { this.url = url; }
+    private volatile String url;             // the endpoint that last worked (sticky)
+    private final java.util.List<String> endpoints = new java.util.ArrayList<>();
+
+    public EthRpc(String url) { setUrl(url); }
+
+    public synchronized void setUrl(String url) {
+        this.url = url;
+        endpoints.clear();
+        java.util.LinkedHashSet<String> set = new java.util.LinkedHashSet<>();
+        set.add(url);                                  // configured primary first
+        for (String f : FALLBACKS) set.add(f);         // then the known-good keyless nodes
+        endpoints.addAll(set);
+    }
+
     public String url() { return url; }
 
-    /** Raw JSON-RPC call. Returns the {@code result} node (String for scalars, JSONArray/JSONObject otherwise). */
+    /**
+     * Raw JSON-RPC call with endpoint fallback. Tries the active endpoint, then each fallback, on any
+     * transport/parse failure (e.g. a 521/HTML body); the first that answers becomes the active one.
+     */
     public Object call(String method, JSONArray params) throws IOException {
+        IOException last = null;
+        for (String ep : endpoints) {
+            try {
+                Object r = callOnce(ep, method, params);
+                if (!ep.equals(url)) url = ep;         // stick to whichever responded
+                return r;
+            } catch (IOException e) {
+                last = e;                               // try the next endpoint
+            }
+        }
+        throw last != null ? last : new IOException("ETH RPC " + method + ": no endpoint responded");
+    }
+
+    private Object callOnce(String url, String method, JSONArray params) throws IOException {
         HttpURLConnection c = null;
         try {
             JSONObject payload = new JSONObject()
