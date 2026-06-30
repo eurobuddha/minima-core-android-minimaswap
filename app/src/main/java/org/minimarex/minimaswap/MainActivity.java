@@ -14,6 +14,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.InputFilter;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
@@ -115,6 +116,7 @@ public class MainActivity extends AppCompatActivity {
     private ScrollView scroller;
     private View pairingBanner;
     private boolean watching = false;
+    private boolean modalOpen = false;   // suppress background render() while a dialog (with inputs) is open
 
     private final Runnable watchTick = new Runnable() {
         @Override public void run() {
@@ -401,6 +403,7 @@ public class MainActivity extends AppCompatActivity {
             min.put(sym, numRow(box, "min MINIMA", p.min));
         }
 
+        modalOpen = true;
         new AlertDialog.Builder(this)
                 .setTitle("My order / rates")
                 .setView(wrapScroll(box))
@@ -414,10 +417,30 @@ public class MainActivity extends AppCompatActivity {
                     }
                     saveOrder(o);
                     toast("Order saved");
-                    render();
                 })
                 .setNegativeButton("Cancel", null)
+                .setOnDismissListener(d -> { modalOpen = false; render(); })
                 .show();
+    }
+
+    /**
+     * Configure an EditText for decimal entry that the Samsung keyboard can't scramble.
+     *
+     * The "0.0054 → 0.0045 / cursor jumps" bug is the IME's composing/predictive region: on a
+     * {@code numberDecimal} field, Samsung's keyboard keeps a composing region and re-commits keystrokes
+     * out of order. {@code TYPE_TEXT_VARIATION_VISIBLE_PASSWORD} forces immediate-commit with no
+     * composing/autocorrect (the reliable cure), and the InputFilter keeps it to one decimal number.
+     * (Suppressing the periodic refresh — what the limit app tried — does NOT fix this.)
+     */
+    private void decimalInput(EditText e) {
+        e.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+        e.setTransformationMethod(null);   // visible-password must still show the digits, not dots
+        e.setFilters(new InputFilter[]{ (source, start, end, dest, dstart, dend) -> {
+            String result = dest.toString().substring(0, dstart)
+                    + source.subSequence(start, end)
+                    + dest.toString().substring(dend);
+            return (result.isEmpty() || result.matches("[0-9]*\\.?[0-9]*")) ? null : "";
+        }});
     }
 
     private EditText numRow(LinearLayout parent, String label, double value) {
@@ -426,7 +449,7 @@ public class MainActivity extends AppCompatActivity {
         r.setGravity(Gravity.CENTER_VERTICAL);
         TextView t = new TextView(this); t.setText(label); t.setTextColor(Design.DIM); t.setTextSize(13f);
         EditText e = new EditText(this);
-        e.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        decimalInput(e);
         e.setText(trim(value)); e.setTextColor(Design.TEXT); e.setTextSize(14f); e.setGravity(Gravity.END);
         r.addView(t, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         r.addView(e, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
@@ -455,7 +478,7 @@ public class MainActivity extends AppCompatActivity {
 
         final EditText amt = new EditText(this);
         amt.setHint(inLabel);
-        amt.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        decimalInput(amt);
         amt.setTextColor(Design.TEXT); amt.setHintTextColor(Design.DIM2);
         box.addView(amt);
 
@@ -468,6 +491,7 @@ public class MainActivity extends AppCompatActivity {
             out.setText(counter == null ? "" : "You receive ≈ " + counter + " " + outUnit);
         }));
 
+        modalOpen = true;
         new AlertDialog.Builder(this)
                 .setTitle("Swap with " + Util.shorten(maker.signerPk))
                 .setView(box)
@@ -478,6 +502,7 @@ public class MainActivity extends AppCompatActivity {
                     startSwap(maker, symbol, buyToken, input, counter);
                 })
                 .setNegativeButton("Cancel", null)
+                .setOnDismissListener(d -> { modalOpen = false; render(); })
                 .show();
     }
 
@@ -513,6 +538,10 @@ public class MainActivity extends AppCompatActivity {
     // ---- UI ----
 
     private void render() {
+        // Never rebuild the view tree while a dialog with text inputs is open — a background render
+        // (watcher / balance callback) restarts the IME and resets the cursor mid-typing. We re-render
+        // once when the dialog dismisses.
+        if (modalOpen) return;
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         col.setPadding(dp(16), dp(14), dp(16), dp(24));
