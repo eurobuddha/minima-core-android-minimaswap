@@ -138,6 +138,44 @@ public final class EthHtlc {
         return EthRpc.hexToBig(ret).signum() != 0;
     }
 
+    /**
+     * Read a contract's full state by id via the {@code getContract} VIEW — an {@code eth_call} (current
+     * state), NOT {@code eth_getLogs}, so it works on free/keyless RPCs that gate archive log queries.
+     * Because {@code contractId = sha256(hashlock)} is deterministic, this lets us find a leg, check
+     * withdrawn/refunded, and read the revealed {@code preimage} (secret) without ever scanning logs.
+     * Returns null if the contract doesn't exist (zero sender).
+     */
+    public Contract getContract(String contractId) throws Exception {
+        Function f = new Function("getContract",
+                Collections.singletonList(new Bytes32(b32(contractId))),
+                Arrays.asList(
+                        new TypeReference<Address>() {}, new TypeReference<Bytes32>() {}, new TypeReference<Address>() {},
+                        new TypeReference<Address>() {}, new TypeReference<Uint256>() {}, new TypeReference<Uint256>() {},
+                        new TypeReference<Bytes32>() {}, new TypeReference<Uint256>() {}, new TypeReference<Bool>() {},
+                        new TypeReference<Bool>() {}, new TypeReference<Bytes32>() {}, new TypeReference<Bool>() {}));
+        String ret = rpc.ethCall(net.htlc, FunctionEncoder.encode(f));
+        if (ret == null || ret.length() < 3) return null;
+        List<Type> d = FunctionReturnDecoder.decode(ret, f.getOutputParameters());
+        if (d.size() < 12) return null;
+        String sender = (String) d.get(0).getValue();
+        if (sender == null || EthRpc.hexToBig(sender).signum() == 0) return null;   // zero address = no such contract
+        Contract c = new Contract();
+        c.contractId = contractId.startsWith("0x") ? contractId : "0x" + contractId;
+        c.owner = sender;
+        c.minimaPublicKey = Numeric.toHexString((byte[]) d.get(1).getValue());
+        c.receiver = (String) d.get(2).getValue();
+        c.tokenContract = (String) d.get(3).getValue();
+        c.amount = (BigInteger) d.get(4).getValue();
+        c.requestAmount = (BigInteger) d.get(5).getValue();
+        c.hashlock = Numeric.toHexString((byte[]) d.get(6).getValue());
+        c.timelock = ((BigInteger) d.get(7).getValue()).longValue();
+        c.withdrawn = (Boolean) d.get(8).getValue();
+        c.refunded = (Boolean) d.get(9).getValue();
+        c.preimage = Numeric.toHexString((byte[]) d.get(10).getValue());
+        c.otc = (Boolean) d.get(11).getValue();
+        return c;
+    }
+
     /** A decoded HTLCERC20New event — one locked ETH leg, discovered by scanning. Mirrors parseHTLCContractData. */
     public static final class Contract {
         public long block;
@@ -152,6 +190,9 @@ public final class EthHtlc {
         public String hashlock;       // 0x…
         public long timelock;         // unix seconds
         public boolean otc;
+        public boolean withdrawn;     // (getContract only) claimed
+        public boolean refunded;      // (getContract only) refunded
+        public String preimage;       // (getContract only) the revealed secret, once withdrawn
     }
 
     /** New-contract events where I am the RECEIVER (legs I can claim/respond to). */

@@ -197,7 +197,6 @@ public final class SwapEngine {
                         + "  ·  " + s.status.toLowerCase());
 
                 EthHtlc eth = new EthHtlc(rpc, wallet.creds(), net);
-                long ethBlock = rpc.blockNumber().longValue();
 
                 // my leg
                 if (s.myLegIsMinima) {
@@ -208,21 +207,17 @@ public final class SwapEngine {
                     L.add("• Your " + s.sellAmount + " " + s.sellToken + ": " + (stillLocked ? "locked on Ethereum" : "claimed or refunded"));
                 }
 
-                // counterparty leg
+                // counterparty leg — read by deterministic contractId via getContract (no eth_getLogs)
                 if (sell) {
-                    long from = Math.max(0, ethBlock - 5000);
-                    EthHtlc.Contract found = null;
-                    for (EthHtlc.Contract c : eth.contractsAsReceiver(BigInteger.valueOf(from), BigInteger.valueOf(ethBlock))) {
-                        if (MinimaHtlc.normKey(c.hashlock).equals(MinimaHtlc.normKey(hash))) { found = c; break; }
-                    }
-                    if (found == null) {
+                    EthHtlc.Contract gc = eth.getContract(EthHtlc.contractId(hash));
+                    if (gc == null) {
                         L.add("• Counterparty " + s.buyToken + " leg: NOT FOUND yet — the maker hasn't locked it, or your node hasn't seen it.");
                     } else {
-                        boolean collectable = eth.canCollect(found.contractId);
-                        L.add("• Counterparty " + s.buyToken + " leg: FOUND " + EthWallet.format(found.amount, decimalsOf(found.tokenContract), 6)
-                                + " " + s.buyToken + (collectable ? " — claimable now" : " — already claimed/refunded"));
-                        if (collectable) L.add("→ Claiming now (or tap Check now). Your " + s.buyToken + " arrives shortly.");
-                        else L.add("→ That leg's 30-min timelock likely expired and the maker refunded it; your MINIMA auto-refunds at block " + s.myTimelock + ".");
+                        boolean claimable = !gc.withdrawn && !gc.refunded;
+                        L.add("• Counterparty " + s.buyToken + " leg: FOUND " + EthWallet.format(gc.amount, decimalsOf(gc.tokenContract), 6)
+                                + " " + s.buyToken + (claimable ? " — claimable now" : (gc.withdrawn ? " — withdrawn (complete)" : " — refunded")));
+                        if (claimable) L.add("→ Claiming now (or tap Check now). Your " + s.buyToken + " arrives shortly.");
+                        else if (gc.refunded) L.add("→ The maker's leg timed out and was refunded; your MINIMA auto-refunds at block " + s.myTimelock + ".");
                     }
                 } else {
                     L.add("• Counterparty MINIMA leg: " + (secretKnown ? "secret known — claiming" : "waiting for the maker to lock / reveal the secret."));
@@ -374,27 +369,81 @@ public final class SwapEngine {
     // ---- Ethereum side ([io]; blocking RPC) ----
 
     private void runEthChecks(final int minimaBlock) {
+        EthHtlc eth;
+        try { eth = new EthHtlc(rpc, wallet.creds(), net); } catch (Exception e) { return; }
+        final String myEth = wallet.address();
+
+        // PRIMARY (works on free/keyless RPCs): for every known swap, read its ETH leg by deterministic
+        // contractId = sha256(hashlock) via getContract (eth_call) — claim, harvest the revealed preimage,
+        // or refund. No eth_getLogs, which free nodes gate as an "archive" request.
+        for (SwapDb.Swap s : db.allSwaps()) {
+            if (SwapDb.ST_COMPLETE.equals(s.status) || SwapDb.ST_REFUNDED.equals(s.status) || SwapDb.ST_ERROR.equals(s.status)) continue;
+            try { checkEthContractFor(eth, s, myEth); } catch (Exception ignore) {}
+        }
+
+        // SECONDARY (best-effort): eth_getLogs to discover a brand-new incoming ERC20→MINIMA lock whose
+        // hashlock we don't know yet (the only case getContract can't cover). Needs an archive RPC; silently
+        // skipped if the endpoint rejects eth_getLogs, so the sell-MINIMA path keeps working on free nodes.
         try {
             long ethBlock = rpc.blockNumber().longValue();
-            Credentials creds = wallet.creds();
-            EthHtlc eth = new EthHtlc(rpc, creds, net);
-
-            checkEthNewSecrets(eth, ethBlock);
-
-            // Incremental discovery: normally a short look-back, but extend back to where we last scanned
-            // after downtime (capped) so a leg isn't missed because the watcher was off.
             long cap = Math.max(0, ethBlock - ETH_SCAN_CAP);
             long recvFrom = scanFrom(ethBlock, 500, cap);
-            long ownFrom = scanFrom(ethBlock, 1000, cap);
             for (EthHtlc.Contract c : eth.contractsAsReceiver(BigInteger.valueOf(recvFrom), BigInteger.valueOf(ethBlock))) {
-                if (db.haveCollect(c.hashlock)) continue;
+                if (db.getSwap(c.hashlock) != null || db.haveCollect(c.hashlock)) continue;   // known swaps handled above
                 try { checkCanCollectEth(eth, c, minimaBlock); } catch (Exception ignore) {}
             }
-            for (EthHtlc.Contract c : eth.contractsAsOwner(BigInteger.valueOf(ownFrom), BigInteger.valueOf(ethBlock))) {
-                checkExpiredEth(eth, c);
-            }
             lastEthScanned = ethBlock;
-        } catch (Exception e) { /* RPC hiccup; bookmark untouched, retry next cycle */ }
+        } catch (Exception ignore) { /* free RPC without eth_getLogs — getContract path above still works */ }
+    }
+
+    /** Read one swap's ETH leg by deterministic contractId and drive it: claim (receiver), harvest the
+     *  revealed secret / refund (sender). All via getContract/withdraw/refund — no eth_getLogs. */
+    private void checkEthContractFor(EthHtlc eth, SwapDb.Swap s, String myEth) throws Exception {
+        final String hash = s.hash;
+        final String contractId = EthHtlc.contractId(hash);
+        EthHtlc.Contract gc = eth.getContract(contractId);
+        if (gc == null) return;   // the ETH leg isn't locked yet
+
+        boolean iAmReceiver = gc.receiver != null && gc.receiver.equalsIgnoreCase(myEth);
+        boolean iAmSender = gc.owner != null && gc.owner.equalsIgnoreCase(myEth);
+
+        if (iAmReceiver) {
+            if (gc.withdrawn || gc.refunded) return;
+            String secret = db.getSecret(hash);
+            if (secret == null) return;   // (responder before harvesting the secret — nothing to do yet)
+            String[] req = db.getRequest(hash);
+            if (req != null) {
+                String tokenHuman = EthWallet.format(gc.amount, decimalsOf(gc.tokenContract), 18);
+                if (!amountTokenOk(req, tokenHuman, gc.tokenContract, true)) {
+                    db.logEvent(hash, SwapDb.EV_COLLECT, "ETH:" + gc.tokenContract, "0", "counterparty amount/token mismatch");
+                    return;
+                }
+            }
+            if (db.haveCollect(hash) || !inflight.add("wdEth:" + hash)) return;
+            db.setSwapStatus(hash, SwapDb.ST_CLAIMING);
+            ui.post(notifier::onSwapsChanged);
+            try {
+                String tx = eth.withdraw(contractId, secret);
+                db.logEvent(hash, SwapDb.EV_COLLECT, "ETH:" + gc.tokenContract, "", tx);
+                db.setSwapStatus(hash, SwapDb.ST_COMPLETE);
+                ui.post(() -> { notifier.notify("Swap complete", "Withdrew your " + s.buyToken); notifier.onSwapsChanged(); });
+            } finally { inflight.remove("wdEth:" + hash); }
+        } else if (iAmSender) {
+            if (gc.withdrawn) {
+                // The counterparty revealed the preimage IN the contract — read it directly (no eth_getLogs).
+                if (gc.preimage != null && EthRpc.hexToBig(gc.preimage).signum() != 0 && db.insertSecret(hash, gc.preimage)) {
+                    ui.post(() -> { notifier.notify("Secret revealed", "Claiming your side of the swap"); notifier.onSwapsChanged(); });
+                }
+            } else if (!gc.refunded && nowUnix() > gc.timelock) {
+                if (db.haveCollectExpired(hash) || !inflight.add("refundE:" + hash)) return;
+                try {
+                    String tx = eth.refund(contractId);
+                    db.logEvent(hash, SwapDb.EV_EXPIRED, "ETH:" + gc.tokenContract, "", tx);
+                    db.setSwapStatus(hash, SwapDb.ST_REFUNDED);
+                    ui.post(() -> { notifier.notify("Swap refunded", "Reclaimed your tokens"); notifier.onSwapsChanged(); });
+                } finally { inflight.remove("refundE:" + hash); }
+            }
+        }
     }
 
     private void checkEthNewSecrets(EthHtlc eth, long ethBlock) {
