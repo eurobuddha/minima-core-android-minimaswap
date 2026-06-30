@@ -363,14 +363,35 @@ public class MainActivity extends AppCompatActivity {
     private void publishOrder() {
         if (identity == null || myMinimaPk == null) { toast("Still connecting to your node…"); return; }
         if (!wallet.ready()) { toast("ETH wallet not ready yet"); return; }
-        Order o = loadOrder();
+        final Order o = loadOrder();
         o.minimaPublicKey = myMinimaPk;
         o.ethAddress = wallet.address();
-        o.minimaAvail = parseD(Util.tidyAmount(minimaBal), 0);          // liquidity snapshot (kept current
-        o.usdtAvail = parseD(Util.tidyAmount(tokenBals.get("USDT")), 0); // by the ~90s balance auto-refresh)
+        o.usdtAvail = parseD(Util.tidyAmount(tokenBals.get("USDT")), 0);
         boolean anyEnabled = false;
         for (Order.Pair p : o.pairs.values()) if (p.enable) { anyEnabled = true; break; }
         if (!anyEnabled) { toast("Enable at least one pair in your order first"); return; }
+        orderStatus = "Reading your sendable balance…";
+        render();
+        // Advertise the SENDABLE balance (what a swap can actually lock) — read fresh at publish time so it's
+        // never a stale snapshot. sendable = coins at your simple addresses; contract-locked coins (e.g. funds
+        // committed in the casino) are excluded by the node (balance.java), so they're correctly not offered.
+        node.cmd("balance tokenid:0x00", new NodeApi.Cb() {
+            @Override public void onResult(JSONObject j) {
+                Object resp = j.opt("response");
+                JSONObject t = null;
+                if (resp instanceof JSONArray && ((JSONArray) resp).length() > 0) t = ((JSONArray) resp).optJSONObject(0);
+                else if (resp instanceof JSONObject) t = (JSONObject) resp;
+                o.minimaAvail = parseD(Util.tidyAmount(t == null ? "0" : t.optString("sendable", "0")), 0);
+                doPublish(o);
+            }
+            @Override public void onError(String m) {
+                o.minimaAvail = parseD(Util.tidyAmount(minimaBal), 0);   // fall back to the cached sendable
+                doPublish(o);
+            }
+        });
+    }
+
+    private void doPublish(Order o) {
         engine.setMyOrder(o);
         orderStatus = "Publishing your order…";
         render();
