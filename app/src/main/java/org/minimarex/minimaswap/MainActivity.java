@@ -16,6 +16,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.text.InputFilter;
 import android.text.InputType;
+import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.EditText;
@@ -580,15 +581,15 @@ public class MainActivity extends AppCompatActivity {
         box.setPadding(dp(20), dp(8), dp(20), dp(8));
 
         TextView hint = new TextView(this);
-        hint.setText("Prices are the price of MINIMA in USDT (USDT per MINIMA). "
-                + "buy = price others buy MINIMA from you (the higher / ask). "
-                + "sell = price others sell MINIMA to you (the lower / bid). "
-                + "min = smallest MINIMA per trade. Keep buy ≥ sell.");
+        hint.setText("Your two-sided market — price of MINIMA in USDT (USDT per MINIMA):\n"
+                + "•  ASK — where YOU SELL MINIMA (the higher price)\n"
+                + "•  BID — where YOU BUY MINIMA (the lower price)\n"
+                + "The gap between them is your spread. Ask must be above Bid.");
         hint.setTextColor(Design.DIM); hint.setTextSize(12f); hint.setPadding(0, 0, 0, dp(10));
         box.addView(hint);
 
         final Map<String, SwitchCompat> en = new LinkedHashMap<>();
-        final Map<String, EditText> buy = new LinkedHashMap<>(), sell = new LinkedHashMap<>(), min = new LinkedHashMap<>();
+        final Map<String, EditText> ask = new LinkedHashMap<>(), bid = new LinkedHashMap<>(), min = new LinkedHashMap<>();
         for (String sym : PAIR_TOKENS) {
             Order.Pair p = o.pairs.get(sym);
             TextView t = new TextView(this); t.setText("MINIMA / " + sym); t.setTextColor(Design.TEXT); t.setTextSize(15f);
@@ -596,29 +597,64 @@ public class MainActivity extends AppCompatActivity {
             box.addView(t);
             SwitchCompat sw = new SwitchCompat(this); sw.setText("Enabled"); sw.setTextColor(Design.DIM); sw.setChecked(p.enable);
             box.addView(sw); en.put(sym, sw);
-            buy.put(sym, numRow(box, "buy MINIMA price (" + sym + ")", p.buy));
-            sell.put(sym, numRow(box, "sell MINIMA price (" + sym + ")", p.sell));
-            min.put(sym, numRow(box, "min MINIMA", p.min));
+            // Internal fields stay buy=ask / sell=bid (wire-compatible); the LABELS are unambiguous maker-perspective.
+            final EditText a = numRow(box, "ASK — you SELL MINIMA (" + sym + ", higher)", p.buy, Design.RED);
+            final EditText b = numRow(box, "BID — you BUY MINIMA (" + sym + ", lower)", p.sell, Design.IN);
+            final EditText mn = numRow(box, "min MINIMA / trade", p.min);
+            ask.put(sym, a); bid.put(sym, b); min.put(sym, mn);
+
+            final TextView pv = new TextView(this); pv.setTextSize(12f); pv.setPadding(0, dp(6), 0, dp(2));
+            box.addView(pv);
+            Runnable upd = () -> updateSpreadPreview(pv, a, b, sym);
+            TextWatcher w = onChange(upd);
+            a.addTextChangedListener(w); b.addTextChangedListener(w);
+            upd.run();
         }
 
         modalOpen = true;
         new AlertDialog.Builder(this)
-                .setTitle("My order / rates")
+                .setTitle("My market / rates")
                 .setView(wrapScroll(box))
                 .setPositiveButton("Save", (d, w) -> {
+                    String warn = null;
                     for (String sym : PAIR_TOKENS) {
                         Order.Pair p = o.pairs.get(sym);
                         p.enable = en.get(sym).isChecked();
-                        p.buy = parseD(buy.get(sym).getText().toString(), p.buy);
-                        p.sell = parseD(sell.get(sym).getText().toString(), p.sell);
+                        p.buy = parseD(ask.get(sym).getText().toString(), p.buy);   // ask
+                        p.sell = parseD(bid.get(sym).getText().toString(), p.sell); // bid
                         p.min = parseD(min.get(sym).getText().toString(), p.min);
+                        if (p.enable && p.buy > 0 && p.sell > 0 && p.buy <= p.sell)
+                            warn = sym + ": Ask ≤ Bid — you'd SELL MINIMA cheaper than you BUY it. Check before publishing.";
                     }
                     saveOrder(o);
-                    toast("Order saved");
+                    toast(warn != null ? "⚠ Saved, but " + warn : "Market saved");
                 })
                 .setNegativeButton("Cancel", null)
                 .setOnDismissListener(d -> { modalOpen = false; render(); })
                 .show();
+    }
+
+    /** Live bid/ask spread preview in the rate editor; flags an inverted (ask ≤ bid) market in red. */
+    private void updateSpreadPreview(TextView pv, EditText askE, EditText bidE, String sym) {
+        double a = parseD(askE.getText().toString(), 0), b = parseD(bidE.getText().toString(), 0);
+        if (a <= 0 || b <= 0) {
+            pv.setText("Bid " + (b > 0 ? trim(b) : "—") + "   /   Ask " + (a > 0 ? trim(a) : "—"));
+            pv.setTextColor(Design.DIM2);
+        } else if (a <= b) {
+            pv.setText("⚠ Inverted — Ask " + trim(a) + " ≤ Bid " + trim(b) + ": you'd sell cheaper than you buy");
+            pv.setTextColor(Design.RED);
+        } else {
+            pv.setText("Spread:  Bid " + trim(b) + "   /   Ask " + trim(a) + "   (" + fmtPrice(a - b) + " " + sym + ")");
+            pv.setTextColor(Design.IN);
+        }
+    }
+
+    private static TextWatcher onChange(Runnable r) {
+        return new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void afterTextChanged(android.text.Editable e) { r.run(); }
+        };
     }
 
     /**
@@ -642,10 +678,14 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private EditText numRow(LinearLayout parent, String label, double value) {
+        return numRow(parent, label, value, Design.DIM);
+    }
+
+    private EditText numRow(LinearLayout parent, String label, double value, int labelColor) {
         LinearLayout r = new LinearLayout(this);
         r.setOrientation(LinearLayout.HORIZONTAL);
         r.setGravity(Gravity.CENTER_VERTICAL);
-        TextView t = new TextView(this); t.setText(label); t.setTextColor(Design.DIM); t.setTextSize(13f);
+        TextView t = new TextView(this); t.setText(label); t.setTextColor(labelColor); t.setTextSize(13f);
         EditText e = new EditText(this);
         decimalInput(e);
         e.setText(trim(value)); e.setTextColor(Design.TEXT); e.setTextSize(14f); e.setGravity(Gravity.END);
@@ -1087,11 +1127,13 @@ public class MainActivity extends AppCompatActivity {
             if (p != null && p.enable && (p.buy > 0 || p.sell > 0)) makers.add(o);
         }
         if (makers.isEmpty()) return;
+        // Track WHO holds the best bid (highest) and best ask (lowest) — they may be different makers.
+        Order bestBidMaker = null, bestAskMaker = null;
         double bestBid = 0, bestAsk = Double.MAX_VALUE;
         for (Order o : makers) {
             Order.Pair p = o.pairs.get(sym);
-            if (p.sell > 0) bestBid = Math.max(bestBid, p.sell);
-            if (p.buy > 0) bestAsk = Math.min(bestAsk, p.buy);
+            if (p.sell > 0 && p.sell > bestBid) { bestBid = p.sell; bestBidMaker = o; }
+            if (p.buy > 0 && p.buy < bestAsk) { bestAsk = p.buy; bestAskMaker = o; }
         }
         java.util.Collections.sort(makers, (a, b) -> Double.compare(a.pairs.get(sym).buy, b.pairs.get(sym).buy)); // tightest ask first
 
@@ -1112,7 +1154,50 @@ public class MainActivity extends AppCompatActivity {
         legend.addView(lR, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         col.addView(legend);
 
+        // With 2+ makers, pin the BEST market (highest bid + lowest ask, the tightest two-sided price) on top.
+        if (makers.size() >= 2 && bestBid > 0 && bestAsk < Double.MAX_VALUE)
+            col.addView(bestMarketCard(sym, bestBidMaker, bestAskMaker, bestBid, bestAsk));
+
         for (Order o : makers) col.addView(makerRow(o, sym, bestBid, bestAsk));
+    }
+
+    private boolean isMine(Order o) {
+        return o != null && identity != null && o.commsPublicId != null && o.commsPublicId.equals(identity.publicId());
+    }
+
+    /** Pinned top-of-book: the highest bid and lowest ask across all makers (may be two different makers). */
+    private LinearLayout bestMarketCard(String sym, Order bidMaker, Order askMaker, double bestBid, double bestAsk) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setBackground(Design.roundBg(this, Design.SURFACE2, 12));
+        box.setPadding(dp(12), dp(8), dp(12), dp(8));
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        blp.topMargin = dp(8); box.setLayoutParams(blp);
+
+        TextView tag = new TextView(this);
+        tag.setText("★ BEST MARKET");
+        tag.setTextColor(Design.ACCENT); tag.setTextSize(11.5f);
+        tag.setTypeface(tag.getTypeface(), android.graphics.Typeface.BOLD);
+        tag.setGravity(Gravity.CENTER); tag.setPadding(0, 0, 0, dp(4));
+        box.addView(tag);
+
+        double bidSize = bidMaker != null ? bidMaker.usdtAvail / bestBid : 0;
+        double askSize = askMaker != null ? askMaker.minimaAvail : 0;
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL); row.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout left = quoteHalf(abbrev(bidSize), fmtPrice(bestBid), Design.IN, true, true);
+        LinearLayout right = quoteHalf(fmtPrice(bestAsk), abbrev(askSize), Design.RED, true, false);
+        if (!isMine(bidMaker)) left.setOnClickListener(v -> takeOrderDialog(bidMaker, sym, true));    // sell to best bid
+        if (!isMine(askMaker)) right.setOnClickListener(v -> takeOrderDialog(askMaker, sym, false));  // buy at best ask
+
+        TextView div = new TextView(this); div.setText("│"); div.setTextColor(Design.DIM2); div.setTextSize(14f);
+        div.setPadding(dp(8), 0, dp(8), 0);
+        row.addView(left, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(div);
+        row.addView(right, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        box.addView(row);
+        return box;
     }
 
     /** One maker's two-sided quote, centred: [bidSize bidPrice] │ [askPrice askSize], tag above. */
