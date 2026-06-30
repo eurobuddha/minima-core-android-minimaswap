@@ -189,6 +189,7 @@ public class SwapService extends Service {
             boolean isNew = set.add(hash);
             if (isNew) prefs.edit().putString("incoming_hashlocks", android.text.TextUtils.join(",", set)).apply();
             engine.addIncomingHashlock(hash);
+            if (isNew) alert("Buy request received", "A buyer wants your MINIMA — finding their USDT lock, then locking.");
             return isNew;
         } catch (Exception e) { return false; }
     }

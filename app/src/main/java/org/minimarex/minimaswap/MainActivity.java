@@ -475,6 +475,10 @@ public class MainActivity extends AppCompatActivity {
         boolean isNew = set.add(hash);
         if (isNew) prefs.edit().putString("incoming_hashlocks", android.text.TextUtils.join(",", set)).apply();
         if (engine != null) engine.addIncomingHashlock(hash);
+        if (isNew) {   // make the handshake visible — the buyer wants to know it landed
+            postNotification("Buy request received", "A buyer wants your MINIMA — finding their USDT lock, then locking.");
+            orderStatus = "↧ Buy request received — locking MINIMA for a buyer…"; render();
+        }
         return isNew;
     }
 

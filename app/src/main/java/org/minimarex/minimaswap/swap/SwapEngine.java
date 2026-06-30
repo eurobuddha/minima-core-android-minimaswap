@@ -85,6 +85,7 @@ public final class SwapEngine {
     private final Set<String> inflight = Collections.synchronizedSet(new HashSet<>());
     private final Map<String, Long> approvePending = Collections.synchronizedMap(new HashMap<>());
     private final Set<String> incoming = Collections.synchronizedSet(new HashSet<>());   // hashlocks announced by a buyer's handshake
+    private final Set<String> declined = Collections.synchronizedSet(new HashSet<>());   // handshake buys we've already notified as declined
 
     public SwapEngine(NodeApi node, MinimaHtlc minima, SwapDb db, EthWallet wallet,
                       Handler ui, Notifier notifier) {
@@ -548,10 +549,17 @@ public final class SwapEngine {
         // I don't know the secret → I'm an ERC20→MINIMA responder; lock the MINIMA counter-leg.
         if (c.otc) return;
         if (db.haveSentCounterParty(hash)) return;
-        if (c.timelock - nowUnix() < CP_SECS_CHECK) return;               // first leg too close to expiry
-        if (!acceptTakerBuyMinima(c)) return;                            // must match my published order
+        if (c.timelock - nowUnix() < CP_SECS_CHECK) { declineNote(hash, "their USDT lock is too close to its timeout"); return; }
+        if (myOrder == null) return;                                      // order not loaded yet — retry next cycle
+        if (!acceptTakerBuyMinima(c)) { declineNote(hash, "it didn't match your published price/limits"); return; }
         if (!inflight.add("cpMin:" + hash)) return;
         lockMinimaCounterLeg(c, minimaBlock);
+    }
+
+    /** Tell the maker (once) why a handshake-announced buy was declined, so a reject isn't silent. */
+    private void declineNote(String hash, String reason) {
+        if (!incoming.contains(MinimaHtlc.normKey(hash)) || !declined.add(MinimaHtlc.normKey(hash))) return;
+        ui.post(() -> notifier.notify("Buy request declined", reason));
     }
 
     private void checkExpiredEth(EthHtlc eth, EthHtlc.Contract c) {
