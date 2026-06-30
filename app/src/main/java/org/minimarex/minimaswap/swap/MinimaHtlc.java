@@ -251,7 +251,11 @@ public final class MinimaHtlc {
     }
 
     private void doScanNotify(String hash, int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
-        cmd("coins simplestate:true depth:" + depth + " state:" + hash + " address:" + NOTIFY, r -> {
+        // The node stores state hex UPPER-CASE ("0x259C…") and matches `state:` case-sensitively (a .contains).
+        // normKey → UPPER-CASE, no 0x — a guaranteed substring of the stored value regardless of the caller's
+        // case (SwapDb keys are lower-case). Passing the raw lower-case hash here would match NOTHING and
+        // re-strand the maker's USDT — the exact bug coinnotify-add fixed.
+        cmd("coins simplestate:true depth:" + depth + " state:" + normKey(hash) + " address:" + NOTIFY, r -> {
             Object resp = r.opt("response");
             ok.accept(resp instanceof org.json.JSONArray ? (org.json.JSONArray) resp : new org.json.JSONArray());
         }, err);

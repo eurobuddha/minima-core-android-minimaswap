@@ -489,10 +489,18 @@ public class MainActivity extends AppCompatActivity {
         return set;
     }
 
-    /** Re-arm the engine with persisted handshakes after a restart. */
+    /** Re-arm the engine with persisted handshakes after a restart, pruning ones that have fully resolved. */
     private void loadIncoming() {
-        if (engine == null) return;
-        for (String h : incomingHashlocks()) engine.addIncomingHashlock(h);
+        if (engine == null || db == null) return;
+        java.util.Set<String> set = incomingHashlocks();
+        boolean changed = false;
+        for (java.util.Iterator<String> it = set.iterator(); it.hasNext(); ) {
+            String h = it.next();
+            SwapDb.Swap s = db.getSwap(h);
+            if (s != null && isTerminal(s)) { it.remove(); changed = true; }   // handshake done — stop persisting it
+            else engine.addIncomingHashlock(h);
+        }
+        if (changed) prefs.edit().putString("incoming_hashlocks", android.text.TextUtils.join(",", set)).apply();
     }
 
     /** Build the base order (pairs + my identities + USDT avail); returns null if no pair is enabled. */
@@ -1176,7 +1184,7 @@ public class MainActivity extends AppCompatActivity {
 
         TextView tag = new TextView(this);
         tag.setText("★ BEST MARKET");
-        tag.setTextColor(Design.ACCENT); tag.setTextSize(11.5f);
+        tag.setTextColor(Design.ACCENT); tag.setTextSize(12.5f);
         tag.setTypeface(tag.getTypeface(), android.graphics.Typeface.BOLD);
         tag.setGravity(Gravity.CENTER); tag.setPadding(0, 0, 0, dp(4));
         box.addView(tag);
@@ -1186,8 +1194,8 @@ public class MainActivity extends AppCompatActivity {
 
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL); row.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout left = quoteHalf(abbrev(bidSize), fmtPrice(bestBid), Design.IN, true, true);
-        LinearLayout right = quoteHalf(fmtPrice(bestAsk), abbrev(askSize), Design.RED, true, false);
+        LinearLayout left = quoteHalf(abbrev(bidSize), fmtPrice(bestBid), Design.IN, true, true, true);
+        LinearLayout right = quoteHalf(fmtPrice(bestAsk), abbrev(askSize), Design.RED, true, false, true);
         if (!isMine(bidMaker)) left.setOnClickListener(v -> takeOrderDialog(bidMaker, sym, true));    // sell to best bid
         if (!isMine(askMaker)) right.setOnClickListener(v -> takeOrderDialog(askMaker, sym, false));  // buy at best ask
 
@@ -1226,9 +1234,9 @@ public class MainActivity extends AppCompatActivity {
         row.setGravity(Gravity.CENTER_VERTICAL);
 
         LinearLayout left = quoteHalf(abbrev(bidSize), hasBid ? fmtPrice(p.sell) : "—",
-                Design.IN, hasBid && p.sell == bestBid, true);
+                Design.IN, hasBid && p.sell == bestBid, true, false);
         LinearLayout right = quoteHalf(hasAsk ? fmtPrice(p.buy) : "—", abbrev(hasAsk ? o.minimaAvail : 0),
-                Design.RED, hasAsk && p.buy == bestAsk, false);
+                Design.RED, hasAsk && p.buy == bestAsk, false, false);
 
         if (!mine && hasBid) left.setOnClickListener(v -> takeOrderDialog(o, sym, true));    // sell MINIMA
         if (!mine && hasAsk) right.setOnClickListener(v -> takeOrderDialog(o, sym, false));  // buy MINIMA
@@ -1243,8 +1251,9 @@ public class MainActivity extends AppCompatActivity {
         return box;
     }
 
-    /** Half of a maker row. leftHalf=true → [size price] right-aligned (price by the centre); else [price size]. */
-    private LinearLayout quoteHalf(String a, String b, int priceColor, boolean best, boolean leftHalf) {
+    /** Half of a maker row. leftHalf=true → [size price] right-aligned (price by the centre); else [price size].
+     *  big=true bumps the font for the pinned BEST MARKET card. */
+    private LinearLayout quoteHalf(String a, String b, int priceColor, boolean best, boolean leftHalf, boolean big) {
         LinearLayout h = new LinearLayout(this);
         h.setOrientation(LinearLayout.HORIZONTAL);
         h.setGravity((leftHalf ? Gravity.END : Gravity.START) | Gravity.CENTER_VERTICAL);
@@ -1252,9 +1261,9 @@ public class MainActivity extends AppCompatActivity {
         String priceText = leftHalf ? b : a;
 
         TextView size = new TextView(this);
-        size.setText(sizeText); size.setTextColor(Design.DIM); size.setTextSize(12f);
+        size.setText(sizeText); size.setTextColor(Design.DIM); size.setTextSize(big ? 13f : 12f);
         TextView price = new TextView(this);
-        price.setText(priceText); price.setTextColor(priceColor); price.setTextSize(15f);
+        price.setText(priceText); price.setTextColor(priceColor); price.setTextSize(big ? 18.5f : 15f);
         if (best) price.setTypeface(price.getTypeface(), android.graphics.Typeface.BOLD);
 
         if (leftHalf) { size.setPadding(0, 0, dp(8), 0); h.addView(size); h.addView(price); }

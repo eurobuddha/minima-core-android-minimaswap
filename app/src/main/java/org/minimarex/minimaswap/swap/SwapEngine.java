@@ -428,8 +428,9 @@ public final class SwapEngine {
             if (db.getSwap(hash) != null || db.haveSentCounterParty(hash)) { incoming.remove(hash); continue; }
             try {
                 EthHtlc.Contract c = eth.getContract(EthHtlc.contractId(hash));
-                if (c == null) continue;   // the buyer's USDT leg isn't visible yet — retry next cycle
-                if (c.receiver != null && c.receiver.equalsIgnoreCase(myEth) && !c.withdrawn && !c.refunded) {
+                if (c == null) continue;                                  // buyer's USDT leg not visible yet — retry
+                if (c.withdrawn || c.refunded) { incoming.remove(hash); continue; }   // terminal — stop polling it
+                if (c.receiver != null && c.receiver.equalsIgnoreCase(myEth)) {
                     checkCanCollectEth(eth, c, minimaBlock);
                 }
             } catch (Exception ignore) {}
