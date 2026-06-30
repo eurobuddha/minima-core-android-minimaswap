@@ -321,6 +321,53 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
+    /** Diagnostic: list the coins the node counts as relevant to this wallet, by address — so we can see
+     *  exactly what inflates the balance (e.g. shared order-book / HTLC / casino coins vs your simple coins). */
+    private void minimaCoinDump() {
+        toast("Reading coins…");
+        node.cmd("coins relevant:true tokenid:0x00 simplestate:false", new NodeApi.Cb() {
+            @Override public void onResult(JSONObject j) {
+                Object resp = j.opt("response");
+                JSONArray coins = resp instanceof JSONArray ? (JSONArray) resp : new JSONArray();
+                StringBuilder sb = new StringBuilder();
+                sb.append("sendable ").append(Util.tidyAmount(minimaBal))
+                  .append("   confirmed ").append(Util.tidyAmount(minimaConfirmed)).append("\n")
+                  .append(coins.length()).append(" relevant coins:\n\n");
+                java.math.BigDecimal sum = java.math.BigDecimal.ZERO;
+                for (int i = 0; i < coins.length(); i++) {
+                    JSONObject c = coins.optJSONObject(i);
+                    if (c == null) continue;
+                    String amt = c.optString("amount", "0");
+                    String addr = c.optString("address", "");
+                    try { sum = sum.add(new java.math.BigDecimal(amt)); } catch (Exception ignore) {}
+                    String mx = c.optString("miniaddress", "");
+                    String tag = "";
+                    if (MinimaHtlc.HTLC_ADDRESS.equalsIgnoreCase(mx)) tag = " (swap HTLC)";
+                    else if (SwapOrderBook.ADDRESS.equalsIgnoreCase(addr)) tag = " (order book)";
+                    sb.append(Util.tidyAmount(amt)).append("   ")
+                      .append(addr.length() > 16 ? addr.substring(0, 16) + "…" : addr).append(tag).append("\n");
+                }
+                sb.append("\nsum of relevant coins ").append(Util.tidyAmount(sum.toPlainString()));
+                showText("Coin breakdown", sb.toString());
+            }
+            @Override public void onError(String m) { showText("Coin breakdown", "Failed: " + m); }
+        });
+    }
+
+    private void showText(String title, String body) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(12), dp(20), dp(4));
+        TextView t = new TextView(this);
+        t.setText(body); t.setTextColor(Design.TEXT); t.setTextSize(12.5f);
+        t.setTypeface(android.graphics.Typeface.MONOSPACE); t.setTextIsSelectable(true);
+        box.addView(t);
+        modalOpen = true;
+        new AlertDialog.Builder(this).setTitle(title).setView(wrapScroll(box))
+                .setPositiveButton("Close", null)
+                .setOnDismissListener(d -> { modalOpen = false; render(); }).show();
+    }
+
     /** Full Minima balance breakdown so the displayed numbers are never a black box. */
     private String minimaBreakdown() {
         String locked = "—";
@@ -652,7 +699,9 @@ public class MainActivity extends AppCompatActivity {
         sub.setTextColor(Design.DIM2); sub.setTextSize(12.5f); sub.setPadding(0, dp(2), 0, dp(14));
         col.addView(sub);
 
-        col.addView(walletCard("Minima · tradeable (sendable)", minimaBal + " MINIMA", minimaBreakdown(), Design.ACCENT));
+        LinearLayout minimaCard = walletCard("Minima · tradeable (sendable)", minimaBal + " MINIMA", minimaBreakdown() + "  ·  long-press for coins", Design.ACCENT);
+        minimaCard.setOnLongClickListener(v -> { minimaCoinDump(); return true; });
+        col.addView(minimaCard);
 
         String addrLine = ethAddr == null ? (ethErr == null ? "deriving from node seed…" : "—") : shortAddr(ethAddr);
         LinearLayout ethCard = walletCard("Ethereum · " + net.label, ethBal, addrLine, Design.TEXT);
