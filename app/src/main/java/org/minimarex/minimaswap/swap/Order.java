@@ -18,6 +18,8 @@ public final class Order {
     public String ethAddress;        // maker's ETH receiving address
     public String commsPublicId;     // 0x + boxPk + signPk — used to seal the handshake to the maker
     public long ts;                  // maker's timestamp (ms) — freshest order per signer wins
+    public double minimaAvail;       // maker's available MINIMA at publish time (liquidity, ask side)
+    public double usdtAvail;         // maker's available USDT at publish time (liquidity, bid side)
     public final Map<String, Pair> pairs = new LinkedHashMap<>();   // "USDT" -> rate
 
     // set on receive (not part of the signed payload)
@@ -42,6 +44,7 @@ public final class Order {
         o.put("eth", ethAddress);
         o.put("cid", commsPublicId);
         o.put("ts", ts);
+        o.put("bal", new JSONObject().put("m", minimaAvail).put("u", usdtAvail));
         JSONObject p = new JSONObject();
         for (Map.Entry<String, Pair> e : pairs.entrySet()) {
             Pair v = e.getValue();
@@ -58,6 +61,8 @@ public final class Order {
         r.ethAddress = o.optString("eth", "");
         r.commsPublicId = o.optString("cid", "");
         r.ts = o.optLong("ts", 0);
+        JSONObject bal = o.optJSONObject("bal");
+        if (bal != null) { r.minimaAvail = bal.optDouble("m", 0); r.usdtAvail = bal.optDouble("u", 0); }
         JSONObject p = o.optJSONObject("pairs");
         if (p != null) {
             for (Iterator<String> it = p.keys(); it.hasNext(); ) {

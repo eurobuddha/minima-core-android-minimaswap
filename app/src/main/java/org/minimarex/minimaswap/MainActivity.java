@@ -337,6 +337,8 @@ public class MainActivity extends AppCompatActivity {
         Order o = loadOrder();
         o.minimaPublicKey = myMinimaPk;
         o.ethAddress = wallet.address();
+        o.minimaAvail = parseD(Util.tidyAmount(minimaBal), 0);          // liquidity snapshot (kept current
+        o.usdtAvail = parseD(Util.tidyAmount(tokenBals.get("USDT")), 0); // by the ~90s balance auto-refresh)
         boolean anyEnabled = false;
         for (Order.Pair p : o.pairs.values()) if (p.enable) { anyEnabled = true; break; }
         if (!anyEnabled) { toast("Enable at least one pair in your order first"); return; }
@@ -630,7 +632,7 @@ public class MainActivity extends AppCompatActivity {
             empty.setTextColor(Design.DIM); empty.setTextSize(12.5f); empty.setPadding(dp(2), dp(6), dp(2), 0);
             col.addView(empty);
         } else {
-            for (Order o : orderBook.values()) col.addView(orderRow(o));
+            orderLadder(col);
         }
 
         LinearLayout btns = new LinearLayout(this);
@@ -732,59 +734,85 @@ public class MainActivity extends AppCompatActivity {
         return "refundable in ~" + mins + " min";
     }
 
-    private LinearLayout orderRow(Order o) {
+    /** The order book as a two-column bid/ask ladder, best price first, with per-level MINIMA liquidity. */
+    private void orderLadder(LinearLayout col) {
+        final String sym = "USDT";
+        java.util.List<Order> bids = new java.util.ArrayList<>();   // SELL MINIMA (maker's sell/bid price)
+        java.util.List<Order> asks = new java.util.ArrayList<>();   // BUY MINIMA (maker's buy/ask price)
+        for (Order o : orderBook.values()) {
+            Order.Pair p = o.pairs.get(sym);
+            if (p == null || !p.enable) continue;
+            if (p.sell > 0) bids.add(o);
+            if (p.buy > 0) asks.add(o);
+        }
+        java.util.Collections.sort(bids, (a, b) -> Double.compare(b.pairs.get(sym).sell, a.pairs.get(sym).sell)); // best (highest) first
+        java.util.Collections.sort(asks, (a, b) -> Double.compare(a.pairs.get(sym).buy, b.pairs.get(sym).buy));   // best (lowest) first
+
+        // spread = best ask − best bid (best buy price − best sell price)
+        if (!bids.isEmpty() && !asks.isEmpty()) {
+            double spread = asks.get(0).pairs.get(sym).buy - bids.get(0).pairs.get(sym).sell;
+            TextView sp = new TextView(this);
+            sp.setText("spread " + trim(spread) + " " + sym + "  ·  prices are " + sym + " per MINIMA (balances at publish)");
+            sp.setTextColor(Design.DIM2); sp.setTextSize(11.5f); sp.setPadding(dp(2), dp(4), 0, dp(6));
+            col.addView(sp);
+        }
+
+        LinearLayout cols = new LinearLayout(this);
+        cols.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        clp.topMargin = dp(4); cols.setLayoutParams(clp);
+        cols.addView(ladderColumn("SELL MINIMA (bid)", bids, sym, true), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        cols.addView(ladderColumn("BUY MINIMA (ask)", asks, sym, false), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        col.addView(cols);
+    }
+
+    private LinearLayout ladderColumn(String header, java.util.List<Order> orders, String sym, boolean sellMinima) {
         LinearLayout c = new LinearLayout(this);
         c.setOrientation(LinearLayout.VERTICAL);
-        c.setBackground(Design.roundBg(this, Design.SURFACE, 14));
-        c.setPadding(dp(14), dp(10), dp(14), dp(10));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = dp(8); c.setLayoutParams(lp);
+        c.setBackground(Design.roundBg(this, Design.SURFACE, 12));
+        c.setPadding(dp(10), dp(8), dp(10), dp(8));
 
-        boolean mine = identity != null && o.commsPublicId != null && o.commsPublicId.equals(identity.publicId());
-        TextView top = new TextView(this);
-        top.setText(mine ? "Your order" : "Maker " + shortAddr(o.signerPk));
-        top.setTextColor(mine ? Design.ACCENT : Design.TEXT); top.setTextSize(14f);
-        top.setTypeface(top.getTypeface(), android.graphics.Typeface.BOLD);
-        c.addView(top);
-        TextView ethLine = new TextView(this);
-        ethLine.setText("ETH " + shortAddr(o.ethAddress));
-        ethLine.setTextColor(Design.DIM2); ethLine.setTextSize(12f); ethLine.setPadding(0, dp(2), 0, dp(4));
-        c.addView(ethLine);
+        TextView h = new TextView(this);
+        h.setText(header);
+        h.setTextColor(sellMinima ? Design.IN : Design.RED); h.setTextSize(12f);
+        h.setTypeface(h.getTypeface(), android.graphics.Typeface.BOLD); h.setPadding(0, 0, 0, dp(4));
+        c.addView(h);
 
-        boolean anyEnabled = false;
-        for (Map.Entry<String, Order.Pair> e : o.pairs.entrySet()) {
-            Order.Pair p = e.getValue();
-            if (!p.enable) continue;
-            anyEnabled = true;
-            final String sym = e.getKey();
-            TextView rate = new TextView(this);
-            // price is USDT per MINIMA: buy = the (higher) price to buy MINIMA, sell = the (lower) price to sell
-            rate.setText("MINIMA  ·  buy " + trim(p.buy) + " / sell " + trim(p.sell) + " " + sym);
-            rate.setTextColor(Design.DIM); rate.setTextSize(12.5f); rate.setPadding(0, dp(4), 0, dp(2));
-            c.addView(rate);
-            if (!mine) {
-                LinearLayout actions = new LinearLayout(this);
-                actions.setOrientation(LinearLayout.HORIZONTAL);
-                TextView buyBtn = Design.pill(this, "Buy MINIMA", Design.ACCENT, Design.ON_ACCENT);
-                buyBtn.setOnClickListener(v -> takeOrderDialog(o, sym, false));   // sellMinima=false
-                TextView sellBtn = Design.pill(this, "Sell MINIMA", Design.SURFACE2, Design.TEXT);
-                sellBtn.setOnClickListener(v -> takeOrderDialog(o, sym, true));    // sellMinima=true
-                LinearLayout.LayoutParams a1 = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-                a1.rightMargin = dp(8); a1.topMargin = dp(4);
-                LinearLayout.LayoutParams a2 = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-                a2.topMargin = dp(4);
-                actions.addView(buyBtn, a1);
-                actions.addView(sellBtn, a2);
-                c.addView(actions);
-            }
-        }
-        if (!anyEnabled) {
-            TextView none = new TextView(this);
-            none.setText("No enabled pairs");
+        if (orders.isEmpty()) {
+            TextView none = new TextView(this); none.setText("—");
             none.setTextColor(Design.DIM2); none.setTextSize(12f);
             c.addView(none);
+            return c;
+        }
+        for (int i = 0; i < orders.size(); i++) {
+            final Order o = orders.get(i);
+            Order.Pair p = o.pairs.get(sym);
+            double price = sellMinima ? p.sell : p.buy;
+            double sizeMinima = sellMinima ? (price > 0 ? o.usdtAvail / price : 0) : o.minimaAvail;
+            boolean mine = identity != null && o.commsPublicId != null && o.commsPublicId.equals(identity.publicId());
+
+            TextView row = new TextView(this);
+            row.setText(trim(price) + "  ·  " + abbrev(sizeMinima) + (mine ? "  (you)" : "  " + shortAddr(o.signerPk)));
+            row.setTextColor(i == 0 ? Design.ACCENT : (mine ? Design.DIM2 : Design.DIM));
+            row.setTextSize(12.5f);
+            if (i == 0) row.setTypeface(row.getTypeface(), android.graphics.Typeface.BOLD);
+            row.setPadding(0, dp(3), 0, dp(3));
+            if (!mine) row.setOnClickListener(v -> takeOrderDialog(o, sym, sellMinima));
+            c.addView(row);
         }
         return c;
+    }
+
+    /** Compact MINIMA size: 300 / 12k / 1.2M. */
+    private static String abbrev(double v) {
+        if (v <= 0) return "—";
+        if (v >= 1_000_000) return trimNum(v / 1_000_000) + "M";
+        if (v >= 1_000) return trimNum(v / 1_000) + "k";
+        return trimNum(v);
+    }
+    private static String trimNum(double v) {
+        java.math.BigDecimal b = java.math.BigDecimal.valueOf(v).setScale(v < 10 ? 2 : 1, RoundingMode.DOWN).stripTrailingZeros();
+        return b.toPlainString();
     }
 
     private LinearLayout walletCard(String title, String big, String sub, int bigColor) {
