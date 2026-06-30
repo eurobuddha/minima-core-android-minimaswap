@@ -730,15 +730,64 @@ public class MainActivity extends AppCompatActivity {
         meta.setTextColor(Design.DIM2); meta.setTextSize(11.5f); meta.setPadding(0, dp(3), 0, 0);
         c.addView(meta);
 
-        // a manual "Check now" for immediate feedback (instead of waiting for the ~90s poll)
+        // surface a logged reject/error reason inline (so a stuck swap isn't a black box)
+        String err = swapErrorNote(s.hash);
+        if (err != null) {
+            TextView e = new TextView(this);
+            e.setText("⚠ " + err);
+            e.setTextColor(Design.RED); e.setTextSize(12f); e.setPadding(0, dp(4), 0, 0);
+            c.addView(e);
+        }
+
+        // a manual "Check now" that runs a live on-chain inspection AND advances the swap
         if (!SwapDb.ST_COMPLETE.equals(s.status) && !SwapDb.ST_REFUNDED.equals(s.status)) {
             TextView check = Design.pill(this, "Check now", Design.SURFACE2, Design.TEXT);
             LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
             clp.topMargin = dp(8); check.setLayoutParams(clp);
-            check.setOnClickListener(v -> { toast("Checking…"); if (engine != null) engine.poll(); refreshBalances(true); });
+            check.setOnClickListener(v -> checkNow(s.hash));
             c.addView(check);
         }
         return c;
+    }
+
+    /** First logged reject/error reason for a swap, or null. */
+    private String swapErrorNote(String hash) {
+        if (db == null) return null;
+        for (SwapDb.Event e : db.getEvents(hash)) {
+            String n = e.note == null ? "" : e.note.toLowerCase();
+            if (n.contains("mismatch") || n.contains("invalid") || n.contains("incorrect")
+                    || n.contains("too close") || n.contains("fail")) return e.note;
+        }
+        return null;
+    }
+
+    /** Force a poll (advance) + run the live inspector and show the report. */
+    private void checkNow(String hash) {
+        toast("Checking…");
+        if (engine == null) return;
+        engine.poll();
+        refreshBalances(true);
+        engine.inspect(hash, lines -> showReport(hash, lines));
+    }
+
+    private void showReport(String hash, java.util.List<String> lines) {
+        StringBuilder sb = new StringBuilder();
+        for (String l : lines) sb.append(l).append("\n\n");
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(12), dp(20), dp(4));
+        TextView t = new TextView(this);
+        t.setText(sb.toString().trim());
+        t.setTextColor(Design.TEXT); t.setTextSize(13f); t.setTextIsSelectable(true);
+        box.addView(t);
+        modalOpen = true;
+        new AlertDialog.Builder(this)
+                .setTitle("Swap status")
+                .setView(wrapScroll(box))
+                .setPositiveButton("Check again", (d, w) -> checkNow(hash))
+                .setNegativeButton("Close", null)
+                .setOnDismissListener(d -> { modalOpen = false; render(); })
+                .show();
     }
 
     /** Plain-language description of where a swap is, so "waiting" isn't ambiguous. */

@@ -61,6 +61,7 @@ public final class SwapEngine {
         void onSwapsChanged();                     // ask the UI to re-render swap cards
     }
     public interface StartCb { void ok(String hash); void err(String msg); }
+    public interface InspectCb { void report(java.util.List<String> lines); }
 
     private final NodeApi node;
     private final MinimaHtlc minima;
@@ -177,6 +178,68 @@ public final class SwapEngine {
                 });
             }
             @Override public void err(String m) { cb.err(m); }
+        });
+    }
+
+    // ============================================================ inspect (live diagnostic for one swap)
+
+    /** Probe both legs on-chain for one swap and report a plain-language status (why it's stuck / where it is). */
+    public void inspect(String hash, InspectCb cb) {
+        if (!ready()) { ui.post(() -> cb.report(java.util.Collections.singletonList("Wallet/node not ready yet — open the app and wait a moment."))); return; }
+        io.execute(() -> {
+            java.util.List<String> L = new java.util.ArrayList<>();
+            try {
+                SwapDb.Swap s = db.getSwap(hash);
+                if (s == null) { ui.post(() -> cb.report(java.util.Collections.singletonList("No record of this swap."))); return; }
+                boolean sell = "MINIMA_TO_ERC20".equals(s.direction);   // I sold MINIMA → counter leg is ETH USDT
+                boolean secretKnown = db.getSecret(hash) != null;
+                L.add((sell ? "Sell " : "Buy ") + s.sellAmount + " " + s.sellToken + " → " + s.buyAmount + " " + s.buyToken
+                        + "  ·  " + s.status.toLowerCase());
+
+                EthHtlc eth = new EthHtlc(rpc, wallet.creds(), net);
+                long ethBlock = rpc.blockNumber().longValue();
+
+                // my leg
+                if (s.myLegIsMinima) {
+                    L.add("• Your " + s.sellAmount + " MINIMA: locked — refundable at block " + s.myTimelock
+                            + (SwapDb.ST_REFUNDED.equals(s.status) ? " (refunded)" : ""));
+                } else {
+                    boolean stillLocked = eth.canCollect(s.contractId);
+                    L.add("• Your " + s.sellAmount + " " + s.sellToken + ": " + (stillLocked ? "locked on Ethereum" : "claimed or refunded"));
+                }
+
+                // counterparty leg
+                if (sell) {
+                    long from = Math.max(0, ethBlock - 5000);
+                    EthHtlc.Contract found = null;
+                    for (EthHtlc.Contract c : eth.contractsAsReceiver(BigInteger.valueOf(from), BigInteger.valueOf(ethBlock))) {
+                        if (MinimaHtlc.normKey(c.hashlock).equals(MinimaHtlc.normKey(hash))) { found = c; break; }
+                    }
+                    if (found == null) {
+                        L.add("• Counterparty " + s.buyToken + " leg: NOT FOUND yet — the maker hasn't locked it, or your node hasn't seen it.");
+                    } else {
+                        boolean collectable = eth.canCollect(found.contractId);
+                        L.add("• Counterparty " + s.buyToken + " leg: FOUND " + EthWallet.format(found.amount, decimalsOf(found.tokenContract), 6)
+                                + " " + s.buyToken + (collectable ? " — claimable now" : " — already claimed/refunded"));
+                        if (collectable) L.add("→ Claiming now (or tap Check now). Your " + s.buyToken + " arrives shortly.");
+                        else L.add("→ That leg's 30-min timelock likely expired and the maker refunded it; your MINIMA auto-refunds at block " + s.myTimelock + ".");
+                    }
+                } else {
+                    L.add("• Counterparty MINIMA leg: " + (secretKnown ? "secret known — claiming" : "waiting for the maker to lock / reveal the secret."));
+                }
+
+                L.add("• Secret: " + (secretKnown ? "known (you can claim)" : "not revealed yet"));
+
+                for (SwapDb.Event e : db.getEvents(hash)) {
+                    String n = e.note == null ? "" : e.note.toLowerCase();
+                    if (n.contains("mismatch") || n.contains("invalid") || n.contains("incorrect")
+                            || n.contains("too close") || n.contains("fail")) L.add("⚠ " + e.note);
+                }
+            } catch (Exception e) {
+                L.add("Check failed (RPC/node): " + e.getMessage());
+            }
+            final java.util.List<String> out = L;
+            ui.post(() -> cb.report(out));
         });
     }
 

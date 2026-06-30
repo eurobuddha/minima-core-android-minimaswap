@@ -85,6 +85,27 @@ public final class SwapDb {
         }
     }
 
+    public static final class Event {
+        public String event, token, amount, note;
+        public long date;
+    }
+
+    /** All logged events for a swap, newest first — surfaces actions + reject/error notes (in {@code note}). */
+    public synchronized java.util.List<Event> getEvents(String hash) {
+        java.util.List<Event> out = new ArrayList<>();
+        try (Cursor c = helper.getReadableDatabase().rawQuery(
+                "SELECT event, token, amount, txnhash, eventdate FROM events WHERE hash=? ORDER BY eventdate DESC",
+                new String[]{norm(hash)})) {
+            while (c.moveToNext()) {
+                Event e = new Event();
+                e.event = c.getString(0); e.token = c.getString(1); e.amount = c.getString(2);
+                e.note = c.getString(3); e.date = c.getLong(4);
+                out.add(e);
+            }
+        }
+        return out;
+    }
+
     public boolean haveSentCounterParty(String hash) { return hasEvent(hash, EV_CPSENT); }
     public boolean haveCollect(String hash)          { return hasEvent(hash, EV_COLLECT); }
     public boolean haveCollectExpired(String hash)   { return hasEvent(hash, EV_EXPIRED); }
