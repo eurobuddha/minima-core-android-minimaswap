@@ -240,7 +240,13 @@ public final class MinimaHtlc {
      * so we never query it unbounded; the caller filters by the hashlocks it actually cares about.
      */
     public void scanNotifyCoins(int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
-        cmd("coins simplestate:true relevant:false depth:" + depth + " address:" + NOTIFY, r -> {
+        // The notify address is SHARED (nobody owns it), so `relevant:false` returns 0 until it's tracked.
+        // coinnotify-add it first (idempotent), then query BARE — the same fix the order-book scan uses.
+        cmd("coinnotify action:add address:" + NOTIFY, r -> doScanNotify(depth, ok, err), e -> doScanNotify(depth, ok, err));
+    }
+
+    private void doScanNotify(int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
+        cmd("coins simplestate:true depth:" + depth + " address:" + NOTIFY, r -> {
             Object resp = r.opt("response");
             ok.accept(resp instanceof org.json.JSONArray ? (org.json.JSONArray) resp : new org.json.JSONArray());
         }, err);
