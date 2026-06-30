@@ -942,73 +942,106 @@ public class MainActivity extends AppCompatActivity {
         return "refundable in ~" + mins + " min";
     }
 
-    /** The order book as a two-column bid/ask ladder, best price first, with per-level MINIMA liquidity. */
+    /**
+     * The order book as centred two-sided rows — one per maker: bidSize · bidPrice │ askPrice · askSize,
+     * maker tag above. Tap the bid half to SELL MINIMA, the ask half to BUY MINIMA. Best bid/ask highlighted.
+     */
     private void orderLadder(LinearLayout col) {
         final String sym = "USDT";
-        java.util.List<Order> bids = new java.util.ArrayList<>();   // SELL MINIMA (maker's sell/bid price)
-        java.util.List<Order> asks = new java.util.ArrayList<>();   // BUY MINIMA (maker's buy/ask price)
+        java.util.List<Order> makers = new java.util.ArrayList<>();
         for (Order o : orderBook.values()) {
             Order.Pair p = o.pairs.get(sym);
-            if (p == null || !p.enable) continue;
-            if (p.sell > 0) bids.add(o);
-            if (p.buy > 0) asks.add(o);
+            if (p != null && p.enable && (p.buy > 0 || p.sell > 0)) makers.add(o);
         }
-        java.util.Collections.sort(bids, (a, b) -> Double.compare(b.pairs.get(sym).sell, a.pairs.get(sym).sell)); // best (highest) first
-        java.util.Collections.sort(asks, (a, b) -> Double.compare(a.pairs.get(sym).buy, b.pairs.get(sym).buy));   // best (lowest) first
+        if (makers.isEmpty()) return;
+        double bestBid = 0, bestAsk = Double.MAX_VALUE;
+        for (Order o : makers) {
+            Order.Pair p = o.pairs.get(sym);
+            if (p.sell > 0) bestBid = Math.max(bestBid, p.sell);
+            if (p.buy > 0) bestAsk = Math.min(bestAsk, p.buy);
+        }
+        java.util.Collections.sort(makers, (a, b) -> Double.compare(a.pairs.get(sym).buy, b.pairs.get(sym).buy)); // tightest ask first
 
-        // spread = best ask − best bid (best buy price − best sell price)
-        if (!bids.isEmpty() && !asks.isEmpty()) {
-            double spread = asks.get(0).pairs.get(sym).buy - bids.get(0).pairs.get(sym).sell;
+        if (bestBid > 0 && bestAsk < Double.MAX_VALUE) {
             TextView sp = new TextView(this);
-            sp.setText("spread " + trim(spread) + " " + sym + "  ·  prices are " + sym + " per MINIMA (balances at publish)");
-            sp.setTextColor(Design.DIM2); sp.setTextSize(11.5f); sp.setPadding(dp(2), dp(4), 0, dp(6));
+            sp.setText("spread " + fmtPrice(bestAsk - bestBid) + " " + sym + "  ·  " + sym + " per MINIMA, size in MINIMA");
+            sp.setTextColor(Design.DIM2); sp.setTextSize(11f); sp.setPadding(dp(2), dp(4), 0, dp(4));
             col.addView(sp);
         }
 
-        LinearLayout cols = new LinearLayout(this);
-        cols.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        clp.topMargin = dp(4); cols.setLayoutParams(clp);
-        cols.addView(ladderColumn("SELL MINIMA (bid)", bids, sym, true), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        cols.addView(ladderColumn("BUY MINIMA (ask)", asks, sym, false), new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        col.addView(cols);
+        // column legend
+        LinearLayout legend = new LinearLayout(this);
+        legend.setOrientation(LinearLayout.HORIZONTAL);
+        legend.setPadding(dp(6), dp(2), dp(6), dp(2));
+        TextView lL = new TextView(this); lL.setText("SELL MINIMA (bid)"); lL.setTextColor(Design.IN); lL.setTextSize(11f);
+        TextView lR = new TextView(this); lR.setText("BUY MINIMA (ask)"); lR.setTextColor(Design.RED); lR.setTextSize(11f); lR.setGravity(Gravity.END);
+        legend.addView(lL, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        legend.addView(lR, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        col.addView(legend);
+
+        for (Order o : makers) col.addView(makerRow(o, sym, bestBid, bestAsk));
     }
 
-    private LinearLayout ladderColumn(String header, java.util.List<Order> orders, String sym, boolean sellMinima) {
-        LinearLayout c = new LinearLayout(this);
-        c.setOrientation(LinearLayout.VERTICAL);
-        c.setBackground(Design.roundBg(this, Design.SURFACE, 12));
-        c.setPadding(dp(10), dp(8), dp(10), dp(8));
+    /** One maker's two-sided quote, centred: [bidSize bidPrice] │ [askPrice askSize], tag above. */
+    private LinearLayout makerRow(Order o, String sym, double bestBid, double bestAsk) {
+        Order.Pair p = o.pairs.get(sym);
+        boolean mine = identity != null && o.commsPublicId != null && o.commsPublicId.equals(identity.publicId());
 
-        TextView h = new TextView(this);
-        h.setText(header);
-        h.setTextColor(sellMinima ? Design.IN : Design.RED); h.setTextSize(12f);
-        h.setTypeface(h.getTypeface(), android.graphics.Typeface.BOLD); h.setPadding(0, 0, 0, dp(4));
-        c.addView(h);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setBackground(Design.roundBg(this, Design.SURFACE, 12));
+        box.setPadding(dp(12), dp(8), dp(12), dp(8));
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        blp.topMargin = dp(8); box.setLayoutParams(blp);
 
-        if (orders.isEmpty()) {
-            TextView none = new TextView(this); none.setText("—");
-            none.setTextColor(Design.DIM2); none.setTextSize(12f);
-            c.addView(none);
-            return c;
-        }
-        for (int i = 0; i < orders.size(); i++) {
-            final Order o = orders.get(i);
-            Order.Pair p = o.pairs.get(sym);
-            double price = sellMinima ? p.sell : p.buy;
-            double sizeMinima = sellMinima ? (price > 0 ? o.usdtAvail / price : 0) : o.minimaAvail;
-            boolean mine = identity != null && o.commsPublicId != null && o.commsPublicId.equals(identity.publicId());
+        TextView tag = new TextView(this);
+        tag.setText(mine ? "your order" : shortAddr(o.signerPk));
+        tag.setTextColor(mine ? Design.ACCENT : Design.DIM2); tag.setTextSize(11.5f);
+        tag.setGravity(Gravity.CENTER); tag.setPadding(0, 0, 0, dp(4));
+        box.addView(tag);
 
-            TextView row = new TextView(this);
-            row.setText(trim(price) + "  ·  " + abbrev(sizeMinima) + (mine ? "  (you)" : "  " + shortAddr(o.signerPk)));
-            row.setTextColor(i == 0 ? Design.ACCENT : (mine ? Design.DIM2 : Design.DIM));
-            row.setTextSize(12.5f);
-            if (i == 0) row.setTypeface(row.getTypeface(), android.graphics.Typeface.BOLD);
-            row.setPadding(0, dp(3), 0, dp(3));
-            if (!mine) row.setOnClickListener(v -> takeOrderDialog(o, sym, sellMinima));
-            c.addView(row);
-        }
-        return c;
+        boolean hasBid = p.sell > 0, hasAsk = p.buy > 0;
+        double bidSize = hasBid ? o.usdtAvail / p.sell : 0;     // MINIMA-equiv the maker can buy from you
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        LinearLayout left = quoteHalf(abbrev(bidSize), hasBid ? fmtPrice(p.sell) : "—",
+                Design.IN, hasBid && p.sell == bestBid, true);
+        LinearLayout right = quoteHalf(hasAsk ? fmtPrice(p.buy) : "—", abbrev(hasAsk ? o.minimaAvail : 0),
+                Design.RED, hasAsk && p.buy == bestAsk, false);
+
+        if (!mine && hasBid) left.setOnClickListener(v -> takeOrderDialog(o, sym, true));    // sell MINIMA
+        if (!mine && hasAsk) right.setOnClickListener(v -> takeOrderDialog(o, sym, false));  // buy MINIMA
+
+        TextView div = new TextView(this); div.setText("│"); div.setTextColor(Design.DIM2); div.setTextSize(14f);
+        div.setPadding(dp(8), 0, dp(8), 0);
+
+        row.addView(left, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(div);
+        row.addView(right, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        box.addView(row);
+        return box;
+    }
+
+    /** Half of a maker row. leftHalf=true → [size price] right-aligned (price by the centre); else [price size]. */
+    private LinearLayout quoteHalf(String a, String b, int priceColor, boolean best, boolean leftHalf) {
+        LinearLayout h = new LinearLayout(this);
+        h.setOrientation(LinearLayout.HORIZONTAL);
+        h.setGravity((leftHalf ? Gravity.END : Gravity.START) | Gravity.CENTER_VERTICAL);
+        String sizeText = leftHalf ? a : b;
+        String priceText = leftHalf ? b : a;
+
+        TextView size = new TextView(this);
+        size.setText(sizeText); size.setTextColor(Design.DIM); size.setTextSize(12f);
+        TextView price = new TextView(this);
+        price.setText(priceText); price.setTextColor(priceColor); price.setTextSize(15f);
+        if (best) price.setTypeface(price.getTypeface(), android.graphics.Typeface.BOLD);
+
+        if (leftHalf) { size.setPadding(0, 0, dp(8), 0); h.addView(size); h.addView(price); }
+        else { price.setPadding(dp(8), 0, 0, 0); h.addView(price); h.addView(size); }
+        return h;
     }
 
     /** Compact MINIMA size: 300 / 12k / 1.2M. */
@@ -1021,6 +1054,10 @@ public class MainActivity extends AppCompatActivity {
     private static String trimNum(double v) {
         java.math.BigDecimal b = java.math.BigDecimal.valueOf(v).setScale(v < 10 ? 2 : 1, RoundingMode.DOWN).stripTrailingZeros();
         return b.toPlainString();
+    }
+    /** Price formatting that absorbs float subtraction noise (e.g. a computed spread). */
+    private static String fmtPrice(double v) {
+        return java.math.BigDecimal.valueOf(v).setScale(10, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString();
     }
 
     private LinearLayout walletCard(String title, String big, String sub, int bigColor) {
