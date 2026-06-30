@@ -18,6 +18,13 @@
     <!-- Scan a counterparty / order QR. -->
     <uses-permission android:name="android.permission.CAMERA" />
 
+    <!-- Background swap watcher: a foreground service drives the swap engine whenever the node is
+         reachable, so swaps progress with the app closed (the node alone isn't enough — we're a
+         separate process). Battery exemption keeps the OS from doze-killing it. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -37,6 +44,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".SwapService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 
 </manifest>

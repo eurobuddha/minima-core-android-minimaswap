@@ -117,6 +117,9 @@ public class MainActivity extends AppCompatActivity {
     private View pairingBanner;
     private boolean watching = false;
     private boolean modalOpen = false;   // suppress background render() while a dialog (with inputs) is open
+    private boolean serviceStarted = false;
+    /** True while the Activity is resumed — the SwapService stands down then so only one polls. */
+    public static volatile boolean FOREGROUND = false;
 
     private final Runnable watchTick = new Runnable() {
         @Override public void run() {
@@ -158,11 +161,13 @@ public class MainActivity extends AppCompatActivity {
 
     @Override protected void onResume() {
         super.onResume();
+        FOREGROUND = true;     // Activity polls while visible; SwapService stands down
         startWatcher();
     }
 
     @Override protected void onPause() {
         super.onPause();
+        FOREGROUND = false;    // hand off to the background SwapService
         stopWatcher();
     }
 
@@ -239,8 +244,32 @@ public class MainActivity extends AppCompatActivity {
     private void maybeStartEngine() {
         if (paired && wallet.ready() && minima.ready() && engine != null) {
             engine.poll();
+            startSwapService();
             render();
         }
+    }
+
+    /** Start the background watcher so swaps progress with the app closed (once, when ready). */
+    private void startSwapService() {
+        if (serviceStarted) return;
+        serviceStarted = true;
+        try { androidx.core.content.ContextCompat.startForegroundService(this, new android.content.Intent(this, SwapService.class)); }
+        catch (Exception ignored) {}
+        try { SwapWorker.schedule(this); } catch (Exception ignored) {}
+        requestBatteryExemption();
+    }
+
+    /** Ask once to be exempt from battery optimisation so the watcher keeps running while the app is closed. */
+    private void requestBatteryExemption() {
+        try {
+            if (prefs.getBoolean("asked_batt", false)) return;
+            prefs.edit().putBoolean("asked_batt", true).apply();
+            android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                startActivity(new android.content.Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        android.net.Uri.parse("package:" + getPackageName())));
+            }
+        } catch (Exception ignored) {}
     }
 
     private void setupIdentity() {
@@ -691,11 +720,45 @@ public class MainActivity extends AppCompatActivity {
         top.addView(Design.pill(this, statusLabel(s), statusBg(s), statusFg(s)));
         c.addView(top);
 
+        TextView detail = new TextView(this);
+        detail.setText(statusDetail(s));
+        detail.setTextColor(Design.DIM); detail.setTextSize(12.5f); detail.setPadding(0, dp(4), 0, 0);
+        c.addView(detail);
+
         TextView meta = new TextView(this);
         meta.setText(s.role.toLowerCase() + "  ·  " + countdown(s));
-        meta.setTextColor(Design.DIM2); meta.setTextSize(12f); meta.setPadding(0, dp(3), 0, 0);
+        meta.setTextColor(Design.DIM2); meta.setTextSize(11.5f); meta.setPadding(0, dp(3), 0, 0);
         c.addView(meta);
+
+        // a manual "Check now" for immediate feedback (instead of waiting for the ~90s poll)
+        if (!SwapDb.ST_COMPLETE.equals(s.status) && !SwapDb.ST_REFUNDED.equals(s.status)) {
+            TextView check = Design.pill(this, "Check now", Design.SURFACE2, Design.TEXT);
+            LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            clp.topMargin = dp(8); check.setLayoutParams(clp);
+            check.setOnClickListener(v -> { toast("Checking…"); if (engine != null) engine.poll(); refreshBalances(true); });
+            c.addView(check);
+        }
         return c;
+    }
+
+    /** Plain-language description of where a swap is, so "waiting" isn't ambiguous. */
+    private String statusDetail(SwapDb.Swap s) {
+        boolean initiator = "INITIATOR".equals(s.role);
+        switch (s.status) {
+            case SwapDb.ST_STARTED:
+                return "Locked your " + s.sellAmount + " " + s.sellToken + " — waiting for the counterparty to lock their side.";
+            case SwapDb.ST_LOCKED:
+                return initiator ? "Counterparty locked — claiming your funds next."
+                        : "You locked your side — waiting for the counterparty to reveal the secret.";
+            case SwapDb.ST_CLAIMING:
+                return "Counterparty locked — claiming your " + s.buyAmount + " " + s.buyToken + " now.";
+            case SwapDb.ST_COMPLETE:
+                return "Done — received " + s.buyAmount + " " + s.buyToken + ".";
+            case SwapDb.ST_REFUNDED:
+                return "Timed out — your " + s.sellAmount + " " + s.sellToken + " was refunded.";
+            default:
+                return "";
+        }
     }
 
     private String statusLabel(SwapDb.Swap s) {

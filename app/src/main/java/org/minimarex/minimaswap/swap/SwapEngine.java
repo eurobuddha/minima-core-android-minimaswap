@@ -235,6 +235,8 @@ public final class SwapEngine {
                 return;
             }
             if (db.haveCollect(hash) || !inflight.add("claimM:" + hash)) return;
+            db.setSwapStatus(hash, SwapDb.ST_CLAIMING);   // counterparty leg found — claiming now
+            notifier.onSwapsChanged();
             minima.claim(coin, hash, secret, new MinimaHtlc.PostCb() {
                 @Override public void ok(String txpowid) {
                     db.logEvent(hash, SwapDb.EV_COLLECT, "minima", coin.optString("amount", ""), txpowid);
@@ -367,6 +369,8 @@ public final class SwapEngine {
                 }
             }
             if (db.haveCollect(hash) || !eth.canCollect(c.contractId) || !inflight.add("wdEth:" + hash)) return;
+            db.setSwapStatus(hash, SwapDb.ST_CLAIMING);   // counterparty leg found — claiming now
+            ui.post(notifier::onSwapsChanged);
             try {
                 String txhash = eth.withdraw(c.contractId, secret);
                 db.logEvent(hash, SwapDb.EV_COLLECT, "ETH:" + c.tokenContract, "", txhash);

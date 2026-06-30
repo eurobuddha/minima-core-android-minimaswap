@@ -10,8 +10,8 @@ android {
         applicationId "org.minimarex.minimaswap"
         minSdk 28
         targetSdk 35
-        versionCode 207
-        versionName "0.2.7"
+        versionCode 300
+        versionName "0.3.0"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -44,6 +44,9 @@ dependencies {
 
     // Message + contact lists
     implementation 'androidx.recyclerview:recyclerview:1.3.2'
+
+    // Background swap watcher: WorkManager re-launches the foreground service if the OS kills it.
+    implementation 'androidx.work:work-runtime:2.9.1'
 
     // Minima Core IPC client SDK (the only way this app reaches the node)
     implementation files('libs/minimaapi.aar')
