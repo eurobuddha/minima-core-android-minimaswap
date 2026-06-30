@@ -1216,7 +1216,7 @@ public class MainActivity extends AppCompatActivity {
 
     private final SwapEngine.Notifier notifier = new SwapEngine.Notifier() {
         @Override public void notify(String title, String body) { ui.post(() -> postNotification(title, body)); }
-        @Override public void onSwapsChanged() { ui.post(MainActivity.this::render); }
+        @Override public void onSwapsChanged() { ui.post(() -> { render(); refreshBalances(false); }); }   // a claim/refund moved funds → update the balance now
     };
 
     private void postNotification(String title, String body) {
