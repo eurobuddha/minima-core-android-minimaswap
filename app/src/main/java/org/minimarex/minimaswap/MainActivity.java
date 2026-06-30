@@ -41,8 +41,10 @@ import com.goterl.lazysodium.LazySodium;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.minimarex.comms.CommsIdentity;
+import org.minimarex.comms.CommsScanner;
 import org.minimarex.comms.CommsTransport;
 import org.minimarex.comms.CryptoProvider;
+import org.minimarex.comms.Opened;
 import org.minimarex.comms.Hex;
 import org.minimarex.comms.LocalEcCryptoProvider;
 import org.minimarex.comms.NodeApi;
@@ -56,6 +58,7 @@ import org.minimarex.minimaswap.swap.Order;
 import org.minimarex.minimaswap.swap.SwapDb;
 import org.minimarex.minimaswap.swap.SwapEngine;
 import org.minimarex.minimaswap.swap.SwapOrderBook;
+import org.minimarex.minimaswap.swap.SwapTake;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -102,6 +105,7 @@ public class MainActivity extends AppCompatActivity {
     private SwapEngine engine;
     private final LinkedHashMap<String, Order> orderBook = new LinkedHashMap<>();
     private String orderStatus = null;
+    private CommsScanner takeScanner;   // maker side: receives buyers' hashlock handshakes
 
     // wallet state shown on the home screen
     private String minimaBal = "…";        // sendable (tradeable)
@@ -131,6 +135,7 @@ public class MainActivity extends AppCompatActivity {
             if (engine != null) engine.poll();
             refreshBalances(false);                 // keep balances current without a restart
             maybeAutoRepublish();                   // keep a live order fresh (~30 min)
+            scanTakeRequests();                      // receive buyers' hashlock handshakes
             ui.postDelayed(this, WATCH_INTERVAL_MS);
         }
     };
@@ -249,8 +254,10 @@ public class MainActivity extends AppCompatActivity {
     /** Once both the ETH wallet and Minima identity are ready, run a first poll to resume any swaps. */
     private void maybeStartEngine() {
         if (paired && wallet.ready() && minima.ready() && engine != null) {
+            loadIncoming();        // re-arm any pending buy handshakes from a prior session
             engine.poll();
             startSwapService();
+            scanTakeRequests();
             render();
         }
     }
@@ -439,6 +446,48 @@ public class MainActivity extends AppCompatActivity {
         SwapOrderBook.scan(node, ls,
                 book -> { orderBook.clear(); orderBook.putAll(book); render(); },
                 err -> { orderStatus = "Book scan: " + err; render(); });
+        scanTakeRequests();
+    }
+
+    // ---- buy handshake (maker side): receive buyers' hashlocks so we can getContract their USDT lock ----
+
+    private void scanTakeRequests() {
+        if (!paired || crypto == null || identity == null || engine == null) return;
+        if (takeScanner == null) {
+            takeScanner = new CommsScanner(node, crypto, new PrefsMeta(prefs), SwapTake.ADDRESS, this::routeTakeRequest, (ok, n) -> {});
+        }
+        takeScanner.scan(chainBlock);
+    }
+
+    private boolean routeTakeRequest(String coinid, Opened opened, JSONObject coin) {
+        try {
+            JSONObject j = new JSONObject(new String(opened.plaintext, StandardCharsets.UTF_8));
+            String to = j.optString("to", ""), from = j.optString("from", ""), hash = j.optString("hash", "");
+            if (hash.isEmpty() || !identity.publicId().equals(to)) return false;       // not for me
+            if (opened.fromPublicId == null || !opened.fromPublicId.equals(from)) return false;  // sender mismatch
+            return addIncoming(hash);
+        } catch (Exception e) { return false; }
+    }
+
+    /** Record a buyer's hashlock (engine discovers their USDT lock via getContract) + persist for resume. */
+    private boolean addIncoming(String hash) {
+        java.util.Set<String> set = incomingHashlocks();
+        boolean isNew = set.add(hash);
+        if (isNew) prefs.edit().putString("incoming_hashlocks", android.text.TextUtils.join(",", set)).apply();
+        if (engine != null) engine.addIncomingHashlock(hash);
+        return isNew;
+    }
+
+    private java.util.Set<String> incomingHashlocks() {
+        java.util.Set<String> set = new java.util.HashSet<>();
+        for (String h : prefs.getString("incoming_hashlocks", "").split(",")) if (!h.isEmpty()) set.add(h);
+        return set;
+    }
+
+    /** Re-arm the engine with persisted handshakes after a restart. */
+    private void loadIncoming() {
+        if (engine == null) return;
+        for (String h : incomingHashlocks()) engine.addIncomingHashlock(h);
     }
 
     /** Build the base order (pairs + my identities + USDT avail); returns null if no pair is enabled. */
@@ -678,8 +727,21 @@ public class MainActivity extends AppCompatActivity {
             // give MINIMA (minima), receive USDT (usdt) → MINIMA→ERC20
             engine.startMinimaToErc20(maker, minima, symbol, usdt, cb);
         } else {
-            // give USDT (usdt), receive MINIMA (minima) → ERC20→MINIMA
-            engine.startErc20ToMinima(maker, symbol, usdt, minima, cb);
+            // give USDT (usdt), receive MINIMA (minima) → ERC20→MINIMA. After the USDT locks, hand the maker
+            // our hashlock (sealed) so it can discover the lock via getContract instead of eth_getLogs.
+            engine.startErc20ToMinima(maker, symbol, usdt, minima, new SwapEngine.StartCb() {
+                @Override public void ok(String hash) {
+                    cb.ok(hash);
+                    if (crypto == null || maker.commsPublicId == null || maker.commsPublicId.isEmpty()) {
+                        orderStatus = "✓ Buy started, but the maker's contact key is missing — they may not see it."; render(); return;
+                    }
+                    SwapTake.send(node, crypto, maker.commsPublicId, identity.publicId(), hash, new CommsTransport.SendCb() {
+                        @Override public void onSent(String txpowid) { orderStatus = "✓ Buy started — maker notified, watching."; render(); }
+                        @Override public void onFailed(String message) { orderStatus = "Buy locked, but maker notify failed: " + message; render(); }
+                    });
+                }
+                @Override public void err(String msg) { cb.err(msg); }
+            });
         }
     }
 

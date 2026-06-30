@@ -19,9 +19,13 @@ import com.goterl.lazysodium.LazySodium;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.minimarex.comms.CommsIdentity;
+import org.minimarex.comms.CommsScanner;
 import org.minimarex.comms.CommsTransport;
+import org.minimarex.comms.CryptoProvider;
 import org.minimarex.comms.Hex;
+import org.minimarex.comms.LocalEcCryptoProvider;
 import org.minimarex.comms.NodeApi;
+import org.minimarex.comms.Opened;
 import org.minimarex.comms.Sodium;
 import org.minimarex.minimaswap.eth.EthNet;
 import org.minimarex.minimaswap.eth.EthRpc;
@@ -31,6 +35,7 @@ import org.minimarex.minimaswap.swap.Order;
 import org.minimarex.minimaswap.swap.SwapDb;
 import org.minimarex.minimaswap.swap.SwapEngine;
 import org.minimarex.minimaswap.swap.SwapOrderBook;
+import org.minimarex.minimaswap.swap.SwapTake;
 
 /**
  * Foreground service that drives the swap engine whenever the node is reachable — so in-flight swaps keep
@@ -57,6 +62,8 @@ public class SwapService extends Service {
     private SwapDb db;
     private SwapEngine engine;
     private CommsIdentity identity;       // to sign order-book republishes in the background
+    private CryptoProvider crypto;        // to open buyers' sealed hashlock handshakes
+    private CommsScanner takeScanner;
     private String myMinimaPk;
     private boolean booted = false;
 
@@ -145,7 +152,7 @@ public class SwapService extends Service {
                     try {
                         byte[] seed = ikm.startsWith("0x") ? Hex.from(ikm) : ikm.getBytes(java.nio.charset.StandardCharsets.UTF_8);
                         CommsIdentity id = CommsIdentity.fromSeed(ls, seed);
-                        h.post(() -> identity = id);
+                        h.post(() -> { identity = id; crypto = new LocalEcCryptoProvider(ls, id); });
                     } catch (Exception ignore) {}
                 }).start();
             }
@@ -156,10 +163,41 @@ public class SwapService extends Service {
     /** 90s poll loop — stands down while the Activity is foreground (it polls then), so we never double-act. */
     private final Runnable tick = new Runnable() {
         @Override public void run() {
-            if (!MainActivity.FOREGROUND && engine != null) { engine.poll(); maybeAutoRepublish(); }
+            if (!MainActivity.FOREGROUND && engine != null) { engine.poll(); maybeAutoRepublish(); scanTakeRequests(); }
             h.postDelayed(this, INTERVAL_MS);
         }
     };
+
+    // ---- buy handshake (maker side, background) ----
+
+    private void scanTakeRequests() {
+        if (crypto == null || identity == null || engine == null) return;
+        if (takeScanner == null) {
+            takeScanner = new CommsScanner(node, crypto, new PrefsMeta(prefs), SwapTake.ADDRESS, this::routeTakeRequest, (ok, n) -> {});
+            for (String hh : incomingHashlocks()) engine.addIncomingHashlock(hh);   // re-arm persisted handshakes
+        }
+        takeScanner.scan(0);   // bounded depth-grow scan; block number only affects bookmarking
+    }
+
+    private boolean routeTakeRequest(String coinid, Opened opened, JSONObject coin) {
+        try {
+            JSONObject j = new JSONObject(new String(opened.plaintext, java.nio.charset.StandardCharsets.UTF_8));
+            String to = j.optString("to", ""), from = j.optString("from", ""), hash = j.optString("hash", "");
+            if (hash.isEmpty() || !identity.publicId().equals(to)) return false;
+            if (opened.fromPublicId == null || !opened.fromPublicId.equals(from)) return false;
+            java.util.Set<String> set = incomingHashlocks();
+            boolean isNew = set.add(hash);
+            if (isNew) prefs.edit().putString("incoming_hashlocks", android.text.TextUtils.join(",", set)).apply();
+            engine.addIncomingHashlock(hash);
+            return isNew;
+        } catch (Exception e) { return false; }
+    }
+
+    private java.util.Set<String> incomingHashlocks() {
+        java.util.Set<String> set = new java.util.HashSet<>();
+        for (String hh : prefs.getString("incoming_hashlocks", "").split(",")) if (!hh.isEmpty()) set.add(hh);
+        return set;
+    }
 
     /** Keep a published order live + its size current while the app is closed (~30 min, fresh sendable). */
     private void maybeAutoRepublish() {

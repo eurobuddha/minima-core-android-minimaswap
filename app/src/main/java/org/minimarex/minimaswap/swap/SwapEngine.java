@@ -84,6 +84,7 @@ public final class SwapEngine {
     private volatile long lastEthScanned = -1;      // ETH block bookmark (New-contract discovery)
     private final Set<String> inflight = Collections.synchronizedSet(new HashSet<>());
     private final Map<String, Long> approvePending = Collections.synchronizedMap(new HashMap<>());
+    private final Set<String> incoming = Collections.synchronizedSet(new HashSet<>());   // hashlocks announced by a buyer's handshake
 
     public SwapEngine(NodeApi node, MinimaHtlc minima, SwapDb db, EthWallet wallet,
                       Handler ui, Notifier notifier) {
@@ -101,6 +102,12 @@ public final class SwapEngine {
     /** The node's full 64-key set, so refunds work for a coin locked under any default key. */
     public void setMyPubkeys(Set<String> keys) { this.myPubkeys = keys == null ? Collections.emptySet() : keys; }
     public void setMyOrder(Order o) { this.myOrder = o; }
+
+    /** A taker told us (via the sealed handshake) the hashlock of a USDT lock addressed to us. We discover it
+     *  by deterministic contractId via getContract (free-RPC-safe) instead of eth_getLogs, then respond. */
+    public void addIncomingHashlock(String hash) {
+        if (hash != null && !hash.isEmpty()) incoming.add(MinimaHtlc.normKey(hash));
+    }
     public SwapDb db() { return db; }
     public void shutdown() { io.shutdownNow(); }
 
@@ -379,6 +386,20 @@ public final class SwapEngine {
         for (SwapDb.Swap s : db.allSwaps()) {
             if (SwapDb.ST_COMPLETE.equals(s.status) || SwapDb.ST_REFUNDED.equals(s.status) || SwapDb.ST_ERROR.equals(s.status)) continue;
             try { checkEthContractFor(eth, s, myEth); } catch (Exception ignore) {}
+        }
+
+        // BUY handshake (free-RPC-safe): a buyer told us the hashlock of a USDT lock addressed to us. Find it by
+        // deterministic contractId via getContract (no eth_getLogs) and run the normal responder path (lock the
+        // MINIMA counter-leg). Once it becomes a known swap, the loop above + the secondary path take over.
+        for (String hash : new java.util.ArrayList<>(incoming)) {
+            if (db.getSwap(hash) != null || db.haveSentCounterParty(hash)) { incoming.remove(hash); continue; }
+            try {
+                EthHtlc.Contract c = eth.getContract(EthHtlc.contractId(hash));
+                if (c == null) continue;   // the buyer's USDT leg isn't visible yet — retry next cycle
+                if (c.receiver != null && c.receiver.equalsIgnoreCase(myEth) && !c.withdrawn && !c.refunded) {
+                    checkCanCollectEth(eth, c, minimaBlock);
+                }
+            } catch (Exception ignore) {}
         }
 
         // SECONDARY (best-effort): eth_getLogs to discover a brand-new incoming ERC20→MINIMA lock whose
