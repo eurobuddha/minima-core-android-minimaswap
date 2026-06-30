@@ -1072,7 +1072,7 @@ public class MainActivity extends AppCompatActivity {
         v.setTypeface(v.getTypeface(), android.graphics.Typeface.BOLD); v.setPadding(0, dp(3), 0, 0);
         c.addView(t); c.addView(v);
         if (sub != null) {
-            TextView s = new TextView(this); s.setText(sub); s.setTextColor(Design.DIM2); s.setTextSize(12.5f); s.setPadding(0, dp(4), 0, 0);
+            TextView s = new TextView(this); s.setText(sub); s.setTextColor(Design.DIM); s.setTextSize(13f); s.setPadding(0, dp(5), 0, 0);
             c.addView(s);
         }
         return c;
