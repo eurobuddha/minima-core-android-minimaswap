@@ -107,6 +107,7 @@ public class MainActivity extends AppCompatActivity {
     private String minimaBal = "…";        // sendable (tradeable)
     private String minimaConfirmed = "—", minimaUnconfirmed = "—", minimaCoins = "—";
     private long lastMinimaUpdate = 0;
+    private int chainBlock = 0;
     private String ethAddr = null;
     private String ethErr = null;
     private String ethBal = "…";
@@ -384,7 +385,16 @@ public class MainActivity extends AppCompatActivity {
     private void refreshBalances(boolean showLoading) {
         if (!paired) return;
         fetchMinimaBalance();
+        fetchBlock();
         if (wallet.ready()) fetchEthBalances(showLoading);
+    }
+
+    private void fetchBlock() {
+        if (!paired || minima == null) return;
+        minima.currentBlock(new MinimaHtlc.BlockCb() {
+            @Override public void ok(int block) { chainBlock = block; render(); }
+            @Override public void err(String m) {}
+        });
     }
 
     private void fetchEthBalances(boolean showLoading) {
@@ -696,7 +706,7 @@ public class MainActivity extends AppCompatActivity {
         col.addView(header);
 
         TextView sub = new TextView(this);
-        sub.setText("v" + BuildConfig.VERSION_NAME + "  ·  Cross-chain atomic swaps · MINIMA ↔ USDT");
+        sub.setText("v" + BuildConfig.VERSION_NAME + (chainBlock > 0 ? "  ·  block " + chainBlock : "") + "  ·  MINIMA ↔ USDT");
         sub.setTextColor(Design.DIM2); sub.setTextSize(12.5f); sub.setPadding(0, dp(2), 0, dp(14));
         col.addView(sub);
 
@@ -808,10 +818,28 @@ public class MainActivity extends AppCompatActivity {
         for (SwapDb.Swap s : show) col.addView(swapCard(s));
         if (hidden > 0) {
             TextView h = new TextView(this);
-            h.setText(hidden + " finished swap" + (hidden == 1 ? "" : "s") + " hidden");
-            h.setTextColor(Design.DIM2); h.setTextSize(11.5f); h.setPadding(dp(2), dp(6), 0, 0);
+            h.setText(hidden + " finished swap" + (hidden == 1 ? "" : "s") + " hidden — tap to view");
+            h.setTextColor(Design.DIM); h.setTextSize(11.5f); h.setPadding(dp(2), dp(6), 0, dp(2));
+            h.setOnClickListener(v -> showHiddenSwaps());
             col.addView(h);
         }
+    }
+
+    /** History of finished (hidden) swaps. */
+    private void showHiddenSwaps() {
+        java.util.Set<String> dismissed = dismissedSwaps();
+        long now = System.currentTimeMillis();
+        StringBuilder sb = new StringBuilder();
+        int n = 0;
+        for (SwapDb.Swap s : db.allSwaps()) {
+            if (isTerminal(s) && (dismissed.contains(s.hash) || now - s.updated > TERMINAL_GRACE_MS)) {
+                n++;
+                sb.append(s.sellAmount).append(" ").append(s.sellToken).append("  →  ")
+                  .append(s.buyAmount).append(" ").append(s.buyToken)
+                  .append("   ·   ").append(statusLabel(s)).append("\n");
+            }
+        }
+        showText("Finished swaps (" + n + ")", n == 0 ? "None." : sb.toString().trim());
     }
 
     private static boolean isTerminal(SwapDb.Swap s) {
