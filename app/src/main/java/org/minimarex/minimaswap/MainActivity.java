@@ -529,7 +529,7 @@ public class MainActivity extends AppCompatActivity {
         col.addView(header);
 
         TextView sub = new TextView(this);
-        sub.setText("Cross-chain atomic swaps · MINIMA ↔ USDT");
+        sub.setText("v" + BuildConfig.VERSION_NAME + "  ·  Cross-chain atomic swaps · MINIMA ↔ USDT");
         sub.setTextColor(Design.DIM2); sub.setTextSize(12.5f); sub.setPadding(0, dp(2), 0, dp(14));
         col.addView(sub);
 

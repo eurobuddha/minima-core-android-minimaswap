@@ -48,17 +48,18 @@ public final class EthRpc {
      * transport/parse failure (e.g. a 521/HTML body); the first that answers becomes the active one.
      */
     public Object call(String method, JSONArray params) throws IOException {
-        IOException last = null;
+        StringBuilder errs = new StringBuilder();
         for (String ep : endpoints) {
             try {
                 Object r = callOnce(ep, method, params);
                 if (!ep.equals(url)) url = ep;         // stick to whichever responded
                 return r;
-            } catch (IOException e) {
-                last = e;                               // try the next endpoint
+            } catch (IOException e) {                   // try the next endpoint; keep each reason
+                if (errs.length() > 0) errs.append("  |  ");
+                errs.append(e.getMessage());
             }
         }
-        throw last != null ? last : new IOException("ETH RPC " + method + ": no endpoint responded");
+        throw new IOException(method + " failed on all RPCs: " + errs);
     }
 
     private Object callOnce(String url, String method, JSONArray params) throws IOException {
@@ -78,17 +79,32 @@ public final class EthRpc {
             }
             int code = c.getResponseCode();
             String body = readAll(code < 400 ? c.getInputStream() : c.getErrorStream());
-            JSONObject resp = new JSONObject(body);
+            String trimmed = body == null ? "" : body.trim();
+            // A healthy node answers with a JSON object; anything else (HTML error page, 5xx text,
+            // captive portal, empty) gets reported with host+status+snippet so failures are diagnosable.
+            if (!trimmed.startsWith("{")) {
+                throw new IOException(host(url) + " HTTP " + code + " non-JSON: " + snippet(trimmed));
+            }
+            JSONObject resp = new JSONObject(trimmed);
             if (resp.has("error")) {
                 JSONObject err = resp.optJSONObject("error");
-                throw new IOException("ETH RPC " + method + ": " + (err == null ? body : err.optString("message", body)));
+                throw new IOException(host(url) + ": " + (err == null ? snippet(trimmed) : err.optString("message", snippet(trimmed))));
             }
             return resp.opt("result");
         } catch (JSONException e) {
-            throw new IOException("ETH RPC " + method + " parse error: " + e.getMessage());
+            throw new IOException(host(url) + " parse error: " + e.getMessage());
         } finally {
             if (c != null) c.disconnect();
         }
+    }
+
+    private static String host(String url) {
+        try { return new URL(url).getHost(); } catch (Exception e) { return url; }
+    }
+    private static String snippet(String s) {
+        if (s == null || s.isEmpty()) return "(empty)";
+        s = s.replaceAll("\\s+", " ").trim();
+        return s.length() > 80 ? s.substring(0, 80) + "…" : s;
     }
 
     public String callStr(String method, JSONArray params) throws IOException {
