@@ -295,10 +295,10 @@ public final class SwapEngine {
     // ---- Minima side (node.cmd; main thread) ----
 
     private void runMinimaChecks(final int block) {
-        // Harvest secrets from the notify address ONLY if a leg I locked is waiting for one (keeps us off
-        // the global notify address otherwise).
-        if (waitingForMinimaSecret()) {
-            minima.scanNotifyCoins(NOTIFY_SCAN_DEPTH, coins -> harvestNotifySecrets(coins), e -> {});
+        // Harvest the revealed secret for each leg I locked that's still waiting — one hashlock-FILTERED query
+        // per pending swap, so we never pull the whole (global, unbounded) notify address.
+        for (String h : pendingSecretHashes()) {
+            minima.scanNotifySecret(h, NOTIFY_SCAN_DEPTH, coins -> harvestNotifySecrets(coins), e -> {});
         }
         minima.scanMyHtlcCoins(coins -> {
             for (int i = 0; i < coins.length(); i++) {
@@ -655,12 +655,14 @@ public final class SwapEngine {
 
     // ============================================================ secret harvesting (Minima notify)
 
-    private boolean waitingForMinimaSecret() {
+    /** Hashlocks of legs I locked as an ERC20→MINIMA responder that are still waiting for the revealed secret. */
+    private java.util.List<String> pendingSecretHashes() {
+        java.util.List<String> out = new java.util.ArrayList<>();
         for (SwapDb.Swap s : db.allSwaps()) {
             if ("RESPONDER".equals(s.role) && "ERC20_TO_MINIMA".equals(s.direction)
-                    && SwapDb.ST_LOCKED.equals(s.status) && db.getSecret(s.hash) == null) return true;
+                    && SwapDb.ST_LOCKED.equals(s.status) && db.getSecret(s.hash) == null) out.add(s.hash);
         }
-        return false;
+        return out;
     }
 
     private void harvestNotifySecrets(JSONArray coins) {

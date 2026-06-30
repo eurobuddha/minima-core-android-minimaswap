@@ -239,14 +239,19 @@ public final class MinimaHtlc {
      * The ERC20→MINIMA responder reads the secret here. Bounded by {@code depth} — the address is global,
      * so we never query it unbounded; the caller filters by the hashlocks it actually cares about.
      */
-    public void scanNotifyCoins(int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
-        // The notify address is SHARED (nobody owns it), so `relevant:false` returns 0 until it's tracked.
-        // coinnotify-add it first (idempotent), then query BARE — the same fix the order-book scan uses.
-        cmd("coinnotify action:add address:" + NOTIFY, r -> doScanNotify(depth, ok, err), e -> doScanNotify(depth, ok, err));
+    /**
+     * Find the revealed-secret notify coin for ONE hashlock. The notify address is a SHARED, global sink —
+     * EVERY bridge claim on the network drops a dust coin here forever — so we must (a) {@code coinnotify}-add
+     * it (else a shared address returns 0 coins until tracked) and (b) filter by {@code state:<hash>} so the
+     * node returns only OUR coin (the claim writes the hashlock to state[101]), not the whole address. Without
+     * the state filter a busy mainnet could return a multi-MB reply and crash Minima Core over the IPC.
+     */
+    public void scanNotifySecret(String hash, int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
+        cmd("coinnotify action:add address:" + NOTIFY, r -> doScanNotify(hash, depth, ok, err), e -> doScanNotify(hash, depth, ok, err));
     }
 
-    private void doScanNotify(int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
-        cmd("coins simplestate:true depth:" + depth + " address:" + NOTIFY, r -> {
+    private void doScanNotify(String hash, int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
+        cmd("coins simplestate:true depth:" + depth + " state:" + hash + " address:" + NOTIFY, r -> {
             Object resp = r.opt("response");
             ok.accept(resp instanceof org.json.JSONArray ? (org.json.JSONArray) resp : new org.json.JSONArray());
         }, err);
