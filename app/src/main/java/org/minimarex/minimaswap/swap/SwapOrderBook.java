@@ -50,9 +50,24 @@ public final class SwapOrderBook {
         }
     }
 
-    /** Bounded one-shot scan of the order book; verifies signatures and returns freshest-per-signer. */
+    /**
+     * Bounded one-shot scan of the order book; verifies signatures and returns freshest-per-signer.
+     *
+     * The book lives at a SHARED address nobody owns, so Minima returns 0 coins for {@code relevant:false}
+     * there until the address is tracked. We therefore {@code coinnotify}-add it first (idempotent), then
+     * query BARE (no {@code relevant} flag) — the same pattern the comms scanner uses for the Mail address.
+     * The query stays bounded by {@code depth:} (a shared address can be heavy; an unbounded read can crash
+     * the node).
+     */
     public static void scan(NodeApi node, LazySodium ls, Consumer<Map<String, Order>> ok, Consumer<String> err) {
-        node.cmd("coins depth:" + SCAN_DEPTH + " relevant:false simplestate:true address:" + ADDRESS, new NodeApi.Cb() {
+        node.cmd("coinnotify action:add address:" + ADDRESS, new NodeApi.Cb() {
+            @Override public void onResult(JSONObject j) { doScan(node, ls, ok, err); }
+            @Override public void onError(String m) { doScan(node, ls, ok, err); }   // proceed regardless
+        });
+    }
+
+    private static void doScan(NodeApi node, LazySodium ls, Consumer<Map<String, Order>> ok, Consumer<String> err) {
+        node.cmd("coins simplestate:true order:desc depth:" + SCAN_DEPTH + " address:" + ADDRESS, new NodeApi.Cb() {
             @Override public void onResult(JSONObject j) {
                 Object resp = j.opt("response");
                 JSONArray coins = resp instanceof JSONArray ? (JSONArray) resp : new JSONArray();
