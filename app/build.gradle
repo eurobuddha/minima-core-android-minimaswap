@@ -1,0 +1,68 @@
+plugins {
+    alias(libs.plugins.android.application)
+}
+
+android {
+    namespace 'org.minimarex.minimaswap'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId "org.minimarex.minimaswap"
+        minSdk 28
+        targetSdk 35
+        versionCode 100
+        versionName "0.1.0"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            // Sign release with the debug keystore, matching the minima-core-android node app.
+            // IPC is authorized by the MINIMA_ID token, not by signature, so this is sufficient
+            // for sideloading. Swap to a dedicated release keystore if uploading to Play.
+            signingConfig signingConfigs.debug
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+    buildFeatures {
+        buildConfig true
+    }
+}
+
+dependencies {
+
+    implementation libs.appcompat
+    implementation libs.material
+    implementation libs.activity
+    implementation libs.constraintlayout
+
+    // Message + contact lists
+    implementation 'androidx.recyclerview:recyclerview:1.3.2'
+
+    // Minima Core IPC client SDK (the only way this app reaches the node)
+    implementation files('libs/minimaapi.aar')
+
+    // Client-side end-to-end crypto: X25519 sealed box + Ed25519 (libsodium via Lazysodium).
+    // The minimaCore node has no Maxima, so all encryption/signing happens in-app; the node
+    // only carries the sealed blob in coin state. Keys are derived from the Minima seed.
+    implementation 'com.goterl:lazysodium-android:5.1.0@aar'
+    implementation 'net.java.dev.jna:jna:5.13.0@aar'
+
+    // QR: generate your key as a QR (core) + scan a contact's key (embedded scanner).
+    implementation 'com.google.zxing:core:3.5.3'
+    implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
+
+    // Ethereum: key derivation (secp256k1), legacy tx signing (RLP) and ABI encode/decode.
+    // We do the JSON-RPC ourselves over HttpURLConnection, so we pull only the pure-Java web3j
+    // modules (no okhttp/core HTTP stack) to stay light on Android. Bouncy Castle comes transitively.
+    implementation 'org.web3j:crypto:4.9.8'
+    implementation 'org.web3j:abi:4.9.8'
+    implementation 'org.web3j:rlp:4.9.8'
+    implementation 'org.web3j:utils:4.9.8'
+}

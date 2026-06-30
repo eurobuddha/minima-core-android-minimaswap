@@ -1,0 +1,18 @@
+# Android / Gradle build output
+.gradle/
+build/
+app/build/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store
+
+# Machine-specific
+local.properties
+
+# Local versioned APK archive (built APKs live in the minima-core-apks repo + GitHub Releases)
+releases/
