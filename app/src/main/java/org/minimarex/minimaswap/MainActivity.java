@@ -103,7 +103,9 @@ public class MainActivity extends AppCompatActivity {
     private String orderStatus = null;
 
     // wallet state shown on the home screen
-    private String minimaBal = "…";
+    private String minimaBal = "…";        // sendable (tradeable)
+    private String minimaConfirmed = "—", minimaUnconfirmed = "—", minimaCoins = "—";
+    private long lastMinimaUpdate = 0;
     private String ethAddr = null;
     private String ethErr = null;
     private String ethBal = "…";
@@ -306,11 +308,28 @@ public class MainActivity extends AppCompatActivity {
                 JSONObject t = null;
                 if (resp instanceof JSONArray && ((JSONArray) resp).length() > 0) t = ((JSONArray) resp).optJSONObject(0);
                 else if (resp instanceof JSONObject) t = (JSONObject) resp;
-                minimaBal = t == null ? "0" : t.optString("sendable", t.optString("confirmed", "0"));
+                if (t != null) {
+                    minimaBal = t.optString("sendable", "0");          // tradeable: simple-address coins only
+                    minimaConfirmed = t.optString("confirmed", "—");   // all your confirmed coins (incl. contract-locked)
+                    minimaUnconfirmed = t.optString("unconfirmed", "—");
+                    minimaCoins = t.optString("coins", "—");
+                }
+                lastMinimaUpdate = System.currentTimeMillis();
                 render();
             }
-            @Override public void onError(String m) { minimaBal = "—"; render(); }
+            @Override public void onError(String m) { minimaBal = "— (node didn't answer)"; lastMinimaUpdate = System.currentTimeMillis(); render(); }
         });
+    }
+
+    /** Full Minima balance breakdown so the displayed numbers are never a black box. */
+    private String minimaBreakdown() {
+        String locked = "—";
+        try {
+            locked = Util.tidyAmount(new java.math.BigDecimal(minimaConfirmed).subtract(new java.math.BigDecimal(minimaBal)).toPlainString());
+        } catch (Exception ignore) {}
+        String ago = lastMinimaUpdate == 0 ? "never" : ((System.currentTimeMillis() - lastMinimaUpdate) / 1000) + "s ago";
+        return "confirmed " + Util.tidyAmount(minimaConfirmed) + "  ·  locked ≈ " + locked
+                + "  ·  unconfirmed " + Util.tidyAmount(minimaUnconfirmed) + "  ·  " + minimaCoins + " coins  ·  updated " + ago;
     }
 
     /** Refresh both wallet balances. showLoading=false → silent (periodic) update, no "…" flicker. */
@@ -633,7 +652,7 @@ public class MainActivity extends AppCompatActivity {
         sub.setTextColor(Design.DIM2); sub.setTextSize(12.5f); sub.setPadding(0, dp(2), 0, dp(14));
         col.addView(sub);
 
-        col.addView(walletCard("Minima", minimaBal + " MINIMA", null, Design.ACCENT));
+        col.addView(walletCard("Minima · tradeable (sendable)", minimaBal + " MINIMA", minimaBreakdown(), Design.ACCENT));
 
         String addrLine = ethAddr == null ? (ethErr == null ? "deriving from node seed…" : "—") : shortAddr(ethAddr);
         LinearLayout ethCard = walletCard("Ethereum · " + net.label, ethBal, addrLine, Design.TEXT);
