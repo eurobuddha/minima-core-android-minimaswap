@@ -107,6 +107,8 @@ public class MainActivity extends AppCompatActivity {
     private final LinkedHashMap<String, Order> orderBook = new LinkedHashMap<>();
     private String orderStatus = null;
     private CommsScanner takeScanner;   // maker side: receives buyers' hashlock handshakes
+    private boolean showHistory = false;
+    private int historyTab = 0;         // 0 = my swaps, 1 = market
 
     // wallet state shown on the home screen
     private String minimaBal = "…";        // sendable (tradeable)
@@ -169,6 +171,11 @@ public class MainActivity extends AppCompatActivity {
         engine = new SwapEngine(node, minima, db, wallet, ui, notifier);
         engine.setNetwork(rpc, net);
         engine.setMyOrder(loadOrder());
+    }
+
+    @Override public void onBackPressed() {
+        if (showHistory) { closeHistory(); return; }   // the history page is the app's only "back" target
+        super.onBackPressed();
     }
 
     @Override protected void onResume() {
@@ -804,6 +811,7 @@ public class MainActivity extends AppCompatActivity {
         // (watcher / balance callback) restarts the IME and resets the cursor mid-typing. We re-render
         // once when the dialog dismisses.
         if (modalOpen) return;
+        if (showHistory) { renderHistoryPage(); return; }
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         col.setPadding(dp(16), dp(14), dp(16), dp(24));
@@ -821,8 +829,15 @@ public class MainActivity extends AppCompatActivity {
 
         TextView sub = new TextView(this);
         sub.setText("v" + BuildConfig.VERSION_NAME + (chainBlock > 0 ? "  ·  block " + chainBlock : "") + "  ·  MINIMA ↔ USDT");
-        sub.setTextColor(Design.DIM2); sub.setTextSize(12.5f); sub.setPadding(0, dp(2), 0, dp(14));
+        sub.setTextColor(Design.DIM2); sub.setTextSize(12.5f); sub.setPadding(0, dp(2), 0, dp(10));
         col.addView(sub);
+
+        LinearLayout histRow = new LinearLayout(this);
+        histRow.setOrientation(LinearLayout.HORIZONTAL); histRow.setPadding(0, 0, 0, dp(6));
+        TextView histPill = Design.pill(this, "📊  History / Market", Design.SURFACE2, Design.TEXT);
+        histPill.setOnClickListener(v -> openHistory(0));
+        histRow.addView(histPill);
+        col.addView(histRow);
 
         LinearLayout minimaCard = walletCard("Minima · tradeable (sendable)", minimaBal + " MINIMA", minimaBreakdown() + "  ·  long-press for coins", Design.ACCENT);
         minimaCard.setOnLongClickListener(v -> { minimaCoinDump(); return true; });
@@ -932,28 +947,160 @@ public class MainActivity extends AppCompatActivity {
         for (SwapDb.Swap s : show) col.addView(swapCard(s));
         if (hidden > 0) {
             TextView h = new TextView(this);
-            h.setText(hidden + " finished swap" + (hidden == 1 ? "" : "s") + " hidden — tap to view");
+            h.setText(hidden + " finished swap" + (hidden == 1 ? "" : "s") + " hidden — tap for history");
             h.setTextColor(Design.DIM); h.setTextSize(11.5f); h.setPadding(dp(2), dp(6), 0, dp(2));
-            h.setOnClickListener(v -> showHiddenSwaps());
+            h.setOnClickListener(v -> openHistory(0));
             col.addView(h);
         }
     }
 
-    /** History of finished (hidden) swaps. */
-    private void showHiddenSwaps() {
-        java.util.Set<String> dismissed = dismissedSwaps();
-        long now = System.currentTimeMillis();
-        StringBuilder sb = new StringBuilder();
-        int n = 0;
-        for (SwapDb.Swap s : db.allSwaps()) {
-            if (isTerminal(s) && (dismissed.contains(s.hash) || now - s.updated > TERMINAL_GRACE_MS)) {
-                n++;
-                sb.append(s.sellAmount).append(" ").append(s.sellToken).append("  →  ")
-                  .append(s.buyAmount).append(" ").append(s.buyToken)
-                  .append("   ·   ").append(statusLabel(s)).append("\n");
-            }
+    // ============================================================ History / Market page
+
+    private void openHistory(int tab) { historyTab = tab; showHistory = true; render(); }
+    private void closeHistory() { showHistory = false; render(); }
+
+    private void renderHistoryPage() {
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding(dp(16), dp(14), dp(16), dp(24));
+
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL); top.setGravity(Gravity.CENTER_VERTICAL);
+        TextView back = Design.pill(this, "←  Back", Design.SURFACE2, Design.TEXT);
+        back.setOnClickListener(v -> closeHistory());
+        top.addView(back);
+        TextView title = new TextView(this);
+        title.setText("   History");
+        title.setTextColor(Design.TEXT); title.setTextSize(20f); title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
+        top.addView(title);
+        col.addView(top);
+
+        LinearLayout tabs = new LinearLayout(this);
+        tabs.setOrientation(LinearLayout.HORIZONTAL); tabs.setPadding(0, dp(12), 0, dp(8));
+        LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        gap.rightMargin = dp(8);
+        TextView t0 = Design.pill(this, "My swaps", historyTab == 0 ? Design.ACCENT : Design.SURFACE2, historyTab == 0 ? Design.ON_ACCENT : Design.DIM);
+        t0.setOnClickListener(v -> openHistory(0));
+        TextView t1 = Design.pill(this, "Market", historyTab == 1 ? Design.ACCENT : Design.SURFACE2, historyTab == 1 ? Design.ON_ACCENT : Design.DIM);
+        t1.setOnClickListener(v -> openHistory(1));
+        tabs.addView(t0, gap); tabs.addView(t1);
+        col.addView(tabs);
+
+        if (historyTab == 0) mySwapsList(col); else marketView(col);
+
+        scroller.removeAllViews();
+        scroller.addView(col);
+    }
+
+    private void mySwapsList(LinearLayout col) {
+        if (db == null) return;
+        java.util.List<SwapDb.Swap> all = db.allSwaps();
+        if (all.isEmpty()) { col.addView(dimNote("No swaps yet — your completed and refunded swaps will appear here.")); return; }
+        for (SwapDb.Swap s : all) col.addView(historySwapCard(s));
+    }
+
+    private LinearLayout historySwapCard(SwapDb.Swap s) {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.setBackground(Design.roundBg(this, Design.SURFACE, 14));
+        c.setPadding(dp(14), dp(10), dp(14), dp(10));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(8); c.setLayoutParams(lp);
+
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL); top.setGravity(Gravity.CENTER_VERTICAL);
+        TextView line = new TextView(this);
+        line.setText(s.sellAmount + " " + s.sellToken + "  →  " + s.buyAmount + " " + s.buyToken);
+        line.setTextColor(Design.TEXT); line.setTextSize(14f);
+        top.addView(line, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        top.addView(Design.pill(this, statusLabel(s), statusBg(s), statusFg(s)));
+        c.addView(top);
+
+        TextView meta = new TextView(this);
+        String when = android.text.format.DateUtils.getRelativeTimeSpanString(
+                s.created, System.currentTimeMillis(), android.text.format.DateUtils.MINUTE_IN_MILLIS).toString();
+        String cp = (s.counterparty == null || s.counterparty.isEmpty()) ? "" : "  ·  " + shortAddr(s.counterparty);
+        meta.setText(when + "  ·  " + s.role.toLowerCase() + cp);
+        meta.setTextColor(Design.DIM2); meta.setTextSize(11.5f); meta.setPadding(0, dp(4), 0, 0);
+        c.addView(meta);
+
+        TextView detail = new TextView(this);
+        detail.setText(statusDetail(s));
+        detail.setTextColor(Design.DIM); detail.setTextSize(12f); detail.setPadding(0, dp(3), 0, 0);
+        c.addView(detail);
+
+        c.setOnClickListener(v -> checkNow(s.hash));   // tap → live inspect detail
+        return c;
+    }
+
+    private void marketView(LinearLayout col) {
+        if (db == null) return;
+        java.util.List<SwapDb.MarketTrade> chartData = db.executedTrades(200);
+        java.util.List<SwapDb.MarketTrade> recent = db.recentTrades(50);
+
+        MarketChartView chart = new MarketChartView(this);
+        chart.setBackground(Design.roundBg(this, Design.SURFACE, 14));
+        chart.setData(chartData);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(180));
+        clp.topMargin = dp(6); chart.setLayoutParams(clp);
+        col.addView(chart);
+
+        TextView stats = new TextView(this);
+        String last = chartData.isEmpty() ? "—" : fmtPrice(chartData.get(chartData.size() - 1).price);
+        stats.setText("last " + last + " USDT/MINIMA  ·  " + countByStatus(recent) + "  ·  price only (buy/sell not shown)");
+        stats.setTextColor(Design.DIM2); stats.setTextSize(11f); stats.setPadding(dp(2), dp(8), 0, dp(6));
+        col.addView(stats);
+
+        if (recent.isEmpty()) {
+            col.addView(dimNote("No market trades observed yet. minimaSwap records swaps network-wide (this app + the original miniSwap) as they happen — it can't backfill, so history builds from now on."));
+            return;
         }
-        showText("Finished swaps (" + n + ")", n == 0 ? "None." : sb.toString().trim());
+        for (SwapDb.MarketTrade t : recent) col.addView(tradeRow(t));
+    }
+
+    private LinearLayout tradeRow(SwapDb.MarketTrade t) {
+        LinearLayout r = new LinearLayout(this);
+        r.setOrientation(LinearLayout.HORIZONTAL); r.setGravity(Gravity.CENTER_VERTICAL);
+        r.setBackground(Design.roundBg(this, Design.SURFACE, 10));
+        r.setPadding(dp(12), dp(8), dp(12), dp(8));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(6); r.setLayoutParams(lp);
+
+        TextView when = new TextView(this);
+        when.setText(android.text.format.DateUtils.getRelativeTimeSpanString(
+                t.observedAt, System.currentTimeMillis(), android.text.format.DateUtils.MINUTE_IN_MILLIS).toString());
+        when.setTextColor(Design.DIM2); when.setTextSize(11f);
+        r.addView(when, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView price = new TextView(this);
+        price.setText(fmtPrice(t.price)); price.setTextColor(Design.TEXT); price.setTextSize(14f);
+        r.addView(price);
+
+        TextView size = new TextView(this);
+        size.setText("  " + abbrev(parseD(t.sizeMinima, 0)) + " M"); size.setTextColor(Design.DIM); size.setTextSize(12f);
+        size.setPadding(dp(8), 0, dp(8), 0);
+        r.addView(size);
+
+        boolean exec = SwapDb.MT_EXECUTED.equals(t.status), ref = SwapDb.MT_REFUNDED.equals(t.status);
+        int bg = exec ? Design.IN : (ref ? Design.RED : Design.SURFACE2);
+        int fg = (exec || ref) ? Design.ON_ACCENT : Design.DIM;
+        r.addView(Design.pill(this, exec ? "filled" : ref ? "cancelled" : "open", bg, fg));
+        return r;
+    }
+
+    private String countByStatus(java.util.List<SwapDb.MarketTrade> ts) {
+        int ex = 0, op = 0;
+        for (SwapDb.MarketTrade t : ts) {
+            if (SwapDb.MT_EXECUTED.equals(t.status)) ex++;
+            else if (SwapDb.MT_OPEN.equals(t.status)) op++;
+        }
+        return ex + " filled · " + op + " open";
+    }
+
+    private TextView dimNote(String s) {
+        TextView t = new TextView(this);
+        t.setText(s); t.setTextColor(Design.DIM); t.setTextSize(12.5f); t.setPadding(dp(2), dp(12), dp(2), 0);
+        return t;
     }
 
     private static boolean isTerminal(SwapDb.Swap s) {

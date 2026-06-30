@@ -287,6 +287,7 @@ public final class SwapEngine {
             @Override public void ok(int block) {
                 runMinimaChecks(block);
                 io.execute(() -> runEthChecks(block));
+                MarketCollector.poll(minima, db, block);   // accrue network-wide trade history
             }
             @Override public void err(String m) { /* node busy; next cycle */ }
         });

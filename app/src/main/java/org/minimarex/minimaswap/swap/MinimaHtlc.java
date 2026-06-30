@@ -221,6 +221,23 @@ public final class MinimaHtlc {
     }
 
     /**
+     * EVERY currently-open lock at the shared HTLC address, network-wide (the market data feed). The address is
+     * shared/unowned, so {@code relevant:false} returns 0 until tracked — coinnotify-add it first (idempotent),
+     * then query BARE with simplestate. Bounded by {@code depth} (a heavy reply on a busy shared address can
+     * crash the node over the IPC). Includes the upstream miniSwap dapp's locks (same contract).
+     */
+    public void scanAllHtlcCoins(int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
+        cmd("coinnotify action:add address:" + HTLC_ADDRESS, r -> doScanAllHtlc(depth, ok, err), e -> doScanAllHtlc(depth, ok, err));
+    }
+
+    private void doScanAllHtlc(int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
+        cmd("coins simplestate:true depth:" + depth + " address:" + HTLC_ADDRESS, r -> {
+            Object resp = r.opt("response");
+            ok.accept(resp instanceof org.json.JSONArray ? (org.json.JSONArray) resp : new org.json.JSONArray());
+        }, err);
+    }
+
+    /**
      * Scan the HTLC address for coins relevant to ME — verbatim the upstream query
      * ({@code coins coinage:2 tokenid:0x00 simplestate:true relevant:true address:HTLC_ADDRESS}).
      * {@code relevant:true} bounds the reply to coins my keys appear in (owner state[0] or receiver

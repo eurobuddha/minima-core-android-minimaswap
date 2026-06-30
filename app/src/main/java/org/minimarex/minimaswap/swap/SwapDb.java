@@ -233,8 +233,103 @@ public final class SwapDb {
         return s.startsWith("0x") ? s.substring(2) : s;
     }
 
+    // ================= market_trades (network-wide trade history, from on-chain HTLC locks) =================
+
+    public static final class MarketTrade {
+        public String coinid, hash, sizeMinima, reqAmount, reqToken, owner, receiver, status, secret;
+        public double price;          // USDT per MINIMA = reqAmount / sizeMinima
+        public long createdBlock, observedAt, timelock;
+    }
+
+    public static final String MT_OPEN = "OPEN", MT_EXECUTED = "EXECUTED", MT_REFUNDED = "REFUNDED";
+
+    /** Record/refresh an observed open HTLC lock (network-wide). Keyed by coinid; never downgrades a
+     *  terminal row back to OPEN. */
+    public synchronized void upsertOpenTrade(MarketTrade t) {
+        if (t.coinid == null || t.coinid.isEmpty()) return;
+        ContentValues v = new ContentValues();
+        v.put("coinid", t.coinid);
+        v.put("hash", norm(t.hash));
+        v.put("price", t.price);
+        v.put("size_minima", t.sizeMinima);
+        v.put("req_amount", t.reqAmount);
+        v.put("req_token", t.reqToken);
+        v.put("owner", t.owner);
+        v.put("receiver", t.receiver);
+        v.put("created_block", t.createdBlock);
+        // keep the first-seen observed_at; only set on insert
+        helper.getWritableDatabase().execSQL(
+                "INSERT OR IGNORE INTO market_trades(coinid,hash,price,size_minima,req_amount,req_token,owner,"
+                        + "receiver,created_block,timelock,observed_at,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                new Object[]{t.coinid, norm(t.hash), t.price, t.sizeMinima, t.reqAmount, t.reqToken, t.owner,
+                        t.receiver, t.createdBlock, t.timelock, System.currentTimeMillis(), MT_OPEN});
+    }
+
+    /** All trades still marked OPEN (so the collector can detect which were spent since last scan). */
+    public synchronized List<MarketTrade> openTrades() {
+        List<MarketTrade> out = new ArrayList<>();
+        try (Cursor c = helper.getReadableDatabase().rawQuery(
+                "SELECT * FROM market_trades WHERE status=?", new String[]{MT_OPEN})) {
+            while (c.moveToNext()) out.add(readTrade(c));
+        }
+        return out;
+    }
+
+    public synchronized void markTradeExecuted(String coinid, String secret) {
+        ContentValues v = new ContentValues();
+        v.put("status", MT_EXECUTED);
+        if (secret != null) v.put("secret", secret);
+        helper.getWritableDatabase().update("market_trades", v, "coinid=?", new String[]{coinid});
+    }
+
+    public synchronized void markTradeRefunded(String coinid) {
+        ContentValues v = new ContentValues();
+        v.put("status", MT_REFUNDED);
+        helper.getWritableDatabase().update("market_trades", v, "coinid=?", new String[]{coinid});
+    }
+
+    /** Recent trades (any status), newest first by created block then observed time. */
+    public synchronized List<MarketTrade> recentTrades(int limit) {
+        List<MarketTrade> out = new ArrayList<>();
+        try (Cursor c = helper.getReadableDatabase().rawQuery(
+                "SELECT * FROM market_trades ORDER BY created_block DESC, observed_at DESC LIMIT ?",
+                new String[]{String.valueOf(limit)})) {
+            while (c.moveToNext()) out.add(readTrade(c));
+        }
+        return out;
+    }
+
+    /** Executed prints for the chart, oldest→newest so a line plots left-to-right. */
+    public synchronized List<MarketTrade> executedTrades(int limit) {
+        List<MarketTrade> out = new ArrayList<>();
+        try (Cursor c = helper.getReadableDatabase().rawQuery(
+                "SELECT * FROM (SELECT * FROM market_trades WHERE status=? ORDER BY created_block DESC LIMIT ?) "
+                        + "ORDER BY created_block ASC", new String[]{MT_EXECUTED, String.valueOf(limit)})) {
+            while (c.moveToNext()) out.add(readTrade(c));
+        }
+        return out;
+    }
+
+    private static MarketTrade readTrade(Cursor c) {
+        MarketTrade t = new MarketTrade();
+        t.coinid = c.getString(c.getColumnIndexOrThrow("coinid"));
+        t.hash = c.getString(c.getColumnIndexOrThrow("hash"));
+        t.price = c.getDouble(c.getColumnIndexOrThrow("price"));
+        t.sizeMinima = c.getString(c.getColumnIndexOrThrow("size_minima"));
+        t.reqAmount = c.getString(c.getColumnIndexOrThrow("req_amount"));
+        t.reqToken = c.getString(c.getColumnIndexOrThrow("req_token"));
+        t.owner = c.getString(c.getColumnIndexOrThrow("owner"));
+        t.receiver = c.getString(c.getColumnIndexOrThrow("receiver"));
+        t.createdBlock = c.getLong(c.getColumnIndexOrThrow("created_block"));
+        t.timelock = c.getLong(c.getColumnIndexOrThrow("timelock"));
+        t.observedAt = c.getLong(c.getColumnIndexOrThrow("observed_at"));
+        t.status = c.getString(c.getColumnIndexOrThrow("status"));
+        t.secret = c.getString(c.getColumnIndexOrThrow("secret"));
+        return t;
+    }
+
     private static final class Helper extends SQLiteOpenHelper {
-        Helper(Context ctx) { super(ctx, "minimaswap.db", null, 1); }
+        Helper(Context ctx) { super(ctx, "minimaswap.db", null, 2); }
 
         @Override public void onCreate(SQLiteDatabase db) {
             db.execSQL("CREATE TABLE secrets (hash TEXT PRIMARY KEY, secret TEXT, added INTEGER)");
@@ -246,8 +341,17 @@ public final class SwapDb {
                     + "selltoken TEXT, sellamount TEXT, buytoken TEXT, buyamount TEXT, counterparty TEXT, "
                     + "status TEXT, contractid TEXT, mytimelock INTEGER, mylegminima INTEGER, "
                     + "created INTEGER, updated INTEGER)");
+            createMarket(db);
         }
 
-        @Override public void onUpgrade(SQLiteDatabase db, int oldV, int newV) { /* v1 only */ }
+        @Override public void onUpgrade(SQLiteDatabase db, int oldV, int newV) {
+            createMarket(db);   // v1→v2: add the market_trades table (idempotent)
+        }
+
+        private void createMarket(SQLiteDatabase db) {
+            db.execSQL("CREATE TABLE IF NOT EXISTS market_trades (coinid TEXT PRIMARY KEY, hash TEXT, "
+                    + "price REAL, size_minima TEXT, req_amount TEXT, req_token TEXT, owner TEXT, receiver TEXT, "
+                    + "created_block INTEGER, timelock INTEGER, observed_at INTEGER, status TEXT, secret TEXT)");
+        }
     }
 }
