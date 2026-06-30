@@ -121,6 +121,7 @@ public class MainActivity extends AppCompatActivity {
     private final Runnable watchTick = new Runnable() {
         @Override public void run() {
             if (engine != null) engine.poll();
+            refreshBalances(false);                 // keep balances current without a restart
             ui.postDelayed(this, WATCH_INTERVAL_MS);
         }
     };
@@ -202,11 +203,11 @@ public class MainActivity extends AppCompatActivity {
             fetchMinimaBalance();
             if (!wallet.ready()) {
                 wallet.deriveFromNode(node, ui, new EthWallet.Cb() {
-                    @Override public void ok(String address) { ethAddr = address; ethErr = null; render(); fetchEthBalances(); maybeStartEngine(); }
+                    @Override public void ok(String address) { ethAddr = address; ethErr = null; render(); fetchEthBalances(true); maybeStartEngine(); }
                     @Override public void err(String msg) { ethErr = msg; render(); }
                 });
             } else {
-                fetchEthBalances();
+                fetchEthBalances(true);
             }
             if (identity == null) setupIdentity();
             if (!minima.ready()) {
@@ -281,12 +282,18 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    private void fetchEthBalances() {
+    /** Refresh both wallet balances. showLoading=false → silent (periodic) update, no "…" flicker. */
+    private void refreshBalances(boolean showLoading) {
+        if (!paired) return;
+        fetchMinimaBalance();
+        if (wallet.ready()) fetchEthBalances(showLoading);
+    }
+
+    private void fetchEthBalances(boolean showLoading) {
         if (!wallet.ready()) return;
         final EthRpc r = rpc;
         final EthNet n = net;
-        ethBal = "…";
-        render();
+        if (showLoading) { ethBal = "…"; render(); }
         io.execute(() -> {
             String wei, err = null;
             LinkedHashMap<String, String> toks = new LinkedHashMap<>();
@@ -574,13 +581,16 @@ public class MainActivity extends AppCompatActivity {
             LinearLayout walletActions = new LinearLayout(this);
             walletActions.setOrientation(LinearLayout.HORIZONTAL);
             walletActions.setPadding(0, dp(8), 0, 0);
+            TextView refreshBal = Design.pill(this, "↻  Refresh", Design.SURFACE2, Design.TEXT);
+            refreshBal.setOnClickListener(v -> { toast("Refreshing balances…"); refreshBalances(true); });
             TextView fund = Design.pill(this, "⤓  Fund / QR", Design.SURFACE2, Design.TEXT);
             fund.setOnClickListener(v -> receiveDialog());
             TextView exportKey = Design.pill(this, "🔑  Export key", Design.SURFACE2, Design.DIM);
             exportKey.setOnClickListener(v -> exportKeyDialog());
-            LinearLayout.LayoutParams fp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-            fp.rightMargin = dp(8);
-            walletActions.addView(fund, fp);
+            LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            gap.rightMargin = dp(8);
+            walletActions.addView(refreshBal, gap);
+            walletActions.addView(fund, gap);
             walletActions.addView(exportKey);
             col.addView(walletActions);
         }
