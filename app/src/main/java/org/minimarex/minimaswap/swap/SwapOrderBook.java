@@ -32,6 +32,24 @@ public final class SwapOrderBook {
 
     private SwapOrderBook() {}
 
+    /** Re-read the live SENDABLE Minima balance, stamp it onto {@code base}, then publish — so the advertised
+     *  liquidity is never stale (contract-locked coins, e.g. casino, are excluded by the node's `sendable`). */
+    public static void publishFresh(NodeApi node, LazySodium ls, CommsIdentity id, Order base, CommsTransport.SendCb cb) {
+        node.cmd("balance tokenid:0x00", new NodeApi.Cb() {
+            @Override public void onResult(JSONObject j) {
+                Object resp = j.opt("response");
+                JSONObject t = null;
+                if (resp instanceof JSONArray && ((JSONArray) resp).length() > 0) t = ((JSONArray) resp).optJSONObject(0);
+                else if (resp instanceof JSONObject) t = (JSONObject) resp;
+                base.minimaAvail = parseD(t == null ? "0" : t.optString("sendable", "0"));
+                publish(node, ls, id, base, cb);
+            }
+            @Override public void onError(String m) { publish(node, ls, id, base, cb); }   // publish with what we have
+        });
+    }
+
+    private static double parseD(String s) { try { return Double.parseDouble(s.trim()); } catch (Exception e) { return 0; } }
+
     /** Sign {@code order} with my comms key and broadcast it to the book. */
     public static void publish(NodeApi node, LazySodium ls, CommsIdentity id, Order order, CommsTransport.SendCb cb) {
         try {

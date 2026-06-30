@@ -81,6 +81,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String PREFS = "minimaswap";
     private static final String[] PAIR_TOKENS = {"USDT"};
     private static final long WATCH_INTERVAL_MS = 90_000;
+    static final long REPUBLISH_INTERVAL_MS = 30 * 60_000;   // keep a published order live + fresh (bridge uses 30m)
 
     private LazySodium ls;
     private NodeApi node;
@@ -125,6 +126,7 @@ public class MainActivity extends AppCompatActivity {
         @Override public void run() {
             if (engine != null) engine.poll();
             refreshBalances(false);                 // keep balances current without a restart
+            maybeAutoRepublish();                   // keep a live order fresh (~30 min)
             ui.postDelayed(this, WATCH_INTERVAL_MS);
         }
     };
@@ -341,6 +343,8 @@ public class MainActivity extends AppCompatActivity {
                 if (n != net) return;
                 ethBal = fwei;
                 tokenBals.clear(); tokenBals.putAll(toks);
+                String usdt = toks.get("USDT");
+                if (usdt != null) prefs.edit().putString("usdt_avail", usdt).apply();   // for the background republish
                 if (ferr != null) ethErr = ferr;
                 render();
             });
@@ -360,44 +364,47 @@ public class MainActivity extends AppCompatActivity {
                 err -> { orderStatus = "Book scan: " + err; render(); });
     }
 
-    private void publishOrder() {
-        if (identity == null || myMinimaPk == null) { toast("Still connecting to your node…"); return; }
-        if (!wallet.ready()) { toast("ETH wallet not ready yet"); return; }
-        final Order o = loadOrder();
+    /** Build the base order (pairs + my identities + USDT avail); returns null if no pair is enabled. */
+    private Order baseOrder() {
+        Order o = loadOrder();
         o.minimaPublicKey = myMinimaPk;
         o.ethAddress = wallet.address();
         o.usdtAvail = parseD(Util.tidyAmount(tokenBals.get("USDT")), 0);
-        boolean anyEnabled = false;
-        for (Order.Pair p : o.pairs.values()) if (p.enable) { anyEnabled = true; break; }
-        if (!anyEnabled) { toast("Enable at least one pair in your order first"); return; }
-        orderStatus = "Reading your sendable balance…";
+        for (Order.Pair p : o.pairs.values()) if (p.enable) return o;
+        return null;
+    }
+
+    private void publishOrder() {
+        if (identity == null || myMinimaPk == null) { toast("Still connecting to your node…"); return; }
+        if (!wallet.ready()) { toast("ETH wallet not ready yet"); return; }
+        final Order o = baseOrder();
+        if (o == null) { toast("Enable at least one pair in your order first"); return; }
+        prefs.edit().putBoolean("auto_publish", true).apply();   // opt in to keep it live + fresh
+        orderStatus = "Publishing your order…";
         render();
-        // Advertise the SENDABLE balance (what a swap can actually lock) — read fresh at publish time so it's
-        // never a stale snapshot. sendable = coins at your simple addresses; contract-locked coins (e.g. funds
-        // committed in the casino) are excluded by the node (balance.java), so they're correctly not offered.
-        node.cmd("balance tokenid:0x00", new NodeApi.Cb() {
-            @Override public void onResult(JSONObject j) {
-                Object resp = j.opt("response");
-                JSONObject t = null;
-                if (resp instanceof JSONArray && ((JSONArray) resp).length() > 0) t = ((JSONArray) resp).optJSONObject(0);
-                else if (resp instanceof JSONObject) t = (JSONObject) resp;
-                o.minimaAvail = parseD(Util.tidyAmount(t == null ? "0" : t.optString("sendable", "0")), 0);
-                doPublish(o);
+        // publishFresh re-reads the live SENDABLE balance so the advertised size is never a stale snapshot.
+        SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
+            @Override public void onSent(String txpowid) {
+                prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();
+                engine.setMyOrder(o);
+                orderStatus = "✓ Order published — auto-refreshes every 30 min";
+                render(); ui.postDelayed(MainActivity.this::scanOrderBook, 2000);
             }
-            @Override public void onError(String m) {
-                o.minimaAvail = parseD(Util.tidyAmount(minimaBal), 0);   // fall back to the cached sendable
-                doPublish(o);
-            }
+            @Override public void onFailed(String message) { orderStatus = "Publish failed: " + message; render(); }
         });
     }
 
-    private void doPublish(Order o) {
-        engine.setMyOrder(o);
-        orderStatus = "Publishing your order…";
-        render();
-        SwapOrderBook.publish(node, ls, identity, o, new CommsTransport.SendCb() {
-            @Override public void onSent(String txpowid) { orderStatus = "✓ Order published — others can now take it"; render(); ui.postDelayed(MainActivity.this::scanOrderBook, 2000); }
-            @Override public void onFailed(String message) { orderStatus = "Publish failed: " + message; render(); }
+    /** Keep a published order live + its advertised size current: re-publish ~every 30 min (fresh sendable). */
+    private void maybeAutoRepublish() {
+        if (identity == null || myMinimaPk == null || !wallet.ready()) return;
+        if (!prefs.getBoolean("auto_publish", false)) return;
+        if (System.currentTimeMillis() - prefs.getLong("last_publish", 0) < REPUBLISH_INTERVAL_MS) return;
+        final Order o = baseOrder();
+        if (o == null) return;   // all pairs disabled → nothing to keep live
+        prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();   // stamp now to avoid re-entry
+        SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
+            @Override public void onSent(String txpowid) { engine.setMyOrder(o); }
+            @Override public void onFailed(String message) { /* retried next interval */ }
         });
     }
 

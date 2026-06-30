@@ -14,8 +14,15 @@ import android.os.Looper;
 
 import androidx.core.app.NotificationCompat;
 
+import com.goterl.lazysodium.LazySodium;
+
+import org.json.JSONArray;
 import org.json.JSONObject;
+import org.minimarex.comms.CommsIdentity;
+import org.minimarex.comms.CommsTransport;
+import org.minimarex.comms.Hex;
 import org.minimarex.comms.NodeApi;
+import org.minimarex.comms.Sodium;
 import org.minimarex.minimaswap.eth.EthNet;
 import org.minimarex.minimaswap.eth.EthRpc;
 import org.minimarex.minimaswap.eth.EthWallet;
@@ -23,6 +30,7 @@ import org.minimarex.minimaswap.swap.MinimaHtlc;
 import org.minimarex.minimaswap.swap.Order;
 import org.minimarex.minimaswap.swap.SwapDb;
 import org.minimarex.minimaswap.swap.SwapEngine;
+import org.minimarex.minimaswap.swap.SwapOrderBook;
 
 /**
  * Foreground service that drives the swap engine whenever the node is reachable — so in-flight swaps keep
@@ -42,11 +50,14 @@ public class SwapService extends Service {
 
     private final Handler h = new Handler(Looper.getMainLooper());
     private SharedPreferences prefs;
+    private LazySodium ls;
     private NodeApi node;
     private MinimaHtlc minima;
     private final EthWallet wallet = new EthWallet();
     private SwapDb db;
     private SwapEngine engine;
+    private CommsIdentity identity;       // to sign order-book republishes in the background
+    private String myMinimaPk;
     private boolean booted = false;
 
     @Override public IBinder onBind(Intent intent) { return null; }
@@ -57,6 +68,7 @@ public class SwapService extends Service {
         startForegroundCompat();
 
         prefs = getSharedPreferences("minimaswap", MODE_PRIVATE);
+        ls = Sodium.get();
         EthNet net = EthNet.MAINNET;
         EthRpc rpc = new EthRpc(prefs.getString("rpc_mainnet", net.defaultRpc));
         db = new SwapDb(this);
@@ -105,6 +117,7 @@ public class SwapService extends Service {
         String savedPk = prefs.getString("swap_pk", "");
         minima.setup(savedAddr, savedPk, new MinimaHtlc.SetupCb() {
             @Override public void ok(String a, String pk) {
+                myMinimaPk = pk;
                 prefs.edit().putString("swap_addr", a).putString("swap_pk", pk).apply();
                 engine.setMyMinimaPk(pk);
                 minima.loadMyKeys(new MinimaHtlc.KeysCb() {
@@ -115,17 +128,57 @@ public class SwapService extends Service {
             @Override public void err(String m) {}
         });
 
+        deriveIdentity();   // so we can sign order-book republishes in the background
+
         h.removeCallbacks(tick);
         h.post(tick);
+    }
+
+    /** Derive the comms signing identity from the node seed (only needed to republish the maker's order). */
+    private void deriveIdentity() {
+        node.cmd("vault action:seed", new NodeApi.Cb() {
+            @Override public void onResult(JSONObject j) {
+                JSONObject r = j.optJSONObject("response");
+                final String ikm = r == null ? "" : r.optString("seed", r.optString("phrase", ""));
+                if (ikm.isEmpty()) return;
+                new Thread(() -> {
+                    try {
+                        byte[] seed = ikm.startsWith("0x") ? Hex.from(ikm) : ikm.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                        CommsIdentity id = CommsIdentity.fromSeed(ls, seed);
+                        h.post(() -> identity = id);
+                    } catch (Exception ignore) {}
+                }).start();
+            }
+            @Override public void onError(String m) {}
+        });
     }
 
     /** 90s poll loop — stands down while the Activity is foreground (it polls then), so we never double-act. */
     private final Runnable tick = new Runnable() {
         @Override public void run() {
-            if (!MainActivity.FOREGROUND && engine != null) engine.poll();
+            if (!MainActivity.FOREGROUND && engine != null) { engine.poll(); maybeAutoRepublish(); }
             h.postDelayed(this, INTERVAL_MS);
         }
     };
+
+    /** Keep a published order live + its size current while the app is closed (~30 min, fresh sendable). */
+    private void maybeAutoRepublish() {
+        if (identity == null || myMinimaPk == null || !wallet.ready()) return;
+        if (!prefs.getBoolean("auto_publish", false)) return;
+        if (System.currentTimeMillis() - prefs.getLong("last_publish", 0) < MainActivity.REPUBLISH_INTERVAL_MS) return;
+        Order o = loadOrder();
+        o.minimaPublicKey = myMinimaPk;
+        o.ethAddress = wallet.address();
+        try { o.usdtAvail = Double.parseDouble(prefs.getString("usdt_avail", "0")); } catch (Exception e) { o.usdtAvail = 0; }
+        boolean anyEnabled = false;
+        for (Order.Pair p : o.pairs.values()) if (p.enable) { anyEnabled = true; break; }
+        if (!anyEnabled) return;
+        prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();
+        SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
+            @Override public void onSent(String txpowid) { engine.setMyOrder(o); }
+            @Override public void onFailed(String message) {}
+        });
+    }
 
     // ----- engine notifier: OS notifications only (no UI here); SwapDb carries state to the Activity -----
 
