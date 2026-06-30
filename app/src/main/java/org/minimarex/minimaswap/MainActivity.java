@@ -391,8 +391,10 @@ public class MainActivity extends AppCompatActivity {
         box.setPadding(dp(20), dp(8), dp(20), dp(8));
 
         TextView hint = new TextView(this);
-        hint.setText("Set your rates (MINIMA per 1 token). buy = you give MINIMA to receive the token; "
-                + "sell = you give the token to receive MINIMA. min = smallest MINIMA per trade.");
+        hint.setText("Prices are the price of MINIMA in USDT (USDT per MINIMA). "
+                + "buy = price others buy MINIMA from you (the higher / ask). "
+                + "sell = price others sell MINIMA to you (the lower / bid). "
+                + "min = smallest MINIMA per trade. Keep buy ≥ sell.");
         hint.setTextColor(Design.DIM); hint.setTextSize(12f); hint.setPadding(0, 0, 0, dp(10));
         box.addView(hint);
 
@@ -400,13 +402,13 @@ public class MainActivity extends AppCompatActivity {
         final Map<String, EditText> buy = new LinkedHashMap<>(), sell = new LinkedHashMap<>(), min = new LinkedHashMap<>();
         for (String sym : PAIR_TOKENS) {
             Order.Pair p = o.pairs.get(sym);
-            TextView t = new TextView(this); t.setText(sym); t.setTextColor(Design.TEXT); t.setTextSize(15f);
+            TextView t = new TextView(this); t.setText("MINIMA / " + sym); t.setTextColor(Design.TEXT); t.setTextSize(15f);
             t.setTypeface(t.getTypeface(), android.graphics.Typeface.BOLD); t.setPadding(0, dp(12), 0, dp(4));
             box.addView(t);
             SwitchCompat sw = new SwitchCompat(this); sw.setText("Enabled"); sw.setTextColor(Design.DIM); sw.setChecked(p.enable);
             box.addView(sw); en.put(sym, sw);
-            buy.put(sym, numRow(box, "buy price", p.buy));
-            sell.put(sym, numRow(box, "sell price", p.sell));
+            buy.put(sym, numRow(box, "buy MINIMA price (" + sym + ")", p.buy));
+            sell.put(sym, numRow(box, "sell MINIMA price (" + sym + ")", p.sell));
             min.put(sym, numRow(box, "min MINIMA", p.min));
         }
 
@@ -466,25 +468,29 @@ public class MainActivity extends AppCompatActivity {
 
     // ---- take an order (guided swap start) ----
 
-    private void takeOrderDialog(Order maker, String symbol, boolean buyToken) {
+    /**
+     * Take a maker's order. We always trade MINIMA, priced in USDT (USDT per MINIMA). You enter a MINIMA
+     * amount; the USDT side is derived from the maker's price.
+     *   - Sell MINIMA → you give MINIMA, receive USDT at the maker's SELL price (the lower / bid).
+     *   - Buy MINIMA  → you give USDT, receive MINIMA at the maker's BUY price (the higher / ask).
+     */
+    private void takeOrderDialog(Order maker, String symbol, boolean sellMinima) {
         Order.Pair p = maker.pairs.get(symbol);
         if (p == null) return;
-        final double rate = buyToken ? p.sell : p.buy;   // buyToken → use maker's sell side
-        final String inLabel = buyToken ? "MINIMA to spend" : (symbol + " to sell");
-        final String outUnit = buyToken ? symbol : "MINIMA";
+        final double price = sellMinima ? p.sell : p.buy;   // USDT per MINIMA: sell=bid(lower), buy=ask(higher)
 
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(20), dp(12), dp(20), dp(4));
         TextView info = new TextView(this);
-        info.setText((buyToken ? "Buy " + symbol + " with MINIMA" : "Sell " + symbol + " for MINIMA")
-                + "\nRate: " + trim(rate) + " MINIMA / " + symbol
-                + "\nMaker min: " + trim(p.min) + " MINIMA");
+        info.setText((sellMinima ? "Sell MINIMA → " + symbol : "Buy MINIMA ← " + symbol)
+                + "\nPrice: " + trim(price) + " " + symbol + " per MINIMA"
+                + "\nMin: " + trim(p.min) + " MINIMA");
         info.setTextColor(Design.DIM); info.setTextSize(13f); info.setPadding(0, 0, 0, dp(10));
         box.addView(info);
 
         final EditText amt = new EditText(this);
-        amt.setHint(inLabel);
+        amt.setHint("MINIMA to " + (sellMinima ? "sell" : "buy"));
         decimalInput(amt);
         amt.setTextColor(Design.TEXT); amt.setHintTextColor(Design.DIM2);
         box.addView(amt);
@@ -494,37 +500,36 @@ public class MainActivity extends AppCompatActivity {
         box.addView(out);
 
         amt.addTextChangedListener(new SimpleWatcher(() -> {
-            String counter = computeCounter(amt.getText().toString(), rate, buyToken);
-            out.setText(counter == null ? "" : "You receive ≈ " + counter + " " + outUnit);
+            String usdt = computeUsdt(amt.getText().toString(), price);
+            out.setText(usdt == null ? "" : (sellMinima ? "You receive ≈ " : "You pay ≈ ") + usdt + " " + symbol);
         }));
 
         modalOpen = true;
         new AlertDialog.Builder(this)
-                .setTitle("Swap with " + Util.shorten(maker.signerPk))
+                .setTitle((sellMinima ? "Sell MINIMA" : "Buy MINIMA") + " · " + Util.shorten(maker.signerPk))
                 .setView(box)
                 .setPositiveButton("Start swap", (d, w) -> {
-                    String input = amt.getText().toString().trim();
-                    String counter = computeCounter(input, rate, buyToken);
-                    if (counter == null) { toast("Enter a valid amount"); return; }
-                    startSwap(maker, symbol, buyToken, input, counter);
+                    String minima = amt.getText().toString().trim();
+                    String usdt = computeUsdt(minima, price);
+                    if (usdt == null) { toast("Enter a valid MINIMA amount"); return; }
+                    startSwap(maker, symbol, sellMinima, minima, usdt);
                 })
                 .setNegativeButton("Cancel", null)
                 .setOnDismissListener(d -> { modalOpen = false; render(); })
                 .show();
     }
 
-    /** counter amount: buyToken → token = minima / rate; sellToken → minima = token * rate. */
-    private String computeCounter(String input, double rate, boolean buyToken) {
+    /** USDT side for a MINIMA amount at a given price (USDT per MINIMA). */
+    private String computeUsdt(String minimaAmount, double price) {
         try {
-            BigDecimal in = new BigDecimal(input.trim());
-            if (in.signum() <= 0 || rate <= 0) return null;
-            BigDecimal r = BigDecimal.valueOf(rate);
-            BigDecimal out = buyToken ? in.divide(r, 12, RoundingMode.DOWN) : in.multiply(r);
-            return Util.tidyAmount(out.stripTrailingZeros().toPlainString());
+            BigDecimal m = new BigDecimal(minimaAmount.trim());
+            if (m.signum() <= 0 || price <= 0) return null;
+            BigDecimal usdt = m.multiply(BigDecimal.valueOf(price)).setScale(6, RoundingMode.DOWN);
+            return Util.tidyAmount(usdt.stripTrailingZeros().toPlainString());
         } catch (Exception e) { return null; }
     }
 
-    private void startSwap(Order maker, String symbol, boolean buyToken, String input, String counter) {
+    private void startSwap(Order maker, String symbol, boolean sellMinima, String minima, String usdt) {
         orderStatus = "Starting swap…"; render();
         SwapEngine.StartCb cb = new SwapEngine.StartCb() {
             @Override public void ok(String hash) {
@@ -533,12 +538,12 @@ public class MainActivity extends AppCompatActivity {
             }
             @Override public void err(String msg) { orderStatus = "Swap failed: " + msg; render(); }
         };
-        if (buyToken) {
-            // I give MINIMA (input), receive token (counter) → MINIMA→ERC20
-            engine.startMinimaToErc20(maker, input, symbol, counter, cb);
+        if (sellMinima) {
+            // give MINIMA (minima), receive USDT (usdt) → MINIMA→ERC20
+            engine.startMinimaToErc20(maker, minima, symbol, usdt, cb);
         } else {
-            // I give token (input), receive MINIMA (counter) → ERC20→MINIMA
-            engine.startErc20ToMinima(maker, symbol, input, counter, cb);
+            // give USDT (usdt), receive MINIMA (minima) → ERC20→MINIMA
+            engine.startErc20ToMinima(maker, symbol, usdt, minima, cb);
         }
     }
 
@@ -753,16 +758,17 @@ public class MainActivity extends AppCompatActivity {
             anyEnabled = true;
             final String sym = e.getKey();
             TextView rate = new TextView(this);
-            rate.setText(sym + "  ·  buy " + trim(p.buy) + " / sell " + trim(p.sell) + " MINIMA");
+            // price is USDT per MINIMA: buy = the (higher) price to buy MINIMA, sell = the (lower) price to sell
+            rate.setText("MINIMA  ·  buy " + trim(p.buy) + " / sell " + trim(p.sell) + " " + sym);
             rate.setTextColor(Design.DIM); rate.setTextSize(12.5f); rate.setPadding(0, dp(4), 0, dp(2));
             c.addView(rate);
             if (!mine) {
                 LinearLayout actions = new LinearLayout(this);
                 actions.setOrientation(LinearLayout.HORIZONTAL);
-                TextView buyBtn = Design.pill(this, "Buy " + sym, Design.ACCENT, Design.ON_ACCENT);
-                buyBtn.setOnClickListener(v -> takeOrderDialog(o, sym, true));
-                TextView sellBtn = Design.pill(this, "Sell " + sym, Design.SURFACE2, Design.TEXT);
-                sellBtn.setOnClickListener(v -> takeOrderDialog(o, sym, false));
+                TextView buyBtn = Design.pill(this, "Buy MINIMA", Design.ACCENT, Design.ON_ACCENT);
+                buyBtn.setOnClickListener(v -> takeOrderDialog(o, sym, false));   // sellMinima=false
+                TextView sellBtn = Design.pill(this, "Sell MINIMA", Design.SURFACE2, Design.TEXT);
+                sellBtn.setOnClickListener(v -> takeOrderDialog(o, sym, true));    // sellMinima=true
                 LinearLayout.LayoutParams a1 = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
                 a1.rightMargin = dp(8); a1.topMargin = dp(4);
                 LinearLayout.LayoutParams a2 = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);

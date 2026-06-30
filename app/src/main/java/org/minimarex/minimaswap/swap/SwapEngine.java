@@ -252,7 +252,7 @@ public final class SwapEngine {
         if ("TRUE".equals(MinimaHtlc.stateAt(coin, 7))) return;            // OTC: manual only
         if (db.haveSentCounterParty(hash)) return;
         if (timelock - block < CP_BLOCKS_CHECK) return;                    // first leg too close to expiry
-        if (!matchesMyOrderSell(coin, reqTokenAddr)) return;              // must match my published order
+        if (!acceptTakerSellMinima(coin, reqTokenAddr)) return;          // must match my published order
         if (!inflight.add("cpEth:" + hash)) return;
         io.execute(() -> lockEthCounterLeg(coin, hash, reqTokenAddr));
     }
@@ -380,7 +380,7 @@ public final class SwapEngine {
         if (c.otc) return;
         if (db.haveSentCounterParty(hash)) return;
         if (c.timelock - nowUnix() < CP_SECS_CHECK) return;               // first leg too close to expiry
-        if (!matchesMyOrderBuy(c)) return;                               // must match my published order
+        if (!acceptTakerBuyMinima(c)) return;                            // must match my published order
         if (!inflight.add("cpMin:" + hash)) return;
         lockMinimaCounterLeg(c, minimaBlock);
     }
@@ -429,33 +429,31 @@ public final class SwapEngine {
     // ============================================================ order-match guards (fund safety)
 
     /**
-     * Responder guard for a MINIMA→ERC20 swap (someone gives MINIMA, wants my ERC20). I only auto-lock if
-     * the token pair is enabled in MY published order, the MINIMA I'd receive is ≥ my minimum, and the deal
-     * is no worse than my published SELL price — I never give more token than my rate for the MINIMA offered.
+     * Responder guard when the taker is SELLING MINIMA to me (they locked MINIMA wanting USDT). I am BUYING
+     * MINIMA, so I pay my SELL price (the lower / bid, in USDT per MINIMA). I only auto-lock if the pair is
+     * enabled, the MINIMA I'd receive meets my minimum, and the USDT I'd pay is ≤ (MINIMA received × sell).
      */
-    private boolean matchesMyOrderSell(JSONObject coin, String reqTokenAddr) {
+    private boolean acceptTakerSellMinima(JSONObject coin, String reqTokenAddr) {
         Order.Pair p = pairFor(reqTokenAddr);
         if (p == null || !p.enable) return false;
-        BigDecimal recvMinima = dec(coin.optString("amount", "0"));
-        BigDecimal giveToken = dec(MinimaHtlc.stateAt(coin, 1));
+        BigDecimal recvMinima = dec(coin.optString("amount", "0"));   // MINIMA the taker locked, I receive
+        BigDecimal giveUsdt = dec(MinimaHtlc.stateAt(coin, 1));       // USDT they requested, I'd pay
         if (recvMinima.compareTo(BigDecimal.valueOf(p.min)) < 0) return false;
-        // require recvMinima >= giveToken * sellPrice  (MINIMA per token)
-        return recvMinima.compareTo(giveToken.multiply(BigDecimal.valueOf(p.sell))) >= 0;
+        return giveUsdt.compareTo(recvMinima.multiply(BigDecimal.valueOf(p.sell))) <= 0;
     }
 
     /**
-     * Responder guard for an ERC20→MINIMA swap (someone gives ERC20, wants my MINIMA). I only auto-lock if
-     * the pair is enabled, the MINIMA I'd give is ≥ my minimum, and I pay no more MINIMA than my published
-     * BUY price for the token I'd receive.
+     * Responder guard when the taker is BUYING MINIMA from me (they locked USDT wanting MINIMA). I am SELLING
+     * MINIMA, so I get my BUY price (the higher / ask, in USDT per MINIMA). I only auto-lock if the pair is
+     * enabled, the MINIMA I'd give meets my minimum, and the USDT I'd receive is ≥ (MINIMA given × buy).
      */
-    private boolean matchesMyOrderBuy(EthHtlc.Contract c) {
+    private boolean acceptTakerBuyMinima(EthHtlc.Contract c) {
         Order.Pair p = pairFor(c.tokenContract);
         if (p == null || !p.enable) return false;
-        BigDecimal giveMinima = dec(EthWallet.format(c.requestAmount, 18, 18));
-        BigDecimal recvToken = dec(EthWallet.format(c.amount, decimalsOf(c.tokenContract), 18));
+        BigDecimal giveMinima = dec(EthWallet.format(c.requestAmount, 18, 18));            // MINIMA I'd give
+        BigDecimal recvUsdt = dec(EthWallet.format(c.amount, decimalsOf(c.tokenContract), 18)); // USDT I'd receive
         if (giveMinima.compareTo(BigDecimal.valueOf(p.min)) < 0) return false;
-        // require giveMinima <= recvToken * buyPrice  (MINIMA per token)
-        return giveMinima.compareTo(recvToken.multiply(BigDecimal.valueOf(p.buy))) <= 0;
+        return recvUsdt.compareTo(giveMinima.multiply(BigDecimal.valueOf(p.buy))) >= 0;
     }
 
     private Order.Pair pairFor(String tokenAddr) {
