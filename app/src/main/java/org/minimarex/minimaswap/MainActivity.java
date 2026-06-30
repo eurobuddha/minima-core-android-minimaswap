@@ -82,6 +82,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String[] PAIR_TOKENS = {"USDT"};
     private static final long WATCH_INTERVAL_MS = 90_000;
     static final long REPUBLISH_INTERVAL_MS = 30 * 60_000;   // keep a published order live + fresh (bridge uses 30m)
+    private static final long TERMINAL_GRACE_MS = 10 * 60_000;   // finished swaps auto-hide after this
 
     private LazySodium ls;
     private NodeApi node;
@@ -789,14 +790,45 @@ public class MainActivity extends AppCompatActivity {
 
     private void renderActiveSwaps(LinearLayout col) {
         if (db == null) return;
-        List<SwapDb.Swap> swaps = db.allSwaps();
-        if (swaps.isEmpty()) return;
+        java.util.Set<String> dismissed = dismissedSwaps();
+        long now = System.currentTimeMillis();
+        List<SwapDb.Swap> show = new java.util.ArrayList<>();
+        int hidden = 0;
+        for (SwapDb.Swap s : db.allSwaps()) {
+            if (isTerminal(s) && (dismissed.contains(s.hash) || now - s.updated > TERMINAL_GRACE_MS)) { hidden++; continue; }
+            show.add(s);
+        }
+        if (show.isEmpty() && hidden == 0) return;
+
         TextView title = new TextView(this);
         title.setText("Your swaps");
         title.setTextColor(Design.TEXT); title.setTextSize(16f); title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
         title.setPadding(0, dp(22), 0, dp(2));
         col.addView(title);
-        for (SwapDb.Swap s : swaps) col.addView(swapCard(s));
+        for (SwapDb.Swap s : show) col.addView(swapCard(s));
+        if (hidden > 0) {
+            TextView h = new TextView(this);
+            h.setText(hidden + " finished swap" + (hidden == 1 ? "" : "s") + " hidden");
+            h.setTextColor(Design.DIM2); h.setTextSize(11.5f); h.setPadding(dp(2), dp(6), 0, 0);
+            col.addView(h);
+        }
+    }
+
+    private static boolean isTerminal(SwapDb.Swap s) {
+        return SwapDb.ST_COMPLETE.equals(s.status) || SwapDb.ST_REFUNDED.equals(s.status) || SwapDb.ST_ERROR.equals(s.status);
+    }
+
+    private java.util.Set<String> dismissedSwaps() {
+        java.util.Set<String> set = new java.util.HashSet<>();
+        for (String h : prefs.getString("dismissed_swaps", "").split(",")) if (!h.isEmpty()) set.add(h);
+        return set;
+    }
+
+    private void dismissSwap(String hash) {
+        java.util.Set<String> set = dismissedSwaps();
+        set.add(hash);
+        prefs.edit().putString("dismissed_swaps", android.text.TextUtils.join(",", set)).apply();
+        render();
     }
 
     private LinearLayout swapCard(SwapDb.Swap s) {
@@ -814,6 +846,13 @@ public class MainActivity extends AppCompatActivity {
         line.setTextColor(Design.TEXT); line.setTextSize(14f);
         top.addView(line, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         top.addView(Design.pill(this, statusLabel(s), statusBg(s), statusFg(s)));
+        if (isTerminal(s)) {
+            TextView x = Design.pill(this, "✕", Design.SURFACE2, Design.DIM);
+            LinearLayout.LayoutParams xlp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            xlp.leftMargin = dp(6); x.setLayoutParams(xlp);
+            x.setOnClickListener(v -> dismissSwap(s.hash));
+            top.addView(x);
+        }
         c.addView(top);
 
         TextView detail = new TextView(this);
