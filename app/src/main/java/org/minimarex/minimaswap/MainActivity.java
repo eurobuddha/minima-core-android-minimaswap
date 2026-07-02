@@ -115,6 +115,11 @@ public class MainActivity extends AppCompatActivity {
     private int currentTab = TAB_SWAP;
     private final TextView[] tabPills = new TextView[4];
     private boolean swapSell = true;    // Swap tab direction: true = Sell MINIMA, false = Buy MINIMA
+    private String swapAmount = "";     // Swap tab "you send" amount — persists across tree rebuilds
+    private boolean swapInputFocused = false;   // suppress background render() while typing the swap amount
+    private static final int USDT_TEAL = 0xFF26A69A;
+    private static final int STG_PENDING = 0, STG_ACTIVE = 1, STG_DONE = 2, STG_WARN = 3;
+    private static final int STAGE_WARN_COLOR = 0xFFE6A23C;
 
     // wallet state shown on the home screen
     private String minimaBal = "…";        // sendable (tradeable)
@@ -935,6 +940,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void setTab(int t) {
         if (t == currentTab) return;
+        swapInputFocused = false;   // leaving the Swap tab clears the typing guard
         currentTab = t;
         animateTab = true;   // cross-fade the new tab in (navigation only, not background refreshes)
         updateTabBarSelection();
@@ -948,6 +954,8 @@ public class MainActivity extends AppCompatActivity {
         // (watcher / balance callback) restarts the IME and resets the cursor mid-typing. We re-render
         // once when the dialog dismisses. (All text entry lives in guarded dialogs, never inline in a tab.)
         if (modalOpen) return;
+        // While the user is typing the swap amount, don't rebuild the tree under them (would reset the IME/cursor).
+        if (swapInputFocused && currentTab == TAB_SWAP) return;
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         col.setPadding(dp(16), dp(14), dp(16), dp(24));
@@ -1032,7 +1040,7 @@ public class MainActivity extends AppCompatActivity {
         h.setPadding(0, dp(4), 0, dp(2));
         col.addView(h);
         TextView sh = new TextView(this);
-        sh.setText("Trade at the best price on offer — pick a direction, then Review.");
+        sh.setText("Enter an amount — see exactly what you'll get at the best price.");
         sh.setTextColor(Design.DIM()); sh.setTextSize(12.5f); sh.setTypeface(Design.sans()); sh.setPadding(0, 0, 0, dp(12));
         col.addView(sh);
 
@@ -1048,76 +1056,122 @@ public class MainActivity extends AppCompatActivity {
 
         if (!paired) {
             col.addView(dimNote("Connect your node in Minima Core → Apps to start swapping."));
+            swapStages(col);
             return;
         }
 
         Best best = bestMakers("USDT");
         final Order maker = swapSell ? best.bidMaker : best.askMaker;
-        double price = swapSell ? best.bestBid : best.bestAsk;
-        boolean have = maker != null && price > 0;
+        final double price = swapSell ? best.bestBid : best.bestAsk;
+        final boolean have = maker != null && price > 0;
 
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackground(Design.card(this, 16));
-        card.setPadding(dp(16), dp(16), dp(16), dp(16));
-        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        clp.topMargin = dp(14); card.setLayoutParams(clp);
-
-        if (have) {
-            TextView lbl = new TextView(this);
-            lbl.setText(swapSell ? "SELL MINIMA · BEST PRICE" : "BUY MINIMA · BEST PRICE");
-            lbl.setTextColor(Design.DIM()); lbl.setTextSize(11f); lbl.setTypeface(Design.sans()); lbl.setLetterSpacing(0.06f);
-            card.addView(lbl);
-
-            TextView pr = new TextView(this);
-            pr.setText(fmtPrice(price));
-            pr.setTextColor(Design.ACCENT()); pr.setTextSize(34f); pr.setTypeface(Design.monoBold()); pr.setLetterSpacing(-0.02f);
-            pr.setPadding(0, dp(6), 0, dp(1));
-            card.addView(pr);
-
-            TextView unit = new TextView(this);
-            unit.setText("USDT per MINIMA");
-            unit.setTextColor(Design.DIM2()); unit.setTextSize(12f); unit.setTypeface(Design.sans());
-            card.addView(unit);
-
-            double size = swapSell ? (maker.usdtAvail / price) : maker.minimaAvail;
-            TextView av = new TextView(this);
-            av.setText("Up to ~" + abbrev(size) + " MINIMA available" + (swapSell ? "" : " · a little ETH needed for gas"));
-            av.setTextColor(Design.DIM()); av.setTextSize(12.5f); av.setTypeface(Design.sans()); av.setPadding(0, dp(12), 0, 0);
-            card.addView(av);
-
-            TextView cta = button(swapSell ? "Review — Sell MINIMA" : "Review — Buy MINIMA");
-            LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-            blp.topMargin = dp(14); cta.setLayoutParams(blp);
-            cta.setOnClickListener(v -> takeOrderDialog(maker, "USDT", swapSell));
-            card.addView(cta);
-
-            TextView hint = Design.pill(this, "ⓘ  What is “best price”?", Design.SURFACE2(), Design.DIM());
-            LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-            hlp.topMargin = dp(12); hint.setLayoutParams(hlp);
-            hint.setOnClickListener(v -> showInfo("Best price",
-                    "Other people publish offers to buy or sell MINIMA at their own price. minimaSwap "
-                    + "automatically picks the best one for your direction, so you don't have to read the "
-                    + "order book. Want to choose a specific offer or set your own price? Open the Market tab."));
-            card.addView(hint);
-        } else {
+        if (!have) {
+            LinearLayout empty = new LinearLayout(this);
+            empty.setOrientation(LinearLayout.VERTICAL);
+            empty.setBackground(Design.card(this, 18));
+            empty.setPadding(dp(16), dp(16), dp(16), dp(16));
+            LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            elp.topMargin = dp(14); empty.setLayoutParams(elp);
             TextView none = new TextView(this);
             none.setText("No one is quoting a " + (swapSell ? "buy" : "sell") + " price right now.");
             none.setTextColor(Design.TEXT()); none.setTextSize(14.5f); none.setTypeface(Design.sansBold());
-            card.addView(none);
+            empty.addView(none);
             TextView sub2 = new TextView(this);
             sub2.setText("Check back soon, or open Market to place your own order and wait for a match.");
             sub2.setTextColor(Design.DIM()); sub2.setTextSize(12.5f); sub2.setTypeface(Design.sans()); sub2.setLineSpacing(dp(3), 1f); sub2.setPadding(0, dp(6), 0, dp(2));
-            card.addView(sub2);
+            empty.addView(sub2);
             TextView go = Design.pill(this, "Open Market", Design.SURFACE2(), Design.TEXT());
             LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-            glp.topMargin = dp(12); go.setLayoutParams(glp);
-            go.setOnClickListener(v -> setTab(TAB_MARKET));
-            card.addView(go);
+            glp.topMargin = dp(12); go.setLayoutParams(glp); go.setOnClickListener(v -> setTab(TAB_MARKET)); Design.pressable(go);
+            empty.addView(go);
+            col.addView(empty);
+            swapStages(col);
+            return;
         }
+
+        // ---- faithful dual-amount card: You send / ⇅ / You receive ----
+        final boolean sellMinima = swapSell;   // send=MINIMA,recv=USDT when selling; send=USDT,recv=MINIMA when buying
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(Design.card(this, 18));
+        card.setPadding(dp(16), dp(14), dp(16), dp(16));
+        card.setClipChildren(false); card.setClipToPadding(false);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        clp.topMargin = dp(14); card.setLayoutParams(clp);
+
+        // YOU SEND (editable)
+        card.addView(fieldLabel("YOU SEND"));
+        LinearLayout sendRow = new LinearLayout(this);
+        sendRow.setOrientation(LinearLayout.HORIZONTAL); sendRow.setGravity(Gravity.CENTER_VERTICAL);
+        sendRow.setPadding(0, dp(6), 0, dp(4));
+        sendRow.addView(coinChip(sellMinima));
+        final EditText amt = new EditText(this);
+        decimalInput(amt);
+        amt.setText(swapAmount);
+        amt.setHint("0.00"); amt.setHintTextColor(Design.DIM2());
+        amt.setTextColor(Design.TEXT()); amt.setTextSize(26f); amt.setTypeface(Design.monoBold());
+        amt.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        amt.setBackground(null); amt.setPadding(dp(8), 0, 0, 0);
+        amt.setOnFocusChangeListener((v, has) -> { swapInputFocused = has; if (!has) ui.postDelayed(this::render, 250); });
+        if (swapAmount.length() > 0) amt.setSelection(swapAmount.length());
+        sendRow.addView(amt, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        card.addView(sendRow);
+
+        // ⇅ flip divider
+        LinearLayout flipRow = new LinearLayout(this);
+        flipRow.setOrientation(LinearLayout.HORIZONTAL); flipRow.setGravity(Gravity.CENTER_VERTICAL);
+        flipRow.setPadding(0, dp(10), 0, dp(10));
+        View l1 = new View(this); l1.setBackgroundColor(Design.BORDER());
+        View l2 = new View(this); l2.setBackgroundColor(Design.BORDER());
+        TextView flip = new TextView(this);
+        flip.setText("⇅"); flip.setGravity(Gravity.CENTER); flip.setTextColor(Design.ACCENT()); flip.setTextSize(16f); flip.setTypeface(Design.sansBold());
+        flip.setBackground(Design.stroked(this, Design.SURFACE2(), 19));
+        flip.setOnClickListener(v -> { swapSell = !swapSell; render(); }); Design.pressable(flip);
+        int fs = dp(38);
+        LinearLayout.LayoutParams llL = new LinearLayout.LayoutParams(0, dp(1), 1f);
+        LinearLayout.LayoutParams llF = new LinearLayout.LayoutParams(fs, fs); llF.leftMargin = dp(12); llF.rightMargin = dp(12);
+        LinearLayout.LayoutParams llR = new LinearLayout.LayoutParams(0, dp(1), 1f);
+        flipRow.addView(l1, llL); flipRow.addView(flip, llF); flipRow.addView(l2, llR);
+        card.addView(flipRow);
+
+        // YOU RECEIVE (computed, live)
+        card.addView(fieldLabel("YOU RECEIVE (estimate)"));
+        LinearLayout recvRow = new LinearLayout(this);
+        recvRow.setOrientation(LinearLayout.HORIZONTAL); recvRow.setGravity(Gravity.CENTER_VERTICAL);
+        recvRow.setPadding(0, dp(6), 0, dp(2));
+        recvRow.addView(coinChip(!sellMinima));
+        final TextView recv = new TextView(this);
+        recv.setTextColor(Design.ACCENT()); recv.setTextSize(26f); recv.setTypeface(Design.monoBold());
+        recv.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        String r0 = sellMinima ? computeUsdt(swapAmount, price) : computeMinima(swapAmount, price);
+        recv.setText(r0 == null ? "0.00" : r0);
+        recvRow.addView(recv, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        card.addView(recvRow);
+
+        // live conversion as they type (updates in place — no tree rebuild)
+        amt.addTextChangedListener(new SimpleWatcher(() -> {
+            swapAmount = amt.getText().toString();
+            String rr = sellMinima ? computeUsdt(swapAmount, price) : computeMinima(swapAmount, price);
+            recv.setText(rr == null ? "0.00" : rr);
+        }));
+
+        // best price line
+        double size = sellMinima ? (maker.usdtAvail / price) : maker.minimaAvail;
+        TextView bp = new TextView(this);
+        bp.setText("Best price " + fmtPrice(price) + " USDT/MINIMA  ·  up to ~" + abbrev(size) + " MINIMA" + (sellMinima ? "" : "  ·  ETH gas ~from your ETH balance"));
+        bp.setTextColor(Design.DIM2()); bp.setTextSize(11.5f); bp.setTypeface(Design.sans()); bp.setPadding(0, dp(12), 0, 0);
+        card.addView(bp);
+
+        TextView cta = button("Review swap");
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        blp.topMargin = dp(16); cta.setLayoutParams(blp);
+        cta.setOnClickListener(v -> reviewSwap(maker, sellMinima, amt.getText().toString().trim(), price));
+        card.addView(cta);
+
         col.addView(card);
 
-        col.addView(swapReadiness());
+        // live swap-leg stages below the price
+        swapStages(col);
 
         if (orderStatus != null) {
             TextView stt = new TextView(this);
@@ -1128,23 +1182,177 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /** A friendly "are you ready to trade" strip; taps jump to the Wallet tab to fund. */
-    private TextView swapReadiness() {
-        String node = paired ? "✓ Node connected" : "⚠ Node not connected";
-        String parts;
+    private TextView fieldLabel(String s) {
+        TextView t = new TextView(this);
+        t.setText(s); t.setTextColor(Design.DIM()); t.setTextSize(11f); t.setTypeface(Design.sans()); t.setLetterSpacing(0.06f);
+        return t;
+    }
+
+    /** A token chip: coloured coin mark + ticker + available balance. */
+    private LinearLayout coinChip(boolean minima) {
+        LinearLayout chip = new LinearLayout(this);
+        chip.setOrientation(LinearLayout.HORIZONTAL); chip.setGravity(Gravity.CENTER_VERTICAL);
+        TextView circle = new TextView(this);
+        circle.setText(minima ? "M" : "$"); circle.setGravity(Gravity.CENTER);
+        circle.setTextColor(minima ? Design.ON_ACCENT() : 0xFFFFFFFF);
+        circle.setTypeface(Design.sansBold()); circle.setTextSize(15f);
+        android.graphics.drawable.GradientDrawable cg = new android.graphics.drawable.GradientDrawable();
+        cg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+        cg.setColor(minima ? Design.ACCENT() : USDT_TEAL);
+        circle.setBackground(cg);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(dp(34), dp(34)); clp.rightMargin = dp(10);
+        chip.addView(circle, clp);
+        LinearLayout colc = new LinearLayout(this); colc.setOrientation(LinearLayout.VERTICAL);
+        TextView tk = new TextView(this); tk.setText(minima ? "MINIMA" : "USDT"); tk.setTextColor(Design.TEXT()); tk.setTextSize(15f); tk.setTypeface(Design.sansBold());
+        TextView sub = new TextView(this);
+        String usdt = tokenBals.get("USDT");
+        sub.setText(minima ? ("avail " + abbrev(parseD(minimaBal, 0))) : ("avail " + (usdt != null ? Util.tidyAmount(usdt) : "—")));
+        sub.setTextColor(Design.DIM()); sub.setTextSize(11f); sub.setTypeface(Design.sans());
+        colc.addView(tk); colc.addView(sub);
+        chip.addView(colc);
+        return chip;
+    }
+
+    /** MINIMA you'd receive for a USDT amount at a given price (USDT per MINIMA). */
+    private String computeMinima(String usdtAmount, double price) {
+        try {
+            BigDecimal u = new BigDecimal(usdtAmount.trim());
+            if (u.signum() <= 0 || price <= 0) return null;
+            BigDecimal m = u.divide(BigDecimal.valueOf(price), 8, RoundingMode.DOWN);
+            return Util.tidyAmount(m.stripTrailingZeros().toPlainString());
+        } catch (Exception e) { return null; }
+    }
+
+    /** Confirm the inline swap, then start it via the existing engine path. */
+    private void reviewSwap(Order maker, boolean sellMinima, String sendStr, double price) {
+        if (sendStr.isEmpty()) { toast("Enter an amount to " + (sellMinima ? "sell" : "spend")); return; }
+        final String minima, usdt;
+        if (sellMinima) { minima = sendStr; usdt = computeUsdt(sendStr, price); }
+        else { usdt = sendStr; minima = computeMinima(sendStr, price); }
+        if (minima == null || usdt == null) { toast("Enter a valid amount"); return; }
+        String msg = sellMinima
+                ? ("Sell  " + minima + " MINIMA\nReceive  ≈ " + usdt + " USDT\n\nBest price " + fmtPrice(price) + " USDT/MINIMA\nCounterparty  " + Util.shorten(maker.signerPk)
+                    + "\n\nThis locks your MINIMA on-chain. Continue?")
+                : ("Buy  ≈ " + minima + " MINIMA\nPay  " + usdt + " USDT (+ ETH gas)\n\nBest price " + fmtPrice(price) + " USDT/MINIMA\nCounterparty  " + Util.shorten(maker.signerPk)
+                    + "\n\nThis locks your USDT on-chain. Continue?");
+        modalOpen = true;
+        dialog()
+                .setTitle(sellMinima ? "Review — Sell MINIMA" : "Review — Buy MINIMA")
+                .setMessage(msg)
+                .setPositiveButton("Start swap", (d, w) -> { swapAmount = ""; startSwap(maker, "USDT", sellMinima, minima, usdt); })
+                .setNegativeButton("Cancel", null)
+                .setOnDismissListener(d -> { modalOpen = false; render(); })
+                .show();
+    }
+
+    // ---- swap-leg stage pills (readiness → lock → counterparty → claim → complete) ----
+
+    private void swapStages(LinearLayout col) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(18); box.setLayoutParams(lp);
+
+        TextView t = new TextView(this);
+        t.setText("YOUR SWAP"); t.setTextColor(Design.DIM()); t.setTextSize(11f); t.setLetterSpacing(0.06f); t.setTypeface(Design.sans()); t.setPadding(dp(2), 0, 0, dp(8));
+        box.addView(t);
+
+        // pre-flight readiness
+        box.addView(stagePill("Node connected", paired ? STG_DONE : STG_WARN));
         if (swapSell) {
-            parts = node + "     " + (parseD(minimaBal, 0) > 0 ? "✓ MINIMA ready" : "⚠ No MINIMA to sell");
+            box.addView(stagePill("MINIMA ready to sell", parseD(minimaBal, 0) > 0 ? STG_DONE : STG_WARN));
         } else {
             String usdt = tokenBals.get("USDT");
-            parts = node + "     " + ((usdt != null && parseD(usdt, 0) > 0) ? "✓ USDT ready" : "⚠ Add USDT")
-                    + "     " + (parseD(ethBal.replace(" ETH", ""), 0) > 0 ? "✓ ETH for gas" : "⚠ Add ETH for gas");
+            box.addView(stagePill("USDT ready to spend", (usdt != null && parseD(usdt, 0) > 0) ? STG_DONE : STG_WARN));
+            box.addView(stagePill("ETH for gas", parseD(ethBal.replace(" ETH", ""), 0) > 0 ? STG_DONE : STG_WARN));
         }
+
+        // live swap legs (if a swap is in flight or just finished)
+        SwapDb.Swap sw = latestRelevantSwap();
+        if (sw != null) {
+            if (SwapDb.ST_REFUNDED.equals(sw.status)) {
+                box.addView(stagePill("Timed out — " + sw.sellAmount + " " + sw.sellToken + " refunded", STG_WARN));
+            } else {
+                int active = stageIndex(sw.status);   // index of the first not-yet-done leg
+                box.addView(stagePill("Locked your " + sw.sellAmount + " " + sw.sellToken, legState(1, active)));
+                box.addView(stagePill("Counterparty locks their side", legState(2, active)));
+                box.addView(stagePill("Claim your " + sw.buyAmount + " " + sw.buyToken, legState(3, active)));
+                box.addView(stagePill("Swap complete", legState(4, active)));
+            }
+            TextView detail = new TextView(this);
+            detail.setText(statusDetail(sw));
+            detail.setTextColor(Design.DIM()); detail.setTextSize(12f); detail.setTypeface(Design.sans()); detail.setLineSpacing(dp(2), 1f); detail.setPadding(dp(2), dp(8), 0, 0);
+            box.addView(detail);
+            if (!isTerminal(sw)) {
+                TextView chk = Design.pill(this, "Check now", Design.SURFACE2(), Design.TEXT());
+                LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                clp.topMargin = dp(8); chk.setLayoutParams(clp);
+                chk.setOnClickListener(v -> checkNow(sw.hash)); Design.pressable(chk);
+                box.addView(chk);
+            }
+        } else {
+            box.addView(stagePill("Enter an amount and tap Review to begin", STG_PENDING));
+        }
+        col.addView(box);
+    }
+
+    /** A stage row: coloured status dot + label. state ∈ {pending, active, done, warn}. */
+    private LinearLayout stagePill(String label, int state) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL); row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(2), dp(5), dp(2), dp(5));
+        View dot = new View(this);
+        android.graphics.drawable.GradientDrawable dg = new android.graphics.drawable.GradientDrawable();
+        dg.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+        switch (state) {
+            case STG_DONE:   dg.setColor(Design.IN()); break;
+            case STG_ACTIVE: dg.setColor(Design.ACCENT()); break;
+            case STG_WARN:   dg.setColor(STAGE_WARN_COLOR); break;
+            default:         dg.setColor(0x00000000); dg.setStroke(Math.max(1, dp(1)), Design.DIM2()); break;
+        }
+        dot.setBackground(dg);
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(dp(9), dp(9)); dlp.leftMargin = dp(2); dlp.rightMargin = dp(12);
+        row.addView(dot, dlp);
         TextView t = new TextView(this);
-        t.setText(parts + "   ›");
-        t.setTextColor(Design.DIM2()); t.setTextSize(11.5f); t.setTypeface(Design.sans()); t.setPadding(dp(2), dp(14), dp(2), 0);
-        t.setOnClickListener(v -> setTab(TAB_WALLET));
-        Design.pressable(t);
-        return t;
+        t.setText(label); t.setTextSize(13f);
+        switch (state) {
+            case STG_ACTIVE: t.setTextColor(Design.TEXT()); t.setTypeface(Design.sansBold()); break;
+            case STG_DONE:   t.setTextColor(Design.TEXT()); t.setTypeface(Design.sans()); break;
+            case STG_WARN:   t.setTextColor(STAGE_WARN_COLOR); t.setTypeface(Design.sans()); break;
+            default:         t.setTextColor(Design.DIM()); t.setTypeface(Design.sans()); break;
+        }
+        row.addView(t);
+        return row;
+    }
+
+    private int legState(int i, int active) {
+        if (i < active) return STG_DONE;
+        if (i == active) return STG_ACTIVE;
+        return STG_PENDING;
+    }
+
+    /** Index of the first not-yet-completed leg for a status (1=lock,2=counterparty,3=claim,5=all done). */
+    private int stageIndex(String status) {
+        switch (status) {
+            case SwapDb.ST_STARTED:  return 2;   // your leg locked; waiting on counterparty
+            case SwapDb.ST_LOCKED:   return 3;   // counterparty locked; claiming next
+            case SwapDb.ST_CLAIMING: return 3;   // claiming your funds
+            case SwapDb.ST_COMPLETE: return 5;   // all legs done
+            default:                 return 2;
+        }
+    }
+
+    /** The swap to surface on the Swap tab: most-recently-updated non-terminal swap, or one that finished
+     *  within the grace window (so you see it land). */
+    private SwapDb.Swap latestRelevantSwap() {
+        if (db == null) return null;
+        SwapDb.Swap pick = null;
+        long now = System.currentTimeMillis();
+        for (SwapDb.Swap s : db.allSwaps()) {
+            if (isTerminal(s) && now - s.updated > TERMINAL_GRACE_MS) continue;
+            if (pick == null || s.updated > pick.updated) pick = s;
+        }
+        return pick;
     }
 
     private static final class Best { Order bidMaker, askMaker; double bestBid = 0, bestAsk = Double.MAX_VALUE; }
