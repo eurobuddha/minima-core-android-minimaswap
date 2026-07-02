@@ -84,7 +84,7 @@ public class MainActivity extends AppCompatActivity {
 
     private static final String CH = "minimaswap";
     private static final String PREFS = "minimaswap";
-    private static final String[] PAIR_TOKENS = {"USDT"};
+    private static final String[] PAIR_TOKENS = Order.PAIR_TOKENS;   // single source of truth in Order
     private static final long WATCH_INTERVAL_MS = 90_000;
     static final long REPUBLISH_INTERVAL_MS = 30 * 60_000;   // keep a published order live + fresh (bridge uses 30m)
     private static final long TERMINAL_GRACE_MS = 10 * 60_000;   // finished swaps auto-hide after this
@@ -635,111 +635,145 @@ public class MainActivity extends AppCompatActivity {
     // ---- order config (persisted; drives both publish AND the responder match guard) ----
 
     private Order loadOrder() {
-        Order o = new Order();
-        String raw = prefs.getString("order_config", "");
-        JSONObject cfg = null;
-        try { if (!raw.isEmpty()) cfg = new JSONObject(raw); } catch (Exception ignore) {}
-        for (String sym : PAIR_TOKENS) {
-            Order.Pair p = new Order.Pair(false, 1.0, 1.0, 1.0);
-            if (cfg != null) {
-                JSONObject c = cfg.optJSONObject(sym);
-                if (c != null) {
-                    p.enable = c.optBoolean("en", false);
-                    p.buy = c.optDouble("buy", 1.0);
-                    p.sell = c.optDouble("sell", 1.0);
-                    p.min = c.optDouble("min", 1.0);
-                }
-            }
-            o.pairs.put(sym, p);
-        }
-        return o;
+        return Order.fromConfigJson(prefs.getString("order_config", ""));   // shared ladder-aware loader
     }
 
     private void saveOrder(Order o) {
-        try {
-            JSONObject cfg = new JSONObject();
-            for (Map.Entry<String, Order.Pair> e : o.pairs.entrySet()) {
-                Order.Pair p = e.getValue();
-                cfg.put(e.getKey(), new JSONObject().put("en", p.enable).put("buy", p.buy).put("sell", p.sell).put("min", p.min));
-            }
-            prefs.edit().putString("order_config", cfg.toString()).apply();
-        } catch (Exception ignore) {}
-        if (engine != null) engine.setMyOrder(o);
+        prefs.edit().putString("order_config", Order.toConfigJson(o)).apply();
+        if (engine != null) engine.setMyOrder(o);   // arm the responder match guard immediately
     }
 
     private void editOrderDialog() {
         final Order o = loadOrder();
+        final String sym = PAIR_TOKENS[0];   // single pair today
+        final Order.Pair p = o.pairs.get(sym);
+
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(20), dp(8), dp(20), dp(8));
 
         TextView hint = new TextView(this);
-        hint.setText("Your two-sided market — price of MINIMA in USDT (USDT per MINIMA):\n"
-                + "•  ASK — where YOU SELL MINIMA (the higher price)\n"
-                + "•  BID — where YOU BUY MINIMA (the lower price)\n"
-                + "The gap between them is your spread. Ask must be above Bid.");
-        hint.setTextColor(Design.DIM()); hint.setTextSize(12f); hint.setPadding(0, 0, 0, dp(10));
+        hint.setText("Your depth ladder for MINIMA / " + sym + "  (price = USDT per MINIMA):\n"
+                + "•  ASKS — where YOU SELL MINIMA (higher).   BIDS — where YOU BUY (lower).\n"
+                + "•  Each level's amount is a per-take cap. Leave rows blank to skip them.\n"
+                + "•  Tip: make your best level your largest — old-app takers only see your best price.");
+        hint.setTextColor(Design.DIM()); hint.setTextSize(12f); hint.setTypeface(Design.sans()); hint.setLineSpacing(dp(2), 1f); hint.setPadding(0, 0, 0, dp(10));
         box.addView(hint);
 
-        final Map<String, SwitchCompat> en = new LinkedHashMap<>();
-        final Map<String, EditText> ask = new LinkedHashMap<>(), bid = new LinkedHashMap<>(), min = new LinkedHashMap<>();
-        for (String sym : PAIR_TOKENS) {
-            Order.Pair p = o.pairs.get(sym);
-            TextView t = new TextView(this); t.setText("MINIMA / " + sym); t.setTextColor(Design.TEXT()); t.setTextSize(15f);
-            t.setTypeface(Design.sansBold()); t.setPadding(0, dp(12), 0, dp(4));
-            box.addView(t);
-            SwitchCompat sw = new SwitchCompat(this); sw.setText("Enabled"); sw.setTextColor(Design.DIM()); sw.setChecked(p.enable);
-            box.addView(sw); en.put(sym, sw);
-            // Internal fields stay buy=ask / sell=bid (wire-compatible); the LABELS are unambiguous maker-perspective.
-            final EditText a = numRow(box, "ASK — you SELL MINIMA (" + sym + ", higher)", p.buy, Design.RED());
-            final EditText b = numRow(box, "BID — you BUY MINIMA (" + sym + ", lower)", p.sell, Design.IN());
-            final EditText mn = numRow(box, "min MINIMA / trade", p.min);
-            ask.put(sym, a); bid.put(sym, b); min.put(sym, mn);
+        final SwitchCompat sw = new SwitchCompat(this);
+        sw.setText("Enabled"); sw.setTextColor(Design.DIM()); sw.setChecked(p.enable);
+        box.addView(sw);
 
-            final TextView pv = new TextView(this); pv.setTextSize(12f); pv.setPadding(0, dp(6), 0, dp(2));
-            box.addView(pv);
-            Runnable upd = () -> updateSpreadPreview(pv, a, b, sym);
-            TextWatcher w = onChange(upd);
-            a.addTextChangedListener(w); b.addTextChangedListener(w);
-            upd.run();
+        // quick-generate
+        box.addView(fieldLabel("QUICK GENERATE (mid · step % · size)"));
+        LinearLayout gen = new LinearLayout(this); gen.setOrientation(LinearLayout.HORIZONTAL); gen.setGravity(Gravity.CENTER_VERTICAL); gen.setPadding(0, dp(4), 0, dp(2));
+        final EditText midE = genField("mid"), stepE = genField("step %"), sizeE = genField("size");
+        LinearLayout.LayoutParams g1 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); g1.rightMargin = dp(6);
+        LinearLayout.LayoutParams g2 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); g2.rightMargin = dp(6);
+        LinearLayout.LayoutParams g3 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        gen.addView(midE, g1); gen.addView(stepE, g2); gen.addView(sizeE, g3);
+        box.addView(gen);
+        TextView genBtn = Design.pill(this, "Generate 6 + 6", Design.SURFACE2(), Design.TEXT());
+        LinearLayout.LayoutParams gblp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        gblp.topMargin = dp(6); genBtn.setLayoutParams(gblp);
+        box.addView(genBtn);
+
+        // Live balances — used to seed a pre-ladder (0.8.x) order's synthetic size so a no-op Save keeps it live.
+        final double liveMinima = parseD(minimaBal, 0);
+        final double liveUsdt = parseD(Util.tidyAmount(tokenBals.get("USDT")), 0);
+
+        // ASKS (maker sells MINIMA, higher)
+        TextView ah = new TextView(this); ah.setText("ASKS — you SELL MINIMA (higher price)");
+        ah.setTextColor(Design.RED()); ah.setTextSize(12.5f); ah.setTypeface(Design.sansBold()); ah.setLetterSpacing(0.03f); ah.setPadding(0, dp(12), 0, dp(2));
+        box.addView(ah);
+        final EditText[][] askRows = new EditText[Order.MAX_LEVELS][];
+        for (int i = 0; i < Order.MAX_LEVELS; i++) {
+            boolean legacy0 = i == 0 && p.asks.isEmpty() && p.enable && p.buy > 0;   // seed row from the live single-price ask
+            double px = i < p.asks.size() ? p.asks.get(i).price : (legacy0 ? p.buy : 0);
+            double am = i < p.asks.size() ? p.asks.get(i).amount : (legacy0 ? liveMinima : 0);
+            askRows[i] = numRow2(box, "A" + (i + 1), px, am, Design.RED());
         }
+
+        // BIDS (maker buys MINIMA, lower)
+        TextView bh = new TextView(this); bh.setText("BIDS — you BUY MINIMA (lower price)");
+        bh.setTextColor(Design.IN()); bh.setTextSize(12.5f); bh.setTypeface(Design.sansBold()); bh.setLetterSpacing(0.03f); bh.setPadding(0, dp(12), 0, dp(2));
+        box.addView(bh);
+        final EditText[][] bidRows = new EditText[Order.MAX_LEVELS][];
+        for (int i = 0; i < Order.MAX_LEVELS; i++) {
+            boolean legacy0 = i == 0 && p.bids.isEmpty() && p.enable && p.sell > 0;   // seed row from the live single-price bid
+            double px = i < p.bids.size() ? p.bids.get(i).price : (legacy0 ? p.sell : 0);
+            double am = i < p.bids.size() ? p.bids.get(i).amount : (legacy0 && p.sell > 0 ? liveUsdt / p.sell : 0);
+            bidRows[i] = numRow2(box, "B" + (i + 1), px, am, Design.IN());
+        }
+
+        final EditText minE = numRow(box, "min MINIMA / trade", p.min);
+
+        final TextView pv = new TextView(this); pv.setTextSize(12f); pv.setTypeface(Design.sans()); pv.setLineSpacing(dp(2), 1f); pv.setPadding(0, dp(10), 0, dp(2));
+        box.addView(pv);
+
+        final Runnable upd = () -> updateLadderPreview(pv, askRows, bidRows);
+        TextWatcher w = onChange(upd);
+        for (EditText[] row : askRows) { row[0].addTextChangedListener(w); row[1].addTextChangedListener(w); }
+        for (EditText[] row : bidRows) { row[0].addTextChangedListener(w); row[1].addTextChangedListener(w); }
+        upd.run();
+
+        genBtn.setOnClickListener(v -> {
+            double mid = parseD(midE.getText().toString(), 0), step = parseD(stepE.getText().toString(), 0), size = parseD(sizeE.getText().toString(), 0);
+            if (mid <= 0 || step <= 0 || size <= 0) { toast("Enter mid price, step % and size to generate"); return; }
+            for (int i = 0; i < Order.MAX_LEVELS; i++) {
+                askRows[i][0].setText(trim(mid * (1 + (i + 1) * step / 100.0))); askRows[i][1].setText(trim(size));
+                bidRows[i][0].setText(trim(mid * (1 - (i + 1) * step / 100.0))); bidRows[i][1].setText(trim(size));
+            }
+            upd.run();
+        });
+        Design.pressable(genBtn);
 
         modalOpen = true;
         dialog()
-                .setTitle("My market / rates")
+                .setTitle("My market / ladder")
                 .setView(wrapScroll(box))
-                .setPositiveButton("Save", (d, w) -> {
-                    String warn = null;
-                    for (String sym : PAIR_TOKENS) {
-                        Order.Pair p = o.pairs.get(sym);
-                        p.enable = en.get(sym).isChecked();
-                        p.buy = parseD(ask.get(sym).getText().toString(), p.buy);   // ask
-                        p.sell = parseD(bid.get(sym).getText().toString(), p.sell); // bid
-                        p.min = parseD(min.get(sym).getText().toString(), p.min);
-                        if (p.enable && p.buy > 0 && p.sell > 0 && p.buy <= p.sell)
-                            warn = sym + ": Ask ≤ Bid — you'd SELL MINIMA cheaper than you BUY it. Check before publishing.";
-                    }
+                .setPositiveButton("Save", (d, w2) -> {
+                    p.enable = sw.isChecked();
+                    p.asks.clear(); p.bids.clear();
+                    for (EditText[] row : askRows) p.asks.add(new Order.Level(parseD(row[0].getText().toString(), 0), parseD(row[1].getText().toString(), 0)));
+                    for (EditText[] row : bidRows) p.bids.add(new Order.Level(parseD(row[0].getText().toString(), 0), parseD(row[1].getText().toString(), 0)));
+                    p.min = parseD(minE.getText().toString(), p.min);
+                    // Editor is authoritative: a side the user leaves with no valid levels is OFF. Zero its scalar
+                    // first so sanitize (which only DERIVES a scalar when a side HAS levels) can't leave a stale
+                    // legacy price live — otherwise the engine's empty-ladder fallback would keep trading it.
+                    p.buy = 0; p.sell = 0;
+                    Order.sanitize(p);   // drop blanks/invalids, cap 6, sort, derive best-level scalars for non-empty sides
                     saveOrder(o);
-                    toast(warn != null ? "⚠ Saved, but " + warn : "Market saved");
+                    if (p.enable && p.asks.isEmpty() && p.bids.isEmpty())
+                        toast("Enabled, but no levels set — add a bid or ask to publish");
+                    else
+                        toast(Order.crossed(p) ? "⚠ Saved, but your best bid ≥ best ask (crossed market)" : "Ladder saved");
                 })
                 .setNegativeButton("Cancel", null)
                 .setOnDismissListener(d -> { modalOpen = false; render(); })
                 .show();
     }
 
-    /** Live bid/ask spread preview in the rate editor; flags an inverted (ask ≤ bid) market in red. */
-    private void updateSpreadPreview(TextView pv, EditText askE, EditText bidE, String sym) {
-        double a = parseD(askE.getText().toString(), 0), b = parseD(bidE.getText().toString(), 0);
-        if (a <= 0 || b <= 0) {
-            pv.setText("Bid " + (b > 0 ? trim(b) : "—") + "   /   Ask " + (a > 0 ? trim(a) : "—"));
-            pv.setTextColor(Design.DIM2());
-        } else if (a <= b) {
-            pv.setText("⚠ Inverted — Ask " + trim(a) + " ≤ Bid " + trim(b) + ": you'd sell cheaper than you buy");
-            pv.setTextColor(Design.RED());
-        } else {
-            pv.setText("Spread:  Bid " + trim(b) + "   /   Ask " + trim(a) + "   (" + fmtPrice(a - b) + " " + sym + ")");
-            pv.setTextColor(Design.IN());
+    /** Live ladder summary in the editor: level counts, best prices, side totals, crossed warning. */
+    private void updateLadderPreview(TextView pv, EditText[][] askRows, EditText[][] bidRows) {
+        int nA = 0, nB = 0; double bestAsk = Double.MAX_VALUE, bestBid = 0, sumA = 0, sumB = 0;
+        for (EditText[] row : askRows) {
+            double px = parseD(row[0].getText().toString(), 0), am = parseD(row[1].getText().toString(), 0);
+            if (px > 0 && am > 0) { nA++; sumA += am; if (px < bestAsk) bestAsk = px; }
         }
+        for (EditText[] row : bidRows) {
+            double px = parseD(row[0].getText().toString(), 0), am = parseD(row[1].getText().toString(), 0);
+            if (px > 0 && am > 0) { nB++; sumB += am; if (px > bestBid) bestBid = px; }
+        }
+        if (nA > 0 && nB > 0 && bestBid >= bestAsk) {
+            pv.setText("⚠ Crossed — best bid " + fmtPrice(bestBid) + " ≥ best ask " + fmtPrice(bestAsk) + ": you'd sell cheaper than you buy");
+            pv.setTextColor(Design.RED());
+            return;
+        }
+        String bidS = nB > 0 ? (nB + " lvl · best " + fmtPrice(bestBid) + " · " + abbrev(sumB) + " M") : "none";
+        String askS = nA > 0 ? (nA + " lvl · best " + fmtPrice(bestAsk) + " · " + abbrev(sumA) + " M") : "none";
+        pv.setText("BIDS  " + bidS + "\nASKS  " + askS);
+        pv.setTextColor(Design.DIM());
     }
 
     private static TextWatcher onChange(Runnable r) {
@@ -788,6 +822,32 @@ public class MainActivity extends AppCompatActivity {
         return e;
     }
 
+    /** A ladder tranche row: [label][price][amount MINIMA]. Blank fields (value ≤ 0) render empty = unused. */
+    private EditText[] numRow2(LinearLayout parent, String label, double price, double amount, int labelColor) {
+        LinearLayout r = new LinearLayout(this);
+        r.setOrientation(LinearLayout.HORIZONTAL); r.setGravity(Gravity.CENTER_VERTICAL); r.setPadding(0, dp(2), 0, dp(2));
+        TextView t = new TextView(this); t.setText(label); t.setTextColor(labelColor); t.setTextSize(12.5f); t.setTypeface(Design.mono());
+        EditText pe = new EditText(this); decimalInput(pe);
+        pe.setHint("price"); pe.setHintTextColor(Design.DIM2());
+        pe.setText(price > 0 ? trim(price) : ""); pe.setTextColor(Design.TEXT()); pe.setTextSize(14f); pe.setGravity(Gravity.END); pe.setTypeface(Design.mono());
+        EditText ae = new EditText(this); decimalInput(ae);
+        ae.setHint("MINIMA"); ae.setHintTextColor(Design.DIM2());
+        ae.setText(amount > 0 ? trim(amount) : ""); ae.setTextColor(Design.TEXT()); ae.setTextSize(14f); ae.setGravity(Gravity.END); ae.setTypeface(Design.mono());
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(dp(26), LinearLayout.LayoutParams.WRAP_CONTENT);
+        LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); plp.leftMargin = dp(6);
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); alp.leftMargin = dp(8);
+        r.addView(t, tlp); r.addView(pe, plp); r.addView(ae, alp);
+        parent.addView(r);
+        return new EditText[]{ pe, ae };
+    }
+
+    private EditText genField(String hint) {
+        EditText e = new EditText(this); decimalInput(e);
+        e.setHint(hint); e.setHintTextColor(Design.DIM2());
+        e.setTextColor(Design.TEXT()); e.setTextSize(14f); e.setTypeface(Design.mono()); e.setGravity(Gravity.CENTER);
+        return e;
+    }
+
     // ---- take an order (guided swap start) ----
 
     /**
@@ -796,10 +856,10 @@ public class MainActivity extends AppCompatActivity {
      *   - Sell MINIMA → you give MINIMA, receive USDT at the maker's SELL price (the lower / bid).
      *   - Buy MINIMA  → you give USDT, receive MINIMA at the maker's BUY price (the higher / ask).
      */
-    private void takeOrderDialog(Order maker, String symbol, boolean sellMinima) {
+    private void takeOrderDialog(Order maker, String symbol, boolean sellMinima, final double price, final double maxAmount) {
+        if (price <= 0) return;
         Order.Pair p = maker.pairs.get(symbol);
-        if (p == null) return;
-        final double price = sellMinima ? p.sell : p.buy;   // USDT per MINIMA: sell=bid(lower), buy=ask(higher)
+        final double min = p != null ? p.min : 0;   // maker's global per-trade minimum
 
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
@@ -807,7 +867,8 @@ public class MainActivity extends AppCompatActivity {
         TextView info = new TextView(this);
         info.setText((sellMinima ? "Sell MINIMA → " + symbol : "Buy MINIMA ← " + symbol)
                 + "\nPrice: " + trim(price) + " " + symbol + " per MINIMA"
-                + "\nMin: " + trim(p.min) + " MINIMA");
+                + "\nThis level: up to " + abbrev(maxAmount) + " MINIMA"
+                + (min > 0 ? "\nMin: " + trim(min) + " MINIMA" : ""));
         info.setTextColor(Design.DIM()); info.setTextSize(13f); info.setTypeface(Design.sans()); info.setLineSpacing(dp(3), 1f); info.setPadding(0, 0, 0, dp(10));
         box.addView(info);
 
@@ -834,6 +895,11 @@ public class MainActivity extends AppCompatActivity {
                     String minima = amt.getText().toString().trim();
                     String usdt = computeUsdt(minima, price);
                     if (usdt == null) { toast("Enter a valid MINIMA amount"); return; }
+                    // Client-side guards are UX-only — the maker's engine guard is authoritative — but catch the
+                    // obvious auto-declines before locking any coins on-chain.
+                    double m = parseD(minima, 0);
+                    if (m > maxAmount + 1e-9) { toast("This level takes up to " + abbrev(maxAmount) + " MINIMA — more will be auto-declined"); return; }
+                    if (min > 0 && m < min) { toast("Below the maker's minimum (" + trim(min) + " MINIMA)"); return; }
                     startSwap(maker, symbol, sellMinima, minima, usdt);
                 })
                 .setNegativeButton("Cancel", null)
@@ -1168,8 +1234,8 @@ public class MainActivity extends AppCompatActivity {
             swapAmount = amt.getText().toString();
         }));
 
-        // best price line
-        double size = sellMinima ? (maker.usdtAvail / price) : maker.minimaAvail;
+        // best price line — cap is the best level's per-take size (ladder-aware), not the maker's whole balance
+        double size = sellMinima ? best.bidCap : best.askCap;
         TextView bp = new TextView(this);
         bp.setText("Best price " + fmtPrice(price) + " USDT/MINIMA  ·  up to ~" + abbrev(size) + " MINIMA" + (sellMinima ? "" : "  ·  ETH gas ~from your ETH balance"));
         bp.setTextColor(Design.DIM2()); bp.setTextSize(11.5f); bp.setTypeface(Design.sans()); bp.setPadding(0, dp(12), 0, 0);
@@ -1178,7 +1244,7 @@ public class MainActivity extends AppCompatActivity {
         TextView cta = button("Review swap");
         LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         blp.topMargin = dp(16); cta.setLayoutParams(blp);
-        cta.setOnClickListener(v -> reviewSwap(maker, sellMinima, amt.getText().toString().trim(), price));
+        cta.setOnClickListener(v -> reviewSwap(maker, sellMinima, amt.getText().toString().trim(), price, sellMinima ? best.bidCap : best.askCap));
         card.addView(cta);
 
         col.addView(card);
@@ -1237,13 +1303,17 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /** Confirm the inline swap, then start it via the existing engine path. */
-    private void reviewSwap(Order maker, boolean sellMinima, String sendStr, double price) {
+    private void reviewSwap(Order maker, boolean sellMinima, String sendStr, double price, double maxAmount) {
         swapInputFocused = false;   // leaving the amount field — let the panel re-render live from here on
         if (sendStr.isEmpty()) { toast("Enter an amount to " + (sellMinima ? "sell" : "spend")); return; }
         final String minima, usdt;
         if (sellMinima) { minima = sendStr; usdt = computeUsdt(sendStr, price); }
         else { usdt = sendStr; minima = computeMinima(sendStr, price); }
         if (minima == null || usdt == null) { toast("Enter a valid amount"); return; }
+        // UX-only cap check against the best level (the maker's guard is authoritative) — stop over-sizing before a lock.
+        if (maxAmount > 0 && parseD(minima, 0) > maxAmount + 1e-9) {
+            toast("Best level takes up to " + abbrev(maxAmount) + " MINIMA — reduce the amount"); return;
+        }
         String msg = sellMinima
                 ? ("Sell  " + minima + " MINIMA\nReceive  ≈ " + usdt + " USDT\n\nBest price " + fmtPrice(price) + " USDT/MINIMA\nCounterparty  " + Util.shorten(maker.signerPk)
                     + "\n\nThis locks your MINIMA on-chain. Continue?")
@@ -1392,17 +1462,23 @@ public class MainActivity extends AppCompatActivity {
         return n;
     }
 
-    private static final class Best { Order bidMaker, askMaker; double bestBid = 0, bestAsk = Double.MAX_VALUE; }
+    private static final class Best { Order bidMaker, askMaker; double bestBid = 0, bestAsk = Double.MAX_VALUE; double bidCap = 0, askCap = 0; }
 
-    /** Best non-own bid/ask across the live order book (for the guided Swap tab; never auto-selects my own order). */
+    /** Best non-own bid/ask LEVEL across the live order book (guided Swap tab; never picks my own order).
+     *  Walks each maker's ladder (legacy makers contribute one synthetic level) and keeps the single best
+     *  price per side plus that level's balance-clamped take cap. */
     private Best bestMakers(String sym) {
         Best r = new Best();
         for (Order o : orderBook.values()) {
-            Order.Pair p = o.pairs.get(sym);
-            if (p == null || !p.enable) continue;
             if (isMine(o)) continue;
-            if (p.sell > 0 && p.sell > r.bestBid) { r.bestBid = p.sell; r.bidMaker = o; }
-            if (p.buy > 0 && p.buy < r.bestAsk) { r.bestAsk = p.buy; r.askMaker = o; }
+            for (Order.Level l : o.effectiveBids(sym)) {
+                double cap = l.price > 0 ? Math.min(l.amount, o.usdtAvail / l.price) : 0;
+                if (l.price > r.bestBid && cap > 0) { r.bestBid = l.price; r.bidMaker = o; r.bidCap = cap; }
+            }
+            for (Order.Level l : o.effectiveAsks(sym)) {
+                double cap = Math.min(l.amount, o.minimaAvail);
+                if ((r.askMaker == null || l.price < r.bestAsk) && cap > 0) { r.bestAsk = l.price; r.askMaker = o; r.askCap = cap; }
+            }
         }
         if (r.askMaker == null) r.bestAsk = 0;   // normalize "none" to 0 for callers
         return r;
@@ -1885,30 +1961,27 @@ public class MainActivity extends AppCompatActivity {
      */
     private void orderLadder(LinearLayout col) {
         final String sym = "USDT";
-        java.util.List<Order> makers = new java.util.ArrayList<>();
+        // Expand every maker's ladder into per-(maker,level) rows — legacy single-price makers contribute one
+        // synthetic level via effectiveBids/Asks, so 0.8.x orders appear seamlessly.
+        java.util.List<Object[]> bidsAgg = new java.util.ArrayList<>();   // {Order maker, Order.Level}
+        java.util.List<Object[]> asksAgg = new java.util.ArrayList<>();
         for (Order o : orderBook.values()) {
-            Order.Pair p = o.pairs.get(sym);
-            if (p != null && p.enable && (p.buy > 0 || p.sell > 0)) makers.add(o);
+            for (Order.Level l : o.effectiveBids(sym)) bidsAgg.add(new Object[]{o, l});
+            for (Order.Level l : o.effectiveAsks(sym)) asksAgg.add(new Object[]{o, l});
         }
-        if (makers.isEmpty()) return;
-        // Track WHO holds the best bid (highest) and best ask (lowest) — they may be different makers.
-        Order bestBidMaker = null, bestAskMaker = null;
-        double bestBid = 0, bestAsk = Double.MAX_VALUE;
-        for (Order o : makers) {
-            Order.Pair p = o.pairs.get(sym);
-            if (p.sell > 0 && p.sell > bestBid) { bestBid = p.sell; bestBidMaker = o; }
-            if (p.buy > 0 && p.buy < bestAsk) { bestAsk = p.buy; bestAskMaker = o; }
-        }
-        java.util.Collections.sort(makers, (a, b) -> Double.compare(a.pairs.get(sym).buy, b.pairs.get(sym).buy)); // tightest ask first
+        if (bidsAgg.isEmpty() && asksAgg.isEmpty()) return;
+        java.util.Collections.sort(bidsAgg, (a, b) -> Double.compare(((Order.Level) b[1]).price, ((Order.Level) a[1]).price)); // bids: best (highest) first
+        java.util.Collections.sort(asksAgg, (a, b) -> Double.compare(((Order.Level) a[1]).price, ((Order.Level) b[1]).price)); // asks: best (lowest) first
 
-        if (bestBid > 0 && bestAsk < Double.MAX_VALUE) {
+        double bestBid = bidsAgg.isEmpty() ? 0 : ((Order.Level) bidsAgg.get(0)[1]).price;
+        double bestAsk = asksAgg.isEmpty() ? 0 : ((Order.Level) asksAgg.get(0)[1]).price;
+        if (bestBid > 0 && bestAsk > 0) {
             TextView sp = new TextView(this);
             sp.setText("spread " + fmtPrice(bestAsk - bestBid) + " " + sym + "  ·  " + sym + " per MINIMA, size in MINIMA");
             sp.setTextColor(Design.DIM2()); sp.setTextSize(11f); sp.setTypeface(Design.sans()); sp.setPadding(dp(2), dp(4), 0, dp(4));
             col.addView(sp);
         }
 
-        // column legend
         LinearLayout legend = new LinearLayout(this);
         legend.setOrientation(LinearLayout.HORIZONTAL);
         legend.setPadding(dp(6), dp(4), dp(6), dp(2));
@@ -1918,11 +1991,69 @@ public class MainActivity extends AppCompatActivity {
         legend.addView(lR, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         col.addView(legend);
 
-        // With 2+ makers, pin the BEST market (highest bid + lowest ask, the tightest two-sided price) on top.
-        if (makers.size() >= 2 && bestBid > 0 && bestAsk < Double.MAX_VALUE)
-            col.addView(bestMarketCard(sym, bestBidMaker, bestAskMaker, bestBid, bestAsk));
+        int rows = Math.max(bidsAgg.size(), asksAgg.size());
+        int shown = Math.min(rows, 12);
+        for (int i = 0; i < shown; i++) {
+            Object[] bidRow = i < bidsAgg.size() ? bidsAgg.get(i) : null;
+            Object[] askRow = i < asksAgg.size() ? asksAgg.get(i) : null;
+            col.addView(depthRow(sym, bidRow, askRow, i == 0));
+        }
+        if (rows > shown) {
+            TextView more = new TextView(this);
+            more.setText("+ " + (rows - shown) + " more level" + (rows - shown == 1 ? "" : "s"));
+            more.setTextColor(Design.DIM2()); more.setTextSize(11f); more.setTypeface(Design.sans()); more.setPadding(dp(2), dp(6), 0, 0);
+            col.addView(more);
+        }
+    }
 
-        for (Order o : makers) col.addView(makerRow(o, sym, bestBid, bestAsk));
+    /** One depth row: [bid half]│[ask half] at rank i (the two halves may be from different makers). */
+    private LinearLayout depthRow(String sym, Object[] bidMr, Object[] askMr, boolean best) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setBackground(best ? Design.stroked(this, Design.SURFACE2(), 12) : Design.card(this, 12));
+        box.setPadding(dp(10), dp(7), dp(10), dp(7));
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        blp.topMargin = dp(6); box.setLayoutParams(blp);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL); row.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout left = depthHalf(sym, bidMr, true, best);
+        LinearLayout right = depthHalf(sym, askMr, false, best);
+        TextView div = new TextView(this); div.setText("│"); div.setTextColor(Design.DIM2()); div.setTextSize(14f); div.setPadding(dp(8), 0, dp(8), 0);
+        row.addView(left, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(div);
+        row.addView(right, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        box.addView(row);
+        return box;
+    }
+
+    /** One side of a depth row: the priced quote + a small maker tag; tappable to take THAT level. */
+    private LinearLayout depthHalf(String sym, Object[] mr, boolean isBid, boolean best) {
+        LinearLayout half = new LinearLayout(this);
+        half.setOrientation(LinearLayout.VERTICAL);
+        if (mr == null) {
+            half.addView(quoteHalf("—", "—", isBid ? Design.IN() : Design.RED(), false, isBid, best));
+            return half;
+        }
+        final Order maker = (Order) mr[0];
+        final Order.Level lvl = (Order.Level) mr[1];
+        // display clamp: never advertise more than the maker's live balance can back (guard/chain still enforce)
+        final double cap = isBid ? (lvl.price > 0 ? Math.min(lvl.amount, maker.usdtAvail / lvl.price) : 0)
+                                 : Math.min(lvl.amount, maker.minimaAvail);
+        half.addView(isBid
+                ? quoteHalf(abbrev(cap), fmtPrice(lvl.price), Design.IN(), best, true, best)
+                : quoteHalf(fmtPrice(lvl.price), abbrev(cap), Design.RED(), best, false, best));
+        boolean mine = isMine(maker);
+        TextView tag = new TextView(this);
+        tag.setText(mine ? "you" : shortAddr(maker.signerPk));
+        tag.setTextColor(mine ? Design.ACCENT() : Design.DIM2()); tag.setTextSize(9.5f); tag.setTypeface(Design.sans());
+        tag.setGravity(isBid ? Gravity.START : Gravity.END);
+        half.addView(tag);
+        if (!mine && cap > 0) {
+            half.setOnClickListener(v -> takeOrderDialog(maker, sym, isBid, lvl.price, cap));
+            Design.pressable(half);
+        }
+        return half;
     }
 
     private boolean isMine(Order o) {
@@ -1930,84 +2061,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /** Pinned top-of-book: the highest bid and lowest ask across all makers (may be two different makers). */
-    private LinearLayout bestMarketCard(String sym, Order bidMaker, Order askMaker, double bestBid, double bestAsk) {
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setBackground(Design.stroked(this, Design.SURFACE2(), 14));
-        box.setPadding(dp(12), dp(10), dp(12), dp(10));
-        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        blp.topMargin = dp(8); box.setLayoutParams(blp);
-
-        TextView tag = new TextView(this);
-        tag.setText("★ BEST MARKET");
-        tag.setTextColor(Design.ACCENT()); tag.setTextSize(11f); tag.setLetterSpacing(0.06f);
-        tag.setTypeface(Design.sansBold());
-        tag.setGravity(Gravity.CENTER); tag.setPadding(0, 0, 0, dp(6));
-        box.addView(tag);
-
-        double bidSize = bidMaker != null ? bidMaker.usdtAvail / bestBid : 0;
-        double askSize = askMaker != null ? askMaker.minimaAvail : 0;
-
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL); row.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout left = quoteHalf(abbrev(bidSize), fmtPrice(bestBid), Design.IN(), true, true, true);
-        LinearLayout right = quoteHalf(fmtPrice(bestAsk), abbrev(askSize), Design.RED(), true, false, true);
-        if (!isMine(bidMaker)) { left.setOnClickListener(v -> takeOrderDialog(bidMaker, sym, true)); Design.pressable(left); }
-        if (!isMine(askMaker)) { right.setOnClickListener(v -> takeOrderDialog(askMaker, sym, false)); Design.pressable(right); }
-
-        TextView div = new TextView(this); div.setText("│"); div.setTextColor(Design.DIM2()); div.setTextSize(14f);
-        div.setPadding(dp(8), 0, dp(8), 0);
-        row.addView(left, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        row.addView(div);
-        row.addView(right, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        box.addView(row);
-        return box;
-    }
-
-    /** One maker's two-sided quote, centred: [bidSize bidPrice] │ [askPrice askSize], tag above. */
-    private LinearLayout makerRow(Order o, String sym, double bestBid, double bestAsk) {
-        Order.Pair p = o.pairs.get(sym);
-        boolean mine = identity != null && o.commsPublicId != null && o.commsPublicId.equals(identity.publicId());
-
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setBackground(Design.card(this, 12));
-        box.setPadding(dp(12), dp(9), dp(12), dp(9));
-        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        blp.topMargin = dp(8); box.setLayoutParams(blp);
-
-        TextView tag = new TextView(this);
-        tag.setText(mine ? "your order" : shortAddr(o.signerPk));
-        tag.setTextColor(mine ? Design.ACCENT() : Design.DIM2()); tag.setTextSize(11f); tag.setTypeface(Design.sans());
-        tag.setGravity(Gravity.CENTER); tag.setPadding(0, 0, 0, dp(5));
-        box.addView(tag);
-
-        boolean hasBid = p.sell > 0, hasAsk = p.buy > 0;
-        double bidSize = hasBid ? o.usdtAvail / p.sell : 0;     // MINIMA-equiv the maker can buy from you
-
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-
-        LinearLayout left = quoteHalf(abbrev(bidSize), hasBid ? fmtPrice(p.sell) : "—",
-                Design.IN(), hasBid && p.sell == bestBid, true, false);
-        LinearLayout right = quoteHalf(hasAsk ? fmtPrice(p.buy) : "—", abbrev(hasAsk ? o.minimaAvail : 0),
-                Design.RED(), hasAsk && p.buy == bestAsk, false, false);
-
-        if (!mine && hasBid) { left.setOnClickListener(v -> takeOrderDialog(o, sym, true)); Design.pressable(left); }    // sell MINIMA
-        if (!mine && hasAsk) { right.setOnClickListener(v -> takeOrderDialog(o, sym, false)); Design.pressable(right); } // buy MINIMA
-
-        TextView div = new TextView(this); div.setText("│"); div.setTextColor(Design.DIM2()); div.setTextSize(14f);
-        div.setPadding(dp(8), 0, dp(8), 0);
-
-        row.addView(left, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        row.addView(div);
-        row.addView(right, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        box.addView(row);
-        return box;
-    }
-
-    /** Half of a maker row. leftHalf=true → [size price] right-aligned (price by the centre); else [price size].
+    /** Half of a depth row. leftHalf=true → [size price] right-aligned (price by the centre); else [price size].
      *  big=true bumps the font for the pinned BEST MARKET card. */
     private LinearLayout quoteHalf(String a, String b, int priceColor, boolean best, boolean leftHalf, boolean big) {
         LinearLayout h = new LinearLayout(this);

@@ -553,7 +553,7 @@ public final class SwapEngine {
         if (db.haveSentCounterParty(hash)) return;
         if (c.timelock - nowUnix() < CP_SECS_CHECK) { declineNote(hash, "their USDT lock is too close to its timeout"); return; }
         if (myOrder == null) return;                                      // order not loaded yet — retry next cycle
-        if (!acceptTakerBuyMinima(c)) { declineNote(hash, "it didn't match your published price/limits"); return; }
+        if (!acceptTakerBuyMinima(c)) { declineNote(hash, "it didn't fit any level of your ladder (price, level size, or minimum)"); return; }
         if (!inflight.add("cpMin:" + hash)) return;
         lockMinimaCounterLeg(c, minimaBlock);
     }
@@ -607,32 +607,54 @@ public final class SwapEngine {
 
     // ============================================================ order-match guards (fund safety)
 
+    /** Reject NaN/Infinity/≤0 before any BigDecimal.valueOf (valueOf throws on NaN/Infinity). */
+    private static boolean validPos(double d) { return !Double.isNaN(d) && !Double.isInfinite(d) && d > 0; }
+
     /**
      * Responder guard when the taker is SELLING MINIMA to me (they locked MINIMA wanting USDT). I am BUYING
-     * MINIMA, so I pay my SELL price (the lower / bid, in USDT per MINIMA). I only auto-lock if the pair is
-     * enabled, the MINIMA I'd receive meets my minimum, and the USDT I'd pay is ≤ (MINIMA received × sell).
+     * MINIMA, so I pay one of my BID prices (USDT per MINIMA). I auto-lock only if the pair is enabled, the
+     * MINIMA I'd receive meets my minimum, and it fits SOME enabled BID tranche — the take amount is within
+     * that tranche's cap AND the USDT I'd pay is ≤ (MINIMA received × tranche price). Per-take cap only; no
+     * cross-take decrement (my real balance is the hard limit, enforced at the lock step).
      */
     private boolean acceptTakerSellMinima(JSONObject coin, String reqTokenAddr) {
         Order.Pair p = pairFor(reqTokenAddr);
         if (p == null || !p.enable) return false;
         BigDecimal recvMinima = dec(coin.optString("amount", "0"));   // MINIMA the taker locked, I receive
         BigDecimal giveUsdt = dec(MinimaHtlc.stateAt(coin, 1));       // USDT they requested, I'd pay
-        if (recvMinima.compareTo(BigDecimal.valueOf(p.min)) < 0) return false;
-        return giveUsdt.compareTo(recvMinima.multiply(BigDecimal.valueOf(p.sell))) <= 0;
+        if (recvMinima.signum() <= 0) return false;
+        if (validPos(p.min) && recvMinima.compareTo(BigDecimal.valueOf(p.min)) < 0) return false;   // min>0 = floor; min≤0/NaN = no floor (0.8.2 parity)
+        if (p.bids.isEmpty())   // legacy single-price order (pre-0.9.0) — behave exactly as before
+            return validPos(p.sell) && giveUsdt.compareTo(recvMinima.multiply(BigDecimal.valueOf(p.sell))) <= 0;
+        for (Order.Level t : p.bids) {   // sanitized: valid, sorted desc, ≤ MAX_LEVELS
+            if (!validPos(t.price) || !validPos(t.amount)) continue;
+            if (recvMinima.compareTo(BigDecimal.valueOf(t.amount)) > 0) continue;             // per-take cap
+            if (giveUsdt.compareTo(recvMinima.multiply(BigDecimal.valueOf(t.price))) <= 0) return true;
+        }
+        return false;
     }
 
     /**
      * Responder guard when the taker is BUYING MINIMA from me (they locked USDT wanting MINIMA). I am SELLING
-     * MINIMA, so I get my BUY price (the higher / ask, in USDT per MINIMA). I only auto-lock if the pair is
-     * enabled, the MINIMA I'd give meets my minimum, and the USDT I'd receive is ≥ (MINIMA given × buy).
+     * MINIMA, so I get one of my ASK prices. I auto-lock only if the pair is enabled, the MINIMA I'd give meets
+     * my minimum, and it fits SOME enabled ASK tranche — within that tranche's cap AND the USDT I'd receive is
+     * ≥ (MINIMA given × tranche price).
      */
     private boolean acceptTakerBuyMinima(EthHtlc.Contract c) {
         Order.Pair p = pairFor(c.tokenContract);
         if (p == null || !p.enable) return false;
         BigDecimal giveMinima = dec(EthWallet.format(c.requestAmount, 18, 18));            // MINIMA I'd give
         BigDecimal recvUsdt = dec(EthWallet.format(c.amount, decimalsOf(c.tokenContract), 18)); // USDT I'd receive
-        if (giveMinima.compareTo(BigDecimal.valueOf(p.min)) < 0) return false;
-        return recvUsdt.compareTo(giveMinima.multiply(BigDecimal.valueOf(p.buy))) >= 0;
+        if (giveMinima.signum() <= 0) return false;
+        if (validPos(p.min) && giveMinima.compareTo(BigDecimal.valueOf(p.min)) < 0) return false;   // min>0 = floor; min≤0/NaN = no floor (0.8.2 parity)
+        if (p.asks.isEmpty())   // legacy single-price order — behave exactly as before
+            return validPos(p.buy) && recvUsdt.compareTo(giveMinima.multiply(BigDecimal.valueOf(p.buy))) >= 0;
+        for (Order.Level t : p.asks) {
+            if (!validPos(t.price) || !validPos(t.amount)) continue;
+            if (giveMinima.compareTo(BigDecimal.valueOf(t.amount)) > 0) continue;             // per-take cap
+            if (recvUsdt.compareTo(giveMinima.multiply(BigDecimal.valueOf(t.price))) >= 0) return true;
+        }
+        return false;
     }
 
     private Order.Pair pairFor(String tokenAddr) {

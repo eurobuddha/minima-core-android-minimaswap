@@ -240,18 +240,7 @@ public class SwapService extends Service {
 
     /** Load my published rates from prefs (drives the responder match-guard for background auto-fills). */
     private Order loadOrder() {
-        Order o = new Order();
-        JSONObject cfg = null;
-        try { String raw = prefs.getString("order_config", ""); if (!raw.isEmpty()) cfg = new JSONObject(raw); }
-        catch (Exception ignore) {}
-        Order.Pair p = new Order.Pair(false, 1, 1, 1);
-        if (cfg != null) {
-            JSONObject c = cfg.optJSONObject("USDT");
-            if (c != null) { p.enable = c.optBoolean("en", false); p.buy = c.optDouble("buy", 1);
-                p.sell = c.optDouble("sell", 1); p.min = c.optDouble("min", 1); }
-        }
-        o.pairs.put("USDT", p);
-        return o;
+        return Order.fromConfigJson(prefs.getString("order_config", ""));   // shared loader — keeps the ladder intact on background republish
     }
 
     private void createChannels() {
