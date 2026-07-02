@@ -108,8 +108,13 @@ public class MainActivity extends AppCompatActivity {
     private final LinkedHashMap<String, Order> orderBook = new LinkedHashMap<>();
     private String orderStatus = null;
     private CommsScanner takeScanner;   // maker side: receives buyers' hashlock handshakes
-    private boolean showHistory = false;
-    private int historyTab = 0;         // 0 = my swaps, 1 = market
+    private int historyTab = 0;         // Activity sub-tab: 0 = my swaps, 1 = market
+    // ---- tabs ----
+    private static final int TAB_SWAP = 0, TAB_WALLET = 1, TAB_ACTIVITY = 2, TAB_MARKET = 3;
+    private static final String[] TAB_LABELS = {"Swap", "Wallet", "Activity", "Market"};
+    private int currentTab = TAB_SWAP;
+    private final TextView[] tabPills = new TextView[4];
+    private boolean swapSell = true;    // Swap tab direction: true = Sell MINIMA, false = Buy MINIMA
 
     // wallet state shown on the home screen
     private String minimaBal = "…";        // sendable (tradeable)
@@ -168,12 +173,14 @@ public class MainActivity extends AppCompatActivity {
         scroller.setFillViewport(true);
         root.addView(pairingBanner, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         root.addView(scroller, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        root.addView(buildTabBar(), new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         setContentView(root);
         applyInsets();
         ensureChannel();
         requestNotifPermission();
 
         render();
+        if (!prefs.getBoolean("seen_welcome", false)) ui.post(this::showWelcome);
         node = new NodeApi(this, this::onPaired);
         minima = new MinimaHtlc(node);
         engine = new SwapEngine(node, minima, db, wallet, ui, notifier);
@@ -182,7 +189,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override public void onBackPressed() {
-        if (showHistory) { closeHistory(); return; }   // the history page is the app's only "back" target
+        if (currentTab != TAB_SWAP) { setTab(TAB_SWAP); return; }   // any non-default tab → back to Swap
         super.onBackPressed();
     }
 
@@ -341,11 +348,7 @@ public class MainActivity extends AppCompatActivity {
                     minimaCoins = t.optString("coins", "—");
                 }
                 lastMinimaUpdate = System.currentTimeMillis();
-                render();
-                if (pulseMinimaPending && !modalOpen && minimaBalView != null) {
-                    pulseMinimaPending = false;
-                    Design.pulse(minimaBalView, 0xFFFFFFFF);   // accent number → flash white
-                }
+                render();   // fires any pending balance pulse via firePendingPulses() when the Wallet tab is showing
             }
             @Override public void onError(String m) { minimaBal = "— (node didn't answer)"; lastMinimaUpdate = System.currentTimeMillis(); render(); }
         });
@@ -478,12 +481,7 @@ public class MainActivity extends AppCompatActivity {
                 String usdt = toks.get("USDT");
                 if (usdt != null) prefs.edit().putString("usdt_avail", usdt).apply();   // for the background republish
                 if (ferr != null) ethErr = ferr;
-                render();
-                if (pulseEthPending && !modalOpen && ethBalView != null) {
-                    pulseEthPending = false;
-                    Design.pulse(ethBalView, Design.ACCENT);                       // white number → flash orange
-                    for (TextView t : tokenBalViews) Design.pulse(t, Design.ACCENT);
-                }
+                render();   // fires any pending balance pulse via firePendingPulses() when the Wallet tab is showing
             });
         });
     }
@@ -851,16 +849,73 @@ public class MainActivity extends AppCompatActivity {
 
     // ---- UI ----
 
+    // ---- tab host ----
+
+    private LinearLayout buildTabBar() {
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setBackgroundColor(Design.SURFACE);
+        bar.setPadding(dp(8), dp(8), dp(8), dp(8));
+        for (int i = 0; i < TAB_LABELS.length; i++) {
+            final int idx = i;
+            boolean sel = idx == currentTab;
+            TextView p = new TextView(this);
+            p.setText(TAB_LABELS[i]);
+            p.setGravity(Gravity.CENTER);
+            p.setTextSize(13f);
+            p.setPadding(dp(10), dp(10), dp(10), dp(10));
+            p.setBackground(Design.roundBg(this, sel ? Design.ACCENT : Design.SURFACE2, 14));
+            p.setTextColor(sel ? Design.ON_ACCENT : Design.DIM);
+            p.setOnClickListener(v -> setTab(idx));
+            tabPills[i] = p;
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+            lp.leftMargin = i == 0 ? 0 : dp(6);
+            bar.addView(p, lp);
+        }
+        return bar;
+    }
+
+    private void updateTabBarSelection() {
+        for (int i = 0; i < tabPills.length; i++) {
+            TextView p = tabPills[i];
+            if (p == null) continue;
+            boolean sel = i == currentTab;
+            p.setBackground(Design.roundBg(this, sel ? Design.ACCENT : Design.SURFACE2, 14));
+            p.setTextColor(sel ? Design.ON_ACCENT : Design.DIM);
+        }
+    }
+
+    private void setTab(int t) {
+        if (t == currentTab) return;
+        currentTab = t;
+        updateTabBarSelection();
+        render();
+    }
+
+    // ---- render dispatcher ----
+
     private void render() {
         // Never rebuild the view tree while a dialog with text inputs is open — a background render
         // (watcher / balance callback) restarts the IME and resets the cursor mid-typing. We re-render
-        // once when the dialog dismisses.
+        // once when the dialog dismisses. (All text entry lives in guarded dialogs, never inline in a tab.)
         if (modalOpen) return;
-        if (showHistory) { renderHistoryPage(); return; }
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         col.setPadding(dp(16), dp(14), dp(16), dp(24));
+        buildHeader(col);
+        switch (currentTab) {
+            case TAB_WALLET:   renderWalletTab(col); break;
+            case TAB_ACTIVITY: renderActivityTab(col); break;
+            case TAB_MARKET:   renderMarketTab(col); break;
+            case TAB_SWAP:
+            default:           renderSwapTab(col); break;
+        }
+        scroller.removeAllViews();
+        scroller.addView(col);
+        if (currentTab == TAB_WALLET) firePendingPulses();
+    }
 
+    private void buildHeader(LinearLayout col) {
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
@@ -876,15 +931,158 @@ public class MainActivity extends AppCompatActivity {
         sub.setText("v" + BuildConfig.VERSION_NAME + (chainBlock > 0 ? "  ·  block " + chainBlock : "") + "  ·  MINIMA ↔ USDT");
         sub.setTextColor(Design.DIM2); sub.setTextSize(12.5f); sub.setPadding(0, dp(2), 0, dp(10));
         col.addView(sub);
+    }
 
-        LinearLayout histRow = new LinearLayout(this);
-        histRow.setOrientation(LinearLayout.HORIZONTAL); histRow.setPadding(0, 0, 0, dp(6));
-        TextView histPill = Design.pill(this, "📊  History / Market", Design.SURFACE2, Design.TEXT);
-        histPill.setOnClickListener(v -> openHistory(0));
-        histRow.addView(histPill);
-        col.addView(histRow);
+    // ---- Swap tab (guided, beginner-first) ----
 
-        LinearLayout minimaCard = walletCard("Minima · tradeable (sendable)", minimaBal + " MINIMA", minimaBreakdown() + "  ·  long-press for coins", Design.ACCENT);
+    private TextView segTab(String label, boolean active, Runnable onTap) {
+        TextView t = new TextView(this);
+        t.setText(label); t.setGravity(Gravity.CENTER); t.setTextSize(14f);
+        t.setPadding(dp(12), dp(11), dp(12), dp(11));
+        t.setBackground(Design.roundBg(this, active ? Design.ACCENT : Design.SURFACE2, 12));
+        t.setTextColor(active ? Design.ON_ACCENT : Design.DIM);
+        if (active) t.setTypeface(t.getTypeface(), android.graphics.Typeface.BOLD);
+        t.setOnClickListener(v -> onTap.run());
+        return t;
+    }
+
+    private void renderSwapTab(LinearLayout col) {
+        TextView h = new TextView(this);
+        h.setText("Swap MINIMA ⇄ USDT");
+        h.setTextColor(Design.TEXT); h.setTextSize(18f); h.setTypeface(h.getTypeface(), android.graphics.Typeface.BOLD);
+        h.setPadding(0, dp(4), 0, dp(2));
+        col.addView(h);
+        TextView sh = new TextView(this);
+        sh.setText("Trade at the best price on offer — pick a direction, then Review.");
+        sh.setTextColor(Design.DIM); sh.setTextSize(12.5f); sh.setPadding(0, 0, 0, dp(12));
+        col.addView(sh);
+
+        // direction toggle (segmented)
+        LinearLayout seg = new LinearLayout(this);
+        seg.setOrientation(LinearLayout.HORIZONTAL);
+        TextView sellTab = segTab("Sell MINIMA", swapSell, () -> { if (!swapSell) { swapSell = true; render(); } });
+        TextView buyTab = segTab("Buy MINIMA", !swapSell, () -> { if (swapSell) { swapSell = false; render(); } });
+        LinearLayout.LayoutParams sp1 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); sp1.rightMargin = dp(5);
+        LinearLayout.LayoutParams sp2 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); sp2.leftMargin = dp(5);
+        seg.addView(sellTab, sp1); seg.addView(buyTab, sp2);
+        col.addView(seg);
+
+        if (!paired) {
+            col.addView(dimNote("Connect your node in Minima Core → Apps to start swapping."));
+            return;
+        }
+
+        Best best = bestMakers("USDT");
+        final Order maker = swapSell ? best.bidMaker : best.askMaker;
+        double price = swapSell ? best.bestBid : best.bestAsk;
+        boolean have = maker != null && price > 0;
+
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(Design.roundBg(this, Design.SURFACE, 16));
+        card.setPadding(dp(16), dp(14), dp(16), dp(14));
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        clp.topMargin = dp(14); card.setLayoutParams(clp);
+
+        if (have) {
+            TextView lbl = new TextView(this);
+            lbl.setText(swapSell ? "Sell your MINIMA for USDT" : "Buy MINIMA with USDT");
+            lbl.setTextColor(Design.DIM); lbl.setTextSize(12.5f);
+            card.addView(lbl);
+
+            TextView pr = new TextView(this);
+            pr.setText(fmtPrice(price) + " USDT per MINIMA");
+            pr.setTextColor(Design.ACCENT); pr.setTextSize(20f); pr.setTypeface(pr.getTypeface(), android.graphics.Typeface.BOLD);
+            pr.setPadding(0, dp(3), 0, 0);
+            card.addView(pr);
+
+            double size = swapSell ? (maker.usdtAvail / price) : maker.minimaAvail;
+            TextView av = new TextView(this);
+            av.setText("Best price available now · up to ~" + abbrev(size) + " MINIMA"
+                    + (swapSell ? "" : " · you'll also need a little ETH for gas"));
+            av.setTextColor(Design.DIM); av.setTextSize(12.5f); av.setPadding(0, dp(6), 0, 0);
+            card.addView(av);
+
+            TextView cta = button(swapSell ? "Review — Sell MINIMA" : "Review — Buy MINIMA");
+            LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            blp.topMargin = dp(14); cta.setLayoutParams(blp);
+            cta.setOnClickListener(v -> takeOrderDialog(maker, "USDT", swapSell));
+            card.addView(cta);
+
+            TextView hint = Design.pill(this, "ⓘ  What is “best price”?", Design.SURFACE2, Design.DIM);
+            LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            hlp.topMargin = dp(12); hint.setLayoutParams(hlp);
+            hint.setOnClickListener(v -> showInfo("Best price",
+                    "Other people publish offers to buy or sell MINIMA at their own price. minimaSwap "
+                    + "automatically picks the best one for your direction, so you don't have to read the "
+                    + "order book. Want to choose a specific offer or set your own price? Open the Market tab."));
+            card.addView(hint);
+        } else {
+            TextView none = new TextView(this);
+            none.setText("No one is quoting a " + (swapSell ? "buy" : "sell") + " price right now.");
+            none.setTextColor(Design.TEXT); none.setTextSize(14f);
+            card.addView(none);
+            TextView sub2 = new TextView(this);
+            sub2.setText("Check back soon, or open Market to place your own order and wait for a match.");
+            sub2.setTextColor(Design.DIM); sub2.setTextSize(12.5f); sub2.setPadding(0, dp(6), 0, dp(2));
+            card.addView(sub2);
+            TextView go = Design.pill(this, "Open Market", Design.SURFACE2, Design.TEXT);
+            LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            glp.topMargin = dp(12); go.setLayoutParams(glp);
+            go.setOnClickListener(v -> setTab(TAB_MARKET));
+            card.addView(go);
+        }
+        col.addView(card);
+
+        col.addView(swapReadiness());
+
+        if (orderStatus != null) {
+            TextView stt = new TextView(this);
+            stt.setText(orderStatus);
+            stt.setTextColor(orderStatus.startsWith("✓") ? Design.IN : Design.DIM);
+            stt.setTextSize(12.5f); stt.setPadding(dp(2), dp(12), dp(2), 0);
+            col.addView(stt);
+        }
+    }
+
+    /** A friendly "are you ready to trade" strip; taps jump to the Wallet tab to fund. */
+    private TextView swapReadiness() {
+        String node = paired ? "✓ Node connected" : "⚠ Node not connected";
+        String parts;
+        if (swapSell) {
+            parts = node + "     " + (parseD(minimaBal, 0) > 0 ? "✓ MINIMA ready" : "⚠ No MINIMA to sell");
+        } else {
+            String usdt = tokenBals.get("USDT");
+            parts = node + "     " + ((usdt != null && parseD(usdt, 0) > 0) ? "✓ USDT ready" : "⚠ Add USDT")
+                    + "     " + (parseD(ethBal.replace(" ETH", ""), 0) > 0 ? "✓ ETH for gas" : "⚠ Add ETH for gas");
+        }
+        TextView t = new TextView(this);
+        t.setText(parts + "   ›");
+        t.setTextColor(Design.DIM2); t.setTextSize(11.5f); t.setPadding(dp(2), dp(14), dp(2), 0);
+        t.setOnClickListener(v -> setTab(TAB_WALLET));
+        return t;
+    }
+
+    private static final class Best { Order bidMaker, askMaker; double bestBid = 0, bestAsk = Double.MAX_VALUE; }
+
+    /** Best non-own bid/ask across the live order book (for the guided Swap tab; never auto-selects my own order). */
+    private Best bestMakers(String sym) {
+        Best r = new Best();
+        for (Order o : orderBook.values()) {
+            Order.Pair p = o.pairs.get(sym);
+            if (p == null || !p.enable) continue;
+            if (isMine(o)) continue;
+            if (p.sell > 0 && p.sell > r.bestBid) { r.bestBid = p.sell; r.bidMaker = o; }
+            if (p.buy > 0 && p.buy < r.bestAsk) { r.bestAsk = p.buy; r.askMaker = o; }
+        }
+        if (r.askMaker == null) r.bestAsk = 0;   // normalize "none" to 0 for callers
+        return r;
+    }
+
+    // ---- Wallet tab ----
+
+    private void renderWalletTab(LinearLayout col) {
+        LinearLayout minimaCard = walletCard("Minima · available to swap", minimaBal + " MINIMA", minimaBreakdown() + "  ·  long-press for coins", Design.ACCENT);
         minimaCard.setOnLongClickListener(v -> { minimaCoinDump(); return true; });
         col.addView(minimaCard);
         minimaBalView = (TextView) minimaCard.findViewWithTag(TAG_BAL);   // fresh ref each render (tree is rebuilt)
@@ -927,14 +1125,32 @@ public class MainActivity extends AppCompatActivity {
             col.addView(err);
         }
 
-        // ---- Active swaps ----
-        renderActiveSwaps(col);
+        if (!paired) col.addView(dimNote("Connect your node in Minima Core → Apps to see your balances."));
+    }
 
-        // ---- Order book ----
+    /** Fire any balance pulse that was armed while the Wallet tab wasn't showing (its balance views didn't exist). */
+    private void firePendingPulses() {
+        if (modalOpen) return;
+        if (pulseMinimaPending && minimaBalView != null) { pulseMinimaPending = false; Design.pulse(minimaBalView, 0xFFFFFFFF); }
+        if (pulseEthPending && ethBalView != null) {
+            pulseEthPending = false;
+            Design.pulse(ethBalView, Design.ACCENT);
+            for (TextView t : tokenBalViews) Design.pulse(t, Design.ACCENT);
+        }
+    }
+
+    // ---- Market tab (advanced: full order book + publish your own) ----
+
+    private void renderMarketTab(LinearLayout col) {
+        TextView hint = new TextView(this);
+        hint.setText("The live order book. Tap a price to trade, or publish your own offer.");
+        hint.setTextColor(Design.DIM); hint.setTextSize(12.5f); hint.setPadding(0, dp(2), 0, dp(2));
+        col.addView(hint);
+
         LinearLayout obHeader = new LinearLayout(this);
         obHeader.setOrientation(LinearLayout.HORIZONTAL);
         obHeader.setGravity(Gravity.CENTER_VERTICAL);
-        obHeader.setPadding(0, dp(22), 0, dp(2));
+        obHeader.setPadding(0, dp(14), 0, dp(2));
         TextView obTitle = new TextView(this);
         obTitle.setText("Order book  ·  " + orderBook.size() + " live");
         obTitle.setTextColor(Design.TEXT); obTitle.setTextSize(16f); obTitle.setTypeface(obTitle.getTypeface(), android.graphics.Typeface.BOLD);
@@ -975,9 +1191,24 @@ public class MainActivity extends AppCompatActivity {
             st.setTextSize(12.5f); st.setPadding(dp(2), dp(10), dp(2), 0);
             col.addView(st);
         }
+    }
 
-        scroller.removeAllViews();
-        scroller.addView(col);
+    private void showInfo(String title, String body) {
+        new AlertDialog.Builder(this).setTitle(title).setMessage(body).setPositiveButton("Got it", null).show();
+    }
+
+    private void showWelcome() {
+        prefs.edit().putBoolean("seen_welcome", true).apply();
+        new AlertDialog.Builder(this)
+                .setTitle("Welcome to minimaSwap")
+                .setMessage("Swap MINIMA ⇄ USDT trustlessly across chains — no middleman ever holds your funds.\n\n"
+                        + "To trade you'll need:\n"
+                        + "•  Minima Core running, with minimaSwap enabled in Apps\n"
+                        + "•  Some MINIMA to sell — or USDT plus a little ETH (for gas) to buy MINIMA\n\n"
+                        + "Your keys are derived from your Minima node seed, so it's the same wallet on any device.\n\n"
+                        + "Tabs:  Swap (quick trade)  ·  Wallet (your money)  ·  Activity (your swaps)  ·  Market (full order book).")
+                .setPositiveButton("Get started", null)
+                .show();
     }
 
     private void renderActiveSwaps(LinearLayout col) {
@@ -1007,42 +1238,32 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // ============================================================ History / Market page
+    // ============================================================ Activity tab (live swaps + history)
 
-    private void openHistory(int tab) { historyTab = tab; showHistory = true; render(); }
-    private void closeHistory() { showHistory = false; render(); }
+    /** Jump to the Activity tab and select a sub-tab (0 = my swaps, 1 = market). Always re-renders so the
+     *  sub-tab pills switch even when we're already on Activity. */
+    private void openHistory(int tab) {
+        historyTab = tab;
+        currentTab = TAB_ACTIVITY;
+        updateTabBarSelection();
+        render();
+    }
 
-    private void renderHistoryPage() {
-        LinearLayout col = new LinearLayout(this);
-        col.setOrientation(LinearLayout.VERTICAL);
-        col.setPadding(dp(16), dp(14), dp(16), dp(24));
-
-        LinearLayout top = new LinearLayout(this);
-        top.setOrientation(LinearLayout.HORIZONTAL); top.setGravity(Gravity.CENTER_VERTICAL);
-        TextView back = Design.pill(this, "←  Back", Design.SURFACE2, Design.TEXT);
-        back.setOnClickListener(v -> closeHistory());
-        top.addView(back);
-        TextView title = new TextView(this);
-        title.setText("   History");
-        title.setTextColor(Design.TEXT); title.setTextSize(20f); title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
-        top.addView(title);
-        col.addView(top);
+    private void renderActivityTab(LinearLayout col) {
+        renderActiveSwaps(col);   // live/resumable swap cards + "N finished hidden" link (empty → adds nothing)
 
         LinearLayout tabs = new LinearLayout(this);
-        tabs.setOrientation(LinearLayout.HORIZONTAL); tabs.setPadding(0, dp(12), 0, dp(8));
+        tabs.setOrientation(LinearLayout.HORIZONTAL); tabs.setPadding(0, dp(18), 0, dp(8));
         LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         gap.rightMargin = dp(8);
         TextView t0 = Design.pill(this, "My swaps", historyTab == 0 ? Design.ACCENT : Design.SURFACE2, historyTab == 0 ? Design.ON_ACCENT : Design.DIM);
         t0.setOnClickListener(v -> openHistory(0));
-        TextView t1 = Design.pill(this, "Market", historyTab == 1 ? Design.ACCENT : Design.SURFACE2, historyTab == 1 ? Design.ON_ACCENT : Design.DIM);
+        TextView t1 = Design.pill(this, "Market history", historyTab == 1 ? Design.ACCENT : Design.SURFACE2, historyTab == 1 ? Design.ON_ACCENT : Design.DIM);
         t1.setOnClickListener(v -> openHistory(1));
         tabs.addView(t0, gap); tabs.addView(t1);
         col.addView(tabs);
 
         if (historyTab == 0) mySwapsList(col); else marketView(col);
-
-        scroller.removeAllViews();
-        scroller.addView(col);
     }
 
     private void mySwapsList(LinearLayout col) {
