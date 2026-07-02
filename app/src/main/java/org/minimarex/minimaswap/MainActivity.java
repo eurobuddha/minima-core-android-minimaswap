@@ -1255,6 +1255,7 @@ public class MainActivity extends AppCompatActivity {
 
         LinearLayout btns = new LinearLayout(this);
         btns.setOrientation(LinearLayout.HORIZONTAL);
+        btns.setClipChildren(false); btns.setClipToPadding(false);   // don't clip the CTA elevation shadow
         TextView editBtn = button("Edit my order");
         editBtn.setBackground(Design.roundBg(this, Design.SURFACE2(), 14));
         editBtn.setTextColor(Design.TEXT());
