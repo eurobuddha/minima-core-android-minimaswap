@@ -117,6 +117,7 @@ public class MainActivity extends AppCompatActivity {
     private boolean swapSell = true;    // Swap tab direction: true = Sell MINIMA, false = Buy MINIMA
     private String swapAmount = "";     // Swap tab "you send" amount — persists across tree rebuilds
     private boolean swapInputFocused = false;   // suppress background render() while typing the swap amount
+    private boolean swapSyncing = false;        // guard so the send/receive fields don't loop while syncing
     private static final int USDT_TEAL = 0xFF26A69A;
     private static final int STG_PENDING = 0, STG_ACTIVE = 1, STG_DONE = 2, STG_WARN = 3;
     private static final int STAGE_WARN_COLOR = 0xFFE6A23C;
@@ -1134,25 +1135,37 @@ public class MainActivity extends AppCompatActivity {
         flipRow.addView(l1, llL); flipRow.addView(flip, llF); flipRow.addView(l2, llR);
         card.addView(flipRow);
 
-        // YOU RECEIVE (computed, live)
+        // YOU RECEIVE — editable too, so you can enter either side (MINIMA or USDT)
         card.addView(fieldLabel("YOU RECEIVE (estimate)"));
         LinearLayout recvRow = new LinearLayout(this);
         recvRow.setOrientation(LinearLayout.HORIZONTAL); recvRow.setGravity(Gravity.CENTER_VERTICAL);
         recvRow.setPadding(0, dp(6), 0, dp(2));
         recvRow.addView(coinChip(!sellMinima));
-        final TextView recv = new TextView(this);
+        final EditText recv = new EditText(this);
+        decimalInput(recv);
+        recv.setHint("0.00"); recv.setHintTextColor(Design.DIM2());
         recv.setTextColor(Design.ACCENT()); recv.setTextSize(26f); recv.setTypeface(Design.monoBold());
         recv.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        recv.setBackground(null); recv.setPadding(dp(8), 0, 0, 0);
         String r0 = sellMinima ? computeUsdt(swapAmount, price) : computeMinima(swapAmount, price);
-        recv.setText(r0 == null ? "0.00" : r0);
+        recv.setText(r0 == null ? "" : r0);
+        recv.setOnFocusChangeListener((v, has) -> { swapInputFocused = has; if (!has) ui.postDelayed(this::render, 250); });
         recvRow.addView(recv, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         card.addView(recvRow);
 
-        // live conversion as they type (updates in place — no tree rebuild)
+        // bidirectional live conversion — type EITHER field, the other computes. swapAmount always = the SEND side.
         amt.addTextChangedListener(new SimpleWatcher(() -> {
+            if (swapSyncing) return;
             swapAmount = amt.getText().toString();
             String rr = sellMinima ? computeUsdt(swapAmount, price) : computeMinima(swapAmount, price);
-            recv.setText(rr == null ? "0.00" : rr);
+            swapSyncing = true; recv.setText(rr == null ? "" : rr); swapSyncing = false;
+        }));
+        recv.addTextChangedListener(new SimpleWatcher(() -> {
+            if (swapSyncing) return;
+            String rstr = recv.getText().toString();
+            String ss = sellMinima ? computeMinima(rstr, price) : computeUsdt(rstr, price);   // inverse: receive → send
+            swapSyncing = true; amt.setText(ss == null ? "" : ss); swapSyncing = false;
+            swapAmount = amt.getText().toString();
         }));
 
         // best price line
@@ -1410,10 +1423,11 @@ public class MainActivity extends AppCompatActivity {
         ethBalView = (TextView) ethCard.findViewWithTag(TAG_BAL);
         tokenBalViews.clear();
         for (Map.Entry<String, String> e : tokenBals.entrySet()) {
-            LinearLayout row = kv(e.getKey(), e.getValue());
-            TextView tv = (TextView) row.findViewWithTag(TAG_BAL);
+            // token balances get the same big card treatment as Minima/ETH (not a small row)
+            LinearLayout tcard = walletCard(e.getKey() + " · Ethereum", e.getValue() + " " + e.getKey(), null, Design.TEXT());
+            TextView tv = (TextView) tcard.findViewWithTag(TAG_BAL);
             if (tv != null) tokenBalViews.add(tv);
-            col.addView(row);
+            col.addView(tcard);
         }
 
         if (ethAddr != null) {
