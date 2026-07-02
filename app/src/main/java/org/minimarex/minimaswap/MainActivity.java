@@ -721,8 +721,8 @@ public class MainActivity extends AppCompatActivity {
             double mid = parseD(midE.getText().toString(), 0), step = parseD(stepE.getText().toString(), 0), size = parseD(sizeE.getText().toString(), 0);
             if (mid <= 0 || step <= 0 || size <= 0) { toast("Enter mid price, step % and size to generate"); return; }
             for (int i = 0; i < Order.MAX_LEVELS; i++) {
-                askRows[i][0].setText(trim(mid * (1 + (i + 1) * step / 100.0))); askRows[i][1].setText(trim(size));
-                bidRows[i][0].setText(trim(mid * (1 - (i + 1) * step / 100.0))); bidRows[i][1].setText(trim(size));
+                askRows[i][0].setText(trimSig(mid * (1 + (i + 1) * step / 100.0))); askRows[i][1].setText(trimSig(size));
+                bidRows[i][0].setText(trimSig(mid * (1 - (i + 1) * step / 100.0))); bidRows[i][1].setText(trimSig(size));
             }
             upd.run();
         });
@@ -829,10 +829,10 @@ public class MainActivity extends AppCompatActivity {
         TextView t = new TextView(this); t.setText(label); t.setTextColor(labelColor); t.setTextSize(12.5f); t.setTypeface(Design.mono());
         EditText pe = new EditText(this); decimalInput(pe);
         pe.setHint("price"); pe.setHintTextColor(Design.DIM2());
-        pe.setText(price > 0 ? trim(price) : ""); pe.setTextColor(Design.TEXT()); pe.setTextSize(14f); pe.setGravity(Gravity.END); pe.setTypeface(Design.mono());
+        pe.setText(price > 0 ? trimSig(price) : ""); pe.setTextColor(Design.TEXT()); pe.setTextSize(14f); pe.setGravity(Gravity.END); pe.setTypeface(Design.mono());
         EditText ae = new EditText(this); decimalInput(ae);
         ae.setHint("MINIMA"); ae.setHintTextColor(Design.DIM2());
-        ae.setText(amount > 0 ? trim(amount) : ""); ae.setTextColor(Design.TEXT()); ae.setTextSize(14f); ae.setGravity(Gravity.END); ae.setTypeface(Design.mono());
+        ae.setText(amount > 0 ? trimSig(amount) : ""); ae.setTextColor(Design.TEXT()); ae.setTextSize(14f); ae.setGravity(Gravity.END); ae.setTypeface(Design.mono());
         LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(dp(26), LinearLayout.LayoutParams.WRAP_CONTENT);
         LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); plp.leftMargin = dp(6);
         LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); alp.leftMargin = dp(8);
@@ -2245,6 +2245,11 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private static String trim(double v) { return Util.tidyAmount(BigDecimal.valueOf(v).stripTrailingZeros().toPlainString()); }
+    /** Like trim() but first rounds away binary float noise (0.00597999999… → 0.00598) — for computed ladder fields. */
+    private static String trimSig(double v) {
+        if (Double.isNaN(v) || Double.isInfinite(v)) return "";
+        return Util.tidyAmount(new BigDecimal(v, new java.math.MathContext(10)).stripTrailingZeros().toPlainString());
+    }
     private static double parseD(String s, double def) { try { return Double.parseDouble(s.trim()); } catch (Exception e) { return def; } }
 
     private int dp(int v) { return Design.dp(this, v); }
