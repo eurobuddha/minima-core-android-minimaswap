@@ -1047,8 +1047,8 @@ public class MainActivity extends AppCompatActivity {
         // direction toggle (segmented)
         LinearLayout seg = new LinearLayout(this);
         seg.setOrientation(LinearLayout.HORIZONTAL);
-        TextView sellTab = segTab("Sell MINIMA", swapSell, () -> { if (!swapSell) { swapSell = true; render(); } });
-        TextView buyTab = segTab("Buy MINIMA", !swapSell, () -> { if (swapSell) { swapSell = false; render(); } });
+        TextView sellTab = segTab("Sell MINIMA", swapSell, () -> { swapInputFocused = false; if (!swapSell) { swapSell = true; } render(); });
+        TextView buyTab = segTab("Buy MINIMA", !swapSell, () -> { swapInputFocused = false; if (swapSell) { swapSell = false; } render(); });
         LinearLayout.LayoutParams sp1 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); sp1.rightMargin = dp(5);
         LinearLayout.LayoutParams sp2 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); sp2.leftMargin = dp(5);
         seg.addView(sellTab, sp1); seg.addView(buyTab, sp2);
@@ -1126,7 +1126,7 @@ public class MainActivity extends AppCompatActivity {
         TextView flip = new TextView(this);
         flip.setText("⇅"); flip.setGravity(Gravity.CENTER); flip.setTextColor(Design.ACCENT()); flip.setTextSize(16f); flip.setTypeface(Design.sansBold());
         flip.setBackground(Design.stroked(this, Design.SURFACE2(), 19));
-        flip.setOnClickListener(v -> { swapSell = !swapSell; render(); }); Design.pressable(flip);
+        flip.setOnClickListener(v -> { swapInputFocused = false; swapSell = !swapSell; render(); }); Design.pressable(flip);
         int fs = dp(38);
         LinearLayout.LayoutParams llL = new LinearLayout.LayoutParams(0, dp(1), 1f);
         LinearLayout.LayoutParams llF = new LinearLayout.LayoutParams(fs, fs); llF.leftMargin = dp(12); llF.rightMargin = dp(12);
@@ -1225,6 +1225,7 @@ public class MainActivity extends AppCompatActivity {
 
     /** Confirm the inline swap, then start it via the existing engine path. */
     private void reviewSwap(Order maker, boolean sellMinima, String sendStr, double price) {
+        swapInputFocused = false;   // leaving the amount field — let the panel re-render live from here on
         if (sendStr.isEmpty()) { toast("Enter an amount to " + (sellMinima ? "sell" : "spend")); return; }
         final String minima, usdt;
         if (sellMinima) { minima = sendStr; usdt = computeUsdt(sendStr, price); }
@@ -1270,6 +1271,12 @@ public class MainActivity extends AppCompatActivity {
         // live swap legs (if a swap is in flight or just finished)
         SwapDb.Swap sw = latestRelevantSwap();
         if (sw != null) {
+            // which swap this panel is tracking (disambiguates concurrent swaps)
+            TextView which = new TextView(this);
+            which.setText(sw.sellAmount + " " + sw.sellToken + "  →  " + sw.buyAmount + " " + sw.buyToken
+                    + "   ·   " + (sw.role == null ? "" : sw.role.toLowerCase()));
+            which.setTextColor(Design.TEXT()); which.setTextSize(13f); which.setTypeface(Design.mono()); which.setPadding(dp(2), dp(2), 0, dp(6));
+            box.addView(which);
             if (SwapDb.ST_REFUNDED.equals(sw.status)) {
                 box.addView(stagePill("Timed out — " + sw.sellAmount + " " + sw.sellToken + " refunded", STG_WARN));
             } else {
@@ -1289,6 +1296,15 @@ public class MainActivity extends AppCompatActivity {
                 clp.topMargin = dp(8); chk.setLayoutParams(clp);
                 chk.setOnClickListener(v -> checkNow(sw.hash)); Design.pressable(chk);
                 box.addView(chk);
+            }
+            int more = activeSwapCount() - (isTerminal(sw) ? 0 : 1);
+            if (more > 0) {
+                TextView moreTv = new TextView(this);
+                moreTv.setText("+ " + more + " more swap" + (more == 1 ? "" : "s") + " in flight — see Activity");
+                moreTv.setTextColor(Design.DIM2()); moreTv.setTextSize(11.5f); moreTv.setTypeface(Design.sans()); moreTv.setPadding(dp(2), dp(8), 0, 0);
+                moreTv.setOnClickListener(v -> openHistory(0));
+                Design.pressable(moreTv);
+                box.addView(moreTv);
             }
         } else {
             box.addView(stagePill("Enter an amount and tap Review to begin", STG_PENDING));
@@ -1350,9 +1366,17 @@ public class MainActivity extends AppCompatActivity {
         long now = System.currentTimeMillis();
         for (SwapDb.Swap s : db.allSwaps()) {
             if (isTerminal(s) && now - s.updated > TERMINAL_GRACE_MS) continue;
-            if (pick == null || s.updated > pick.updated) pick = s;
+            if (pick == null || s.created > pick.created) pick = s;   // the swap the user most recently started
         }
         return pick;
+    }
+
+    /** Count of swaps still in flight (non-terminal) — used to hint at concurrent swaps. */
+    private int activeSwapCount() {
+        if (db == null) return 0;
+        int n = 0;
+        for (SwapDb.Swap s : db.allSwaps()) if (!isTerminal(s)) n++;
+        return n;
     }
 
     private static final class Best { Order bidMaker, askMaker; double bestBid = 0, bestAsk = Double.MAX_VALUE; }
