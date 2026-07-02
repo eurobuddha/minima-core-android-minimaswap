@@ -24,10 +24,10 @@ public class MarketChartView extends View {
 
     public MarketChartView(Context c) {
         super(c);
-        line.setColor(Design.ACCENT); line.setStrokeWidth(dp(2)); line.setStyle(Paint.Style.STROKE);
-        dot.setColor(Design.ACCENT);
-        axis.setColor(Design.DIM2); axis.setStrokeWidth(1);
-        label.setColor(Design.DIM); label.setTextSize(sp(10));
+        line.setColor(Design.ACCENT()); line.setStrokeWidth(dp(2)); line.setStyle(Paint.Style.STROKE);
+        dot.setColor(Design.ACCENT());
+        axis.setColor(Design.DIM2()); axis.setStrokeWidth(1);
+        label.setColor(Design.DIM()); label.setTextSize(sp(10));
     }
 
     public void setData(List<SwapDb.MarketTrade> d) {

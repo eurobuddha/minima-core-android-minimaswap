@@ -3,4 +3,21 @@
     </style>
 
     <style name="Theme.Utxo" parent="Base.Theme.Utxo" />
+
+    <!-- Dialog chrome that follows the in-app Onyx/Daylight toggle (picked via Design.dialogTheme()). -->
+    <style name="SwapDialogDark" parent="android:Theme.Material.Dialog.Alert">
+        <item name="android:colorBackground">#12151C</item>
+        <item name="android:textColorPrimary">#EEF0F4</item>
+        <item name="android:textColorSecondary">#8B909C</item>
+        <item name="android:colorAccent">#F7931A</item>
+        <item name="android:windowBackground">@drawable/dialog_bg_dark</item>
+    </style>
+
+    <style name="SwapDialogLight" parent="android:Theme.Material.Light.Dialog.Alert">
+        <item name="android:colorBackground">#FFFFFF</item>
+        <item name="android:textColorPrimary">#181B22</item>
+        <item name="android:textColorSecondary">#8B909C</item>
+        <item name="android:colorAccent">#F7931A</item>
+        <item name="android:windowBackground">@drawable/dialog_bg_light</item>
+    </style>
 </resources>

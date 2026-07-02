@@ -139,7 +139,11 @@ public class MainActivity extends AppCompatActivity {
 
     private LinearLayout root;
     private ScrollView scroller;
-    private View pairingBanner;
+    private LinearLayout tabBar;
+    private final ImageView[] tabIcons = new ImageView[4];
+    private final LinearLayout[] tabCells = new LinearLayout[4];
+    private TextView pairingBanner;
+    private boolean animateTab = false;   // fade in ONLY on a tab switch, never on a background refresh
     private boolean watching = false;
     private boolean modalOpen = false;   // suppress background render() while a dialog (with inputs) is open
     private boolean serviceStarted = false;
@@ -158,6 +162,7 @@ public class MainActivity extends AppCompatActivity {
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
+        Design.load(this);   // persisted theme + bundled Inter/JetBrains Mono, before any view is built
         ls = Sodium.get();
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         net = EthNet.MAINNET;
@@ -166,15 +171,16 @@ public class MainActivity extends AppCompatActivity {
 
         root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Design.BG);
         pairingBanner = buildPairingBanner();
         pairingBanner.setVisibility(View.GONE);
         scroller = new ScrollView(this);
         scroller.setFillViewport(true);
+        tabBar = buildTabBar();
         root.addView(pairingBanner, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         root.addView(scroller, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
-        root.addView(buildTabBar(), new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        root.addView(tabBar, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         setContentView(root);
+        applyChrome();
         applyInsets();
         ensureChannel();
         requestNotifPermission();
@@ -231,8 +237,31 @@ public class MainActivity extends AppCompatActivity {
             return insets;
         });
         ViewCompat.requestApplyInsets(root);
-        new WindowInsetsControllerCompat(getWindow(), root).setAppearanceLightStatusBars(false);
     }
+
+    /** Re-colour the persistent chrome (root, tab bar, pairing banner, status bar) for the current theme.
+     *  Called once in onCreate and again on a theme toggle — no Activity recreate, so live swaps survive. */
+    private void applyChrome() {
+        root.setBackgroundColor(Design.BG());
+        if (tabBar != null) tabBar.setBackgroundColor(Design.SURFACE());
+        if (pairingBanner != null) {
+            pairingBanner.setBackgroundColor(Design.ACCENT());
+            pairingBanner.setTextColor(Design.ON_ACCENT());
+        }
+        updateTabBarSelection();
+        new WindowInsetsControllerCompat(getWindow(), root).setAppearanceLightStatusBars(!Design.isDark());
+    }
+
+    /** Flip Onyx ↔ Daylight and restyle live (re-render, never recreate). */
+    private void toggleTheme() {
+        Design.toggle(this);
+        applyChrome();
+        toast(Design.isDark() ? "Dark theme" : "Light theme");
+        render();
+    }
+
+    /** AlertDialog builder whose chrome follows the in-app theme (dark/light). */
+    private AlertDialog.Builder dialog() { return new AlertDialog.Builder(this, Design.dialogTheme()); }
 
     // ---- pairing + identity ----
 
@@ -392,11 +421,11 @@ public class MainActivity extends AppCompatActivity {
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(20), dp(12), dp(20), dp(4));
         TextView t = new TextView(this);
-        t.setText(body); t.setTextColor(Design.TEXT); t.setTextSize(12.5f);
-        t.setTypeface(android.graphics.Typeface.MONOSPACE); t.setTextIsSelectable(true);
+        t.setText(body); t.setTextColor(Design.TEXT()); t.setTextSize(12.5f);
+        t.setTypeface(Design.mono()); t.setTextIsSelectable(true);
         box.addView(t);
         modalOpen = true;
-        new AlertDialog.Builder(this).setTitle(title).setView(wrapScroll(box))
+        dialog().setTitle(title).setView(wrapScroll(box))
                 .setPositiveButton("Close", null)
                 .setOnDismissListener(d -> { modalOpen = false; render(); }).show();
     }
@@ -643,21 +672,21 @@ public class MainActivity extends AppCompatActivity {
                 + "•  ASK — where YOU SELL MINIMA (the higher price)\n"
                 + "•  BID — where YOU BUY MINIMA (the lower price)\n"
                 + "The gap between them is your spread. Ask must be above Bid.");
-        hint.setTextColor(Design.DIM); hint.setTextSize(12f); hint.setPadding(0, 0, 0, dp(10));
+        hint.setTextColor(Design.DIM()); hint.setTextSize(12f); hint.setPadding(0, 0, 0, dp(10));
         box.addView(hint);
 
         final Map<String, SwitchCompat> en = new LinkedHashMap<>();
         final Map<String, EditText> ask = new LinkedHashMap<>(), bid = new LinkedHashMap<>(), min = new LinkedHashMap<>();
         for (String sym : PAIR_TOKENS) {
             Order.Pair p = o.pairs.get(sym);
-            TextView t = new TextView(this); t.setText("MINIMA / " + sym); t.setTextColor(Design.TEXT); t.setTextSize(15f);
-            t.setTypeface(t.getTypeface(), android.graphics.Typeface.BOLD); t.setPadding(0, dp(12), 0, dp(4));
+            TextView t = new TextView(this); t.setText("MINIMA / " + sym); t.setTextColor(Design.TEXT()); t.setTextSize(15f);
+            t.setTypeface(Design.sansBold()); t.setPadding(0, dp(12), 0, dp(4));
             box.addView(t);
-            SwitchCompat sw = new SwitchCompat(this); sw.setText("Enabled"); sw.setTextColor(Design.DIM); sw.setChecked(p.enable);
+            SwitchCompat sw = new SwitchCompat(this); sw.setText("Enabled"); sw.setTextColor(Design.DIM()); sw.setChecked(p.enable);
             box.addView(sw); en.put(sym, sw);
             // Internal fields stay buy=ask / sell=bid (wire-compatible); the LABELS are unambiguous maker-perspective.
-            final EditText a = numRow(box, "ASK — you SELL MINIMA (" + sym + ", higher)", p.buy, Design.RED);
-            final EditText b = numRow(box, "BID — you BUY MINIMA (" + sym + ", lower)", p.sell, Design.IN);
+            final EditText a = numRow(box, "ASK — you SELL MINIMA (" + sym + ", higher)", p.buy, Design.RED());
+            final EditText b = numRow(box, "BID — you BUY MINIMA (" + sym + ", lower)", p.sell, Design.IN());
             final EditText mn = numRow(box, "min MINIMA / trade", p.min);
             ask.put(sym, a); bid.put(sym, b); min.put(sym, mn);
 
@@ -670,7 +699,7 @@ public class MainActivity extends AppCompatActivity {
         }
 
         modalOpen = true;
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("My market / rates")
                 .setView(wrapScroll(box))
                 .setPositiveButton("Save", (d, w) -> {
@@ -697,13 +726,13 @@ public class MainActivity extends AppCompatActivity {
         double a = parseD(askE.getText().toString(), 0), b = parseD(bidE.getText().toString(), 0);
         if (a <= 0 || b <= 0) {
             pv.setText("Bid " + (b > 0 ? trim(b) : "—") + "   /   Ask " + (a > 0 ? trim(a) : "—"));
-            pv.setTextColor(Design.DIM2);
+            pv.setTextColor(Design.DIM2());
         } else if (a <= b) {
             pv.setText("⚠ Inverted — Ask " + trim(a) + " ≤ Bid " + trim(b) + ": you'd sell cheaper than you buy");
-            pv.setTextColor(Design.RED);
+            pv.setTextColor(Design.RED());
         } else {
             pv.setText("Spread:  Bid " + trim(b) + "   /   Ask " + trim(a) + "   (" + fmtPrice(a - b) + " " + sym + ")");
-            pv.setTextColor(Design.IN);
+            pv.setTextColor(Design.IN());
         }
     }
 
@@ -736,17 +765,17 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private EditText numRow(LinearLayout parent, String label, double value) {
-        return numRow(parent, label, value, Design.DIM);
+        return numRow(parent, label, value, Design.DIM());
     }
 
     private EditText numRow(LinearLayout parent, String label, double value, int labelColor) {
         LinearLayout r = new LinearLayout(this);
         r.setOrientation(LinearLayout.HORIZONTAL);
         r.setGravity(Gravity.CENTER_VERTICAL);
-        TextView t = new TextView(this); t.setText(label); t.setTextColor(labelColor); t.setTextSize(13f);
+        TextView t = new TextView(this); t.setText(label); t.setTextColor(labelColor); t.setTextSize(13f); t.setTypeface(Design.sans());
         EditText e = new EditText(this);
         decimalInput(e);
-        e.setText(trim(value)); e.setTextColor(Design.TEXT); e.setTextSize(14f); e.setGravity(Gravity.END);
+        e.setText(trim(value)); e.setTextColor(Design.TEXT()); e.setTextSize(15f); e.setGravity(Gravity.END); e.setTypeface(Design.mono());
         r.addView(t, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         r.addView(e, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         parent.addView(r);
@@ -773,17 +802,17 @@ public class MainActivity extends AppCompatActivity {
         info.setText((sellMinima ? "Sell MINIMA → " + symbol : "Buy MINIMA ← " + symbol)
                 + "\nPrice: " + trim(price) + " " + symbol + " per MINIMA"
                 + "\nMin: " + trim(p.min) + " MINIMA");
-        info.setTextColor(Design.DIM); info.setTextSize(13f); info.setPadding(0, 0, 0, dp(10));
+        info.setTextColor(Design.DIM()); info.setTextSize(13f); info.setTypeface(Design.sans()); info.setLineSpacing(dp(3), 1f); info.setPadding(0, 0, 0, dp(10));
         box.addView(info);
 
         final EditText amt = new EditText(this);
         amt.setHint("MINIMA to " + (sellMinima ? "sell" : "buy"));
         decimalInput(amt);
-        amt.setTextColor(Design.TEXT); amt.setHintTextColor(Design.DIM2);
+        amt.setTextColor(Design.TEXT()); amt.setHintTextColor(Design.DIM2()); amt.setTextSize(16f); amt.setTypeface(Design.mono());
         box.addView(amt);
 
         final TextView out = new TextView(this);
-        out.setTextColor(Design.ACCENT); out.setTextSize(14f); out.setPadding(0, dp(10), 0, 0);
+        out.setTextColor(Design.ACCENT()); out.setTextSize(14f); out.setTypeface(Design.sans()); out.setPadding(0, dp(10), 0, 0);
         box.addView(out);
 
         amt.addTextChangedListener(new SimpleWatcher(() -> {
@@ -792,7 +821,7 @@ public class MainActivity extends AppCompatActivity {
         }));
 
         modalOpen = true;
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle((sellMinima ? "Sell MINIMA" : "Buy MINIMA") + " · " + Util.shorten(maker.signerPk))
                 .setView(box)
                 .setPositiveButton("Start swap", (d, w) -> {
@@ -854,40 +883,60 @@ public class MainActivity extends AppCompatActivity {
     private LinearLayout buildTabBar() {
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.setBackgroundColor(Design.SURFACE);
-        bar.setPadding(dp(8), dp(8), dp(8), dp(8));
+        bar.setBackgroundColor(Design.SURFACE());
+        bar.setPadding(dp(6), dp(7), dp(6), dp(9));
+        final int[] icons = {R.drawable.ic_tab_swap, R.drawable.ic_tab_wallet, R.drawable.ic_tab_activity, R.drawable.ic_tab_market};
         for (int i = 0; i < TAB_LABELS.length; i++) {
             final int idx = i;
             boolean sel = idx == currentTab;
+
+            LinearLayout cell = new LinearLayout(this);
+            cell.setOrientation(LinearLayout.VERTICAL);
+            cell.setGravity(Gravity.CENTER);
+            cell.setPadding(0, dp(6), 0, dp(5));
+            cell.setBackground(Design.roundBg(this, sel ? Design.ACCENT_SOFT() : 0x00000000, 14));
+
+            ImageView ic = new ImageView(this);
+            ic.setImageResource(icons[i]);
+            ic.setColorFilter(sel ? Design.ACCENT() : Design.DIM());
+            ic.setLayoutParams(new LinearLayout.LayoutParams(dp(22), dp(22)));
+            tabIcons[i] = ic;
+
             TextView p = new TextView(this);
             p.setText(TAB_LABELS[i]);
             p.setGravity(Gravity.CENTER);
-            p.setTextSize(13f);
-            p.setPadding(dp(10), dp(10), dp(10), dp(10));
-            p.setBackground(Design.roundBg(this, sel ? Design.ACCENT : Design.SURFACE2, 14));
-            p.setTextColor(sel ? Design.ON_ACCENT : Design.DIM);
-            p.setOnClickListener(v -> setTab(idx));
+            p.setTextSize(10.5f);
+            p.setTypeface(Design.sans());
+            p.setPadding(0, dp(4), 0, 0);
+            p.setTextColor(sel ? Design.ACCENT() : Design.DIM());
             tabPills[i] = p;
+
+            cell.addView(ic);
+            cell.addView(p);
+            cell.setOnClickListener(v -> setTab(idx));
+            Design.pressable(cell);
+            tabCells[i] = cell;
+
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-            lp.leftMargin = i == 0 ? 0 : dp(6);
-            bar.addView(p, lp);
+            lp.leftMargin = i == 0 ? 0 : dp(4);
+            bar.addView(cell, lp);
         }
         return bar;
     }
 
     private void updateTabBarSelection() {
         for (int i = 0; i < tabPills.length; i++) {
-            TextView p = tabPills[i];
-            if (p == null) continue;
             boolean sel = i == currentTab;
-            p.setBackground(Design.roundBg(this, sel ? Design.ACCENT : Design.SURFACE2, 14));
-            p.setTextColor(sel ? Design.ON_ACCENT : Design.DIM);
+            if (tabCells[i] != null) tabCells[i].setBackground(Design.roundBg(this, sel ? Design.ACCENT_SOFT() : 0x00000000, 14));
+            if (tabIcons[i] != null) tabIcons[i].setColorFilter(sel ? Design.ACCENT() : Design.DIM());
+            if (tabPills[i] != null) tabPills[i].setTextColor(sel ? Design.ACCENT() : Design.DIM());
         }
     }
 
     private void setTab(int t) {
         if (t == currentTab) return;
         currentTab = t;
+        animateTab = true;   // cross-fade the new tab in (navigation only, not background refreshes)
         updateTabBarSelection();
         render();
     }
@@ -912,6 +961,7 @@ public class MainActivity extends AppCompatActivity {
         }
         scroller.removeAllViews();
         scroller.addView(col);
+        if (animateTab) { col.setAlpha(0f); col.animate().alpha(1f).setDuration(120).start(); animateTab = false; }
         if (currentTab == TAB_WALLET) firePendingPulses();
     }
 
@@ -919,18 +969,46 @@ public class MainActivity extends AppCompatActivity {
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
+
         TextView brand = new TextView(this);
         brand.setText("minimaSwap");
-        brand.setTextColor(Design.TEXT); brand.setTextSize(22f); brand.setTypeface(brand.getTypeface(), android.graphics.Typeface.BOLD);
+        brand.setTextColor(Design.TEXT()); brand.setTextSize(21f); brand.setTypeface(Design.sansBold()); brand.setLetterSpacing(-0.01f);
         header.addView(brand, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        TextView chip = Design.pill(this, "Mainnet · real funds", Design.ACCENT, Design.ON_ACCENT);
-        header.addView(chip);
+
+        TextView theme = Design.pill(this, Design.isDark() ? "☾" : "☀", Design.SURFACE2(), Design.DIM());
+        theme.setTextSize(13f);
+        theme.setOnClickListener(v -> toggleTheme());
+        Design.pressable(theme);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        tlp.rightMargin = dp(8);
+        header.addView(theme, tlp);
+
+        header.addView(mainnetChip());
         col.addView(header);
 
         TextView sub = new TextView(this);
-        sub.setText("v" + BuildConfig.VERSION_NAME + (chainBlock > 0 ? "  ·  block " + chainBlock : "") + "  ·  MINIMA ↔ USDT");
-        sub.setTextColor(Design.DIM2); sub.setTextSize(12.5f); sub.setPadding(0, dp(2), 0, dp(10));
+        sub.setText("v" + BuildConfig.VERSION_NAME + (chainBlock > 0 ? "  ·  block " + chainBlock : "") + "  ·  real funds");
+        sub.setTextColor(Design.DIM2()); sub.setTextSize(12f); sub.setTypeface(Design.sans()); sub.setPadding(0, dp(3), 0, dp(12));
         col.addView(sub);
+    }
+
+    /** Small "live" chip: a filled dot + Mainnet, tinted with the soft accent. */
+    private View mainnetChip() {
+        LinearLayout chip = new LinearLayout(this);
+        chip.setOrientation(LinearLayout.HORIZONTAL);
+        chip.setGravity(Gravity.CENTER_VERTICAL);
+        chip.setBackground(Design.roundBg(this, Design.ACCENT_SOFT(), 14));
+        chip.setPadding(dp(10), dp(6), dp(11), dp(6));
+        View dot = new View(this);
+        android.graphics.drawable.GradientDrawable dg = new android.graphics.drawable.GradientDrawable();
+        dg.setShape(android.graphics.drawable.GradientDrawable.OVAL); dg.setColor(Design.ACCENT());
+        dot.setBackground(dg);
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(dp(6), dp(6)); dlp.rightMargin = dp(6);
+        chip.addView(dot, dlp);
+        TextView t = new TextView(this);
+        t.setText("Mainnet"); t.setTextColor(Design.ACCENT()); t.setTextSize(11f); t.setTypeface(Design.sansBold());
+        chip.addView(t);
+        return chip;
     }
 
     // ---- Swap tab (guided, beginner-first) ----
@@ -938,23 +1016,24 @@ public class MainActivity extends AppCompatActivity {
     private TextView segTab(String label, boolean active, Runnable onTap) {
         TextView t = new TextView(this);
         t.setText(label); t.setGravity(Gravity.CENTER); t.setTextSize(14f);
-        t.setPadding(dp(12), dp(11), dp(12), dp(11));
-        t.setBackground(Design.roundBg(this, active ? Design.ACCENT : Design.SURFACE2, 12));
-        t.setTextColor(active ? Design.ON_ACCENT : Design.DIM);
-        if (active) t.setTypeface(t.getTypeface(), android.graphics.Typeface.BOLD);
+        t.setPadding(dp(12), dp(12), dp(12), dp(12));
+        t.setBackground(Design.roundBg(this, active ? Design.ACCENT() : Design.SURFACE2(), 12));
+        t.setTextColor(active ? Design.ON_ACCENT() : Design.DIM());
+        t.setTypeface(active ? Design.sansBold() : Design.sans());
         t.setOnClickListener(v -> onTap.run());
+        Design.pressable(t);
         return t;
     }
 
     private void renderSwapTab(LinearLayout col) {
         TextView h = new TextView(this);
         h.setText("Swap MINIMA ⇄ USDT");
-        h.setTextColor(Design.TEXT); h.setTextSize(18f); h.setTypeface(h.getTypeface(), android.graphics.Typeface.BOLD);
+        h.setTextColor(Design.TEXT()); h.setTextSize(18f); h.setTypeface(Design.sansBold());
         h.setPadding(0, dp(4), 0, dp(2));
         col.addView(h);
         TextView sh = new TextView(this);
         sh.setText("Trade at the best price on offer — pick a direction, then Review.");
-        sh.setTextColor(Design.DIM); sh.setTextSize(12.5f); sh.setPadding(0, 0, 0, dp(12));
+        sh.setTextColor(Design.DIM()); sh.setTextSize(12.5f); sh.setTypeface(Design.sans()); sh.setPadding(0, 0, 0, dp(12));
         col.addView(sh);
 
         // direction toggle (segmented)
@@ -979,28 +1058,32 @@ public class MainActivity extends AppCompatActivity {
 
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackground(Design.roundBg(this, Design.SURFACE, 16));
-        card.setPadding(dp(16), dp(14), dp(16), dp(14));
+        card.setBackground(Design.card(this, 16));
+        card.setPadding(dp(16), dp(16), dp(16), dp(16));
         LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         clp.topMargin = dp(14); card.setLayoutParams(clp);
 
         if (have) {
             TextView lbl = new TextView(this);
-            lbl.setText(swapSell ? "Sell your MINIMA for USDT" : "Buy MINIMA with USDT");
-            lbl.setTextColor(Design.DIM); lbl.setTextSize(12.5f);
+            lbl.setText(swapSell ? "SELL MINIMA · BEST PRICE" : "BUY MINIMA · BEST PRICE");
+            lbl.setTextColor(Design.DIM()); lbl.setTextSize(11f); lbl.setTypeface(Design.sans()); lbl.setLetterSpacing(0.06f);
             card.addView(lbl);
 
             TextView pr = new TextView(this);
-            pr.setText(fmtPrice(price) + " USDT per MINIMA");
-            pr.setTextColor(Design.ACCENT); pr.setTextSize(20f); pr.setTypeface(pr.getTypeface(), android.graphics.Typeface.BOLD);
-            pr.setPadding(0, dp(3), 0, 0);
+            pr.setText(fmtPrice(price));
+            pr.setTextColor(Design.ACCENT()); pr.setTextSize(34f); pr.setTypeface(Design.monoBold()); pr.setLetterSpacing(-0.02f);
+            pr.setPadding(0, dp(6), 0, dp(1));
             card.addView(pr);
+
+            TextView unit = new TextView(this);
+            unit.setText("USDT per MINIMA");
+            unit.setTextColor(Design.DIM2()); unit.setTextSize(12f); unit.setTypeface(Design.sans());
+            card.addView(unit);
 
             double size = swapSell ? (maker.usdtAvail / price) : maker.minimaAvail;
             TextView av = new TextView(this);
-            av.setText("Best price available now · up to ~" + abbrev(size) + " MINIMA"
-                    + (swapSell ? "" : " · you'll also need a little ETH for gas"));
-            av.setTextColor(Design.DIM); av.setTextSize(12.5f); av.setPadding(0, dp(6), 0, 0);
+            av.setText("Up to ~" + abbrev(size) + " MINIMA available" + (swapSell ? "" : " · a little ETH needed for gas"));
+            av.setTextColor(Design.DIM()); av.setTextSize(12.5f); av.setTypeface(Design.sans()); av.setPadding(0, dp(12), 0, 0);
             card.addView(av);
 
             TextView cta = button(swapSell ? "Review — Sell MINIMA" : "Review — Buy MINIMA");
@@ -1009,7 +1092,7 @@ public class MainActivity extends AppCompatActivity {
             cta.setOnClickListener(v -> takeOrderDialog(maker, "USDT", swapSell));
             card.addView(cta);
 
-            TextView hint = Design.pill(this, "ⓘ  What is “best price”?", Design.SURFACE2, Design.DIM);
+            TextView hint = Design.pill(this, "ⓘ  What is “best price”?", Design.SURFACE2(), Design.DIM());
             LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
             hlp.topMargin = dp(12); hint.setLayoutParams(hlp);
             hint.setOnClickListener(v -> showInfo("Best price",
@@ -1020,13 +1103,13 @@ public class MainActivity extends AppCompatActivity {
         } else {
             TextView none = new TextView(this);
             none.setText("No one is quoting a " + (swapSell ? "buy" : "sell") + " price right now.");
-            none.setTextColor(Design.TEXT); none.setTextSize(14f);
+            none.setTextColor(Design.TEXT()); none.setTextSize(14.5f); none.setTypeface(Design.sansBold());
             card.addView(none);
             TextView sub2 = new TextView(this);
             sub2.setText("Check back soon, or open Market to place your own order and wait for a match.");
-            sub2.setTextColor(Design.DIM); sub2.setTextSize(12.5f); sub2.setPadding(0, dp(6), 0, dp(2));
+            sub2.setTextColor(Design.DIM()); sub2.setTextSize(12.5f); sub2.setTypeface(Design.sans()); sub2.setLineSpacing(dp(3), 1f); sub2.setPadding(0, dp(6), 0, dp(2));
             card.addView(sub2);
-            TextView go = Design.pill(this, "Open Market", Design.SURFACE2, Design.TEXT);
+            TextView go = Design.pill(this, "Open Market", Design.SURFACE2(), Design.TEXT());
             LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
             glp.topMargin = dp(12); go.setLayoutParams(glp);
             go.setOnClickListener(v -> setTab(TAB_MARKET));
@@ -1039,8 +1122,8 @@ public class MainActivity extends AppCompatActivity {
         if (orderStatus != null) {
             TextView stt = new TextView(this);
             stt.setText(orderStatus);
-            stt.setTextColor(orderStatus.startsWith("✓") ? Design.IN : Design.DIM);
-            stt.setTextSize(12.5f); stt.setPadding(dp(2), dp(12), dp(2), 0);
+            stt.setTextColor(orderStatus.startsWith("✓") ? Design.IN() : Design.DIM());
+            stt.setTextSize(12.5f); stt.setTypeface(Design.sans()); stt.setPadding(dp(2), dp(12), dp(2), 0);
             col.addView(stt);
         }
     }
@@ -1058,8 +1141,9 @@ public class MainActivity extends AppCompatActivity {
         }
         TextView t = new TextView(this);
         t.setText(parts + "   ›");
-        t.setTextColor(Design.DIM2); t.setTextSize(11.5f); t.setPadding(dp(2), dp(14), dp(2), 0);
+        t.setTextColor(Design.DIM2()); t.setTextSize(11.5f); t.setTypeface(Design.sans()); t.setPadding(dp(2), dp(14), dp(2), 0);
         t.setOnClickListener(v -> setTab(TAB_WALLET));
+        Design.pressable(t);
         return t;
     }
 
@@ -1082,13 +1166,13 @@ public class MainActivity extends AppCompatActivity {
     // ---- Wallet tab ----
 
     private void renderWalletTab(LinearLayout col) {
-        LinearLayout minimaCard = walletCard("Minima · available to swap", minimaBal + " MINIMA", minimaBreakdown() + "  ·  long-press for coins", Design.ACCENT);
+        LinearLayout minimaCard = walletCard("Minima · available to swap", minimaBal + " MINIMA", minimaBreakdown() + "  ·  long-press for coins", Design.ACCENT());
         minimaCard.setOnLongClickListener(v -> { minimaCoinDump(); return true; });
         col.addView(minimaCard);
         minimaBalView = (TextView) minimaCard.findViewWithTag(TAG_BAL);   // fresh ref each render (tree is rebuilt)
 
         String addrLine = ethAddr == null ? (ethErr == null ? "deriving from node seed…" : "—") : shortAddr(ethAddr);
-        LinearLayout ethCard = walletCard("Ethereum · " + net.label, ethBal, addrLine, Design.TEXT);
+        LinearLayout ethCard = walletCard("Ethereum · " + net.label, ethBal, addrLine, Design.TEXT());
         if (ethAddr != null) ethCard.setOnClickListener(v -> receiveDialog());
         col.addView(ethCard);
         ethBalView = (TextView) ethCard.findViewWithTag(TAG_BAL);
@@ -1104,11 +1188,11 @@ public class MainActivity extends AppCompatActivity {
             LinearLayout walletActions = new LinearLayout(this);
             walletActions.setOrientation(LinearLayout.HORIZONTAL);
             walletActions.setPadding(0, dp(8), 0, 0);
-            TextView refreshBal = Design.pill(this, "↻  Refresh", Design.SURFACE2, Design.TEXT);
+            TextView refreshBal = Design.pill(this, "↻  Refresh", Design.SURFACE2(), Design.TEXT());
             refreshBal.setOnClickListener(v -> { toast("Refreshing balances…"); refreshBalances(true); });
-            TextView fund = Design.pill(this, "⤓  Fund / QR", Design.SURFACE2, Design.TEXT);
+            TextView fund = Design.pill(this, "⤓  Fund / QR", Design.SURFACE2(), Design.TEXT());
             fund.setOnClickListener(v -> receiveDialog());
-            TextView exportKey = Design.pill(this, "🔑  Export key", Design.SURFACE2, Design.DIM);
+            TextView exportKey = Design.pill(this, "🔑  Export key", Design.SURFACE2(), Design.DIM());
             exportKey.setOnClickListener(v -> exportKeyDialog());
             LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
             gap.rightMargin = dp(8);
@@ -1121,7 +1205,7 @@ public class MainActivity extends AppCompatActivity {
         if (ethErr != null) {
             TextView err = new TextView(this);
             err.setText("⚠ " + ethErr);
-            err.setTextColor(Design.RED); err.setTextSize(12f); err.setPadding(dp(2), dp(8), dp(2), 0);
+            err.setTextColor(Design.RED()); err.setTextSize(12f); err.setPadding(dp(2), dp(8), dp(2), 0);
             col.addView(err);
         }
 
@@ -1134,8 +1218,8 @@ public class MainActivity extends AppCompatActivity {
         if (pulseMinimaPending && minimaBalView != null) { pulseMinimaPending = false; Design.pulse(minimaBalView, 0xFFFFFFFF); }
         if (pulseEthPending && ethBalView != null) {
             pulseEthPending = false;
-            Design.pulse(ethBalView, Design.ACCENT);
-            for (TextView t : tokenBalViews) Design.pulse(t, Design.ACCENT);
+            Design.pulse(ethBalView, Design.ACCENT());
+            for (TextView t : tokenBalViews) Design.pulse(t, Design.ACCENT());
         }
     }
 
@@ -1144,7 +1228,7 @@ public class MainActivity extends AppCompatActivity {
     private void renderMarketTab(LinearLayout col) {
         TextView hint = new TextView(this);
         hint.setText("The live order book. Tap a price to trade, or publish your own offer.");
-        hint.setTextColor(Design.DIM); hint.setTextSize(12.5f); hint.setPadding(0, dp(2), 0, dp(2));
+        hint.setTextColor(Design.DIM()); hint.setTextSize(12.5f); hint.setTypeface(Design.sans()); hint.setPadding(0, dp(2), 0, dp(2));
         col.addView(hint);
 
         LinearLayout obHeader = new LinearLayout(this);
@@ -1153,9 +1237,9 @@ public class MainActivity extends AppCompatActivity {
         obHeader.setPadding(0, dp(14), 0, dp(2));
         TextView obTitle = new TextView(this);
         obTitle.setText("Order book  ·  " + orderBook.size() + " live");
-        obTitle.setTextColor(Design.TEXT); obTitle.setTextSize(16f); obTitle.setTypeface(obTitle.getTypeface(), android.graphics.Typeface.BOLD);
+        obTitle.setTextColor(Design.TEXT()); obTitle.setTextSize(16f); obTitle.setTypeface(Design.sansBold());
         obHeader.addView(obTitle, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        TextView refresh = Design.pill(this, "Refresh", Design.SURFACE2, Design.DIM);
+        TextView refresh = Design.pill(this, "Refresh", Design.SURFACE2(), Design.DIM());
         refresh.setOnClickListener(v -> scanOrderBook());
         obHeader.addView(refresh);
         col.addView(obHeader);
@@ -1163,7 +1247,7 @@ public class MainActivity extends AppCompatActivity {
         if (orderBook.isEmpty()) {
             TextView empty = new TextView(this);
             empty.setText(paired ? "No live orders yet. Publish one, or wait for a counterparty." : "Connect your node to see the order book.");
-            empty.setTextColor(Design.DIM); empty.setTextSize(12.5f); empty.setPadding(dp(2), dp(6), dp(2), 0);
+            empty.setTextColor(Design.DIM()); empty.setTextSize(12.5f); empty.setTypeface(Design.sans()); empty.setPadding(dp(2), dp(6), dp(2), 0);
             col.addView(empty);
         } else {
             orderLadder(col);
@@ -1172,8 +1256,8 @@ public class MainActivity extends AppCompatActivity {
         LinearLayout btns = new LinearLayout(this);
         btns.setOrientation(LinearLayout.HORIZONTAL);
         TextView editBtn = button("Edit my order");
-        editBtn.setBackground(Design.roundBg(this, Design.SURFACE2, 14));
-        editBtn.setTextColor(Design.TEXT);
+        editBtn.setBackground(Design.roundBg(this, Design.SURFACE2(), 14));
+        editBtn.setTextColor(Design.TEXT());
         editBtn.setOnClickListener(v -> editOrderDialog());
         TextView publish = button("Publish");
         publish.setOnClickListener(v -> publishOrder());
@@ -1187,19 +1271,19 @@ public class MainActivity extends AppCompatActivity {
         if (orderStatus != null) {
             TextView st = new TextView(this);
             st.setText(orderStatus);
-            st.setTextColor(orderStatus.startsWith("✓") ? Design.IN : Design.DIM);
-            st.setTextSize(12.5f); st.setPadding(dp(2), dp(10), dp(2), 0);
+            st.setTextColor(orderStatus.startsWith("✓") ? Design.IN() : Design.DIM());
+            st.setTextSize(12.5f); st.setTypeface(Design.sans()); st.setPadding(dp(2), dp(10), dp(2), 0);
             col.addView(st);
         }
     }
 
     private void showInfo(String title, String body) {
-        new AlertDialog.Builder(this).setTitle(title).setMessage(body).setPositiveButton("Got it", null).show();
+        dialog().setTitle(title).setMessage(body).setPositiveButton("Got it", null).show();
     }
 
     private void showWelcome() {
         prefs.edit().putBoolean("seen_welcome", true).apply();
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("Welcome to minimaSwap")
                 .setMessage("Swap MINIMA ⇄ USDT trustlessly across chains — no middleman ever holds your funds.\n\n"
                         + "To trade you'll need:\n"
@@ -1225,14 +1309,14 @@ public class MainActivity extends AppCompatActivity {
 
         TextView title = new TextView(this);
         title.setText("Your swaps");
-        title.setTextColor(Design.TEXT); title.setTextSize(16f); title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
+        title.setTextColor(Design.TEXT()); title.setTextSize(16f); title.setTypeface(Design.sansBold());
         title.setPadding(0, dp(22), 0, dp(2));
         col.addView(title);
         for (SwapDb.Swap s : show) col.addView(swapCard(s));
         if (hidden > 0) {
             TextView h = new TextView(this);
             h.setText(hidden + " finished swap" + (hidden == 1 ? "" : "s") + " hidden — tap for history");
-            h.setTextColor(Design.DIM); h.setTextSize(11.5f); h.setPadding(dp(2), dp(6), 0, dp(2));
+            h.setTextColor(Design.DIM()); h.setTextSize(11.5f); h.setTypeface(Design.sans()); h.setPadding(dp(2), dp(6), 0, dp(2));
             h.setOnClickListener(v -> openHistory(0));
             col.addView(h);
         }
@@ -1243,8 +1327,10 @@ public class MainActivity extends AppCompatActivity {
     /** Jump to the Activity tab and select a sub-tab (0 = my swaps, 1 = market). Always re-renders so the
      *  sub-tab pills switch even when we're already on Activity. */
     private void openHistory(int tab) {
+        boolean switching = currentTab != TAB_ACTIVITY;
         historyTab = tab;
         currentTab = TAB_ACTIVITY;
+        if (switching) animateTab = true;
         updateTabBarSelection();
         render();
     }
@@ -1256,9 +1342,9 @@ public class MainActivity extends AppCompatActivity {
         tabs.setOrientation(LinearLayout.HORIZONTAL); tabs.setPadding(0, dp(18), 0, dp(8));
         LinearLayout.LayoutParams gap = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         gap.rightMargin = dp(8);
-        TextView t0 = Design.pill(this, "My swaps", historyTab == 0 ? Design.ACCENT : Design.SURFACE2, historyTab == 0 ? Design.ON_ACCENT : Design.DIM);
+        TextView t0 = Design.pill(this, "My swaps", historyTab == 0 ? Design.ACCENT() : Design.SURFACE2(), historyTab == 0 ? Design.ON_ACCENT() : Design.DIM());
         t0.setOnClickListener(v -> openHistory(0));
-        TextView t1 = Design.pill(this, "Market history", historyTab == 1 ? Design.ACCENT : Design.SURFACE2, historyTab == 1 ? Design.ON_ACCENT : Design.DIM);
+        TextView t1 = Design.pill(this, "Market history", historyTab == 1 ? Design.ACCENT() : Design.SURFACE2(), historyTab == 1 ? Design.ON_ACCENT() : Design.DIM());
         t1.setOnClickListener(v -> openHistory(1));
         tabs.addView(t0, gap); tabs.addView(t1);
         col.addView(tabs);
@@ -1276,8 +1362,8 @@ public class MainActivity extends AppCompatActivity {
     private LinearLayout historySwapCard(SwapDb.Swap s) {
         LinearLayout c = new LinearLayout(this);
         c.setOrientation(LinearLayout.VERTICAL);
-        c.setBackground(Design.roundBg(this, Design.SURFACE, 14));
-        c.setPadding(dp(14), dp(10), dp(14), dp(10));
+        c.setBackground(Design.card(this, 14));
+        c.setPadding(dp(14), dp(11), dp(14), dp(11));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.topMargin = dp(8); c.setLayoutParams(lp);
 
@@ -1285,7 +1371,7 @@ public class MainActivity extends AppCompatActivity {
         top.setOrientation(LinearLayout.HORIZONTAL); top.setGravity(Gravity.CENTER_VERTICAL);
         TextView line = new TextView(this);
         line.setText(s.sellAmount + " " + s.sellToken + "  →  " + s.buyAmount + " " + s.buyToken);
-        line.setTextColor(Design.TEXT); line.setTextSize(14f);
+        line.setTextColor(Design.TEXT()); line.setTextSize(14f); line.setTypeface(Design.mono());
         top.addView(line, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         top.addView(Design.pill(this, statusLabel(s), statusBg(s), statusFg(s)));
         c.addView(top);
@@ -1295,15 +1381,16 @@ public class MainActivity extends AppCompatActivity {
                 s.created, System.currentTimeMillis(), android.text.format.DateUtils.MINUTE_IN_MILLIS).toString();
         String cp = (s.counterparty == null || s.counterparty.isEmpty()) ? "" : "  ·  " + shortAddr(s.counterparty);
         meta.setText(when + "  ·  " + s.role.toLowerCase() + cp);
-        meta.setTextColor(Design.DIM2); meta.setTextSize(11.5f); meta.setPadding(0, dp(4), 0, 0);
+        meta.setTextColor(Design.DIM2()); meta.setTextSize(11.5f); meta.setTypeface(Design.sans()); meta.setPadding(0, dp(5), 0, 0);
         c.addView(meta);
 
         TextView detail = new TextView(this);
         detail.setText(statusDetail(s));
-        detail.setTextColor(Design.DIM); detail.setTextSize(12f); detail.setPadding(0, dp(3), 0, 0);
+        detail.setTextColor(Design.DIM()); detail.setTextSize(12f); detail.setTypeface(Design.sans()); detail.setPadding(0, dp(3), 0, 0);
         c.addView(detail);
 
         c.setOnClickListener(v -> checkNow(s.hash));   // tap → live inspect detail
+        Design.pressable(c);
         return c;
     }
 
@@ -1313,7 +1400,7 @@ public class MainActivity extends AppCompatActivity {
         java.util.List<SwapDb.MarketTrade> recent = db.recentTrades(50);
 
         MarketChartView chart = new MarketChartView(this);
-        chart.setBackground(Design.roundBg(this, Design.SURFACE, 14));
+        chart.setBackground(Design.card(this, 14));
         chart.setData(chartData);
         LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(180));
         clp.topMargin = dp(6); chart.setLayoutParams(clp);
@@ -1322,7 +1409,7 @@ public class MainActivity extends AppCompatActivity {
         TextView stats = new TextView(this);
         String last = chartData.isEmpty() ? "—" : fmtPrice(chartData.get(chartData.size() - 1).price);
         stats.setText("last " + last + " USDT/MINIMA  ·  " + countByStatus(recent) + "  ·  price only (buy/sell not shown)");
-        stats.setTextColor(Design.DIM2); stats.setTextSize(11f); stats.setPadding(dp(2), dp(8), 0, dp(6));
+        stats.setTextColor(Design.DIM2()); stats.setTextSize(11f); stats.setTypeface(Design.sans()); stats.setPadding(dp(2), dp(8), 0, dp(6));
         col.addView(stats);
 
         if (recent.isEmpty()) {
@@ -1335,29 +1422,29 @@ public class MainActivity extends AppCompatActivity {
     private LinearLayout tradeRow(SwapDb.MarketTrade t) {
         LinearLayout r = new LinearLayout(this);
         r.setOrientation(LinearLayout.HORIZONTAL); r.setGravity(Gravity.CENTER_VERTICAL);
-        r.setBackground(Design.roundBg(this, Design.SURFACE, 10));
-        r.setPadding(dp(12), dp(8), dp(12), dp(8));
+        r.setBackground(Design.card(this, 12));
+        r.setPadding(dp(12), dp(9), dp(12), dp(9));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.topMargin = dp(6); r.setLayoutParams(lp);
 
         TextView when = new TextView(this);
         when.setText(android.text.format.DateUtils.getRelativeTimeSpanString(
                 t.observedAt, System.currentTimeMillis(), android.text.format.DateUtils.MINUTE_IN_MILLIS).toString());
-        when.setTextColor(Design.DIM2); when.setTextSize(11f);
+        when.setTextColor(Design.DIM2()); when.setTextSize(11f); when.setTypeface(Design.sans());
         r.addView(when, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
         TextView price = new TextView(this);
-        price.setText(fmtPrice(t.price)); price.setTextColor(Design.TEXT); price.setTextSize(14f);
+        price.setText(fmtPrice(t.price)); price.setTextColor(Design.TEXT()); price.setTextSize(14f); price.setTypeface(Design.mono());
         r.addView(price);
 
         TextView size = new TextView(this);
-        size.setText("  " + abbrev(parseD(t.sizeMinima, 0)) + " M"); size.setTextColor(Design.DIM); size.setTextSize(12f);
+        size.setText("  " + abbrev(parseD(t.sizeMinima, 0)) + " M"); size.setTextColor(Design.DIM()); size.setTextSize(12f); size.setTypeface(Design.mono());
         size.setPadding(dp(8), 0, dp(8), 0);
         r.addView(size);
 
         boolean exec = SwapDb.MT_EXECUTED.equals(t.status), ref = SwapDb.MT_REFUNDED.equals(t.status);
-        int bg = exec ? Design.IN : (ref ? Design.RED : Design.SURFACE2);
-        int fg = (exec || ref) ? Design.ON_ACCENT : Design.DIM;
+        int bg = exec ? Design.IN() : (ref ? Design.RED() : Design.SURFACE2());
+        int fg = (exec || ref) ? Design.ON_ACCENT() : Design.DIM();
         r.addView(Design.pill(this, exec ? "filled" : ref ? "cancelled" : "open", bg, fg));
         return r;
     }
@@ -1373,7 +1460,8 @@ public class MainActivity extends AppCompatActivity {
 
     private TextView dimNote(String s) {
         TextView t = new TextView(this);
-        t.setText(s); t.setTextColor(Design.DIM); t.setTextSize(12.5f); t.setPadding(dp(2), dp(12), dp(2), 0);
+        t.setText(s); t.setTextColor(Design.DIM()); t.setTextSize(12.5f); t.setTypeface(Design.sans());
+        t.setLineSpacing(dp(3), 1f); t.setPadding(dp(2), dp(12), dp(2), 0);
         return t;
     }
 
@@ -1397,8 +1485,8 @@ public class MainActivity extends AppCompatActivity {
     private LinearLayout swapCard(SwapDb.Swap s) {
         LinearLayout c = new LinearLayout(this);
         c.setOrientation(LinearLayout.VERTICAL);
-        c.setBackground(Design.roundBg(this, Design.SURFACE, 14));
-        c.setPadding(dp(14), dp(10), dp(14), dp(10));
+        c.setBackground(Design.card(this, 14));
+        c.setPadding(dp(14), dp(11), dp(14), dp(11));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.topMargin = dp(8); c.setLayoutParams(lp);
 
@@ -1406,11 +1494,11 @@ public class MainActivity extends AppCompatActivity {
         top.setOrientation(LinearLayout.HORIZONTAL); top.setGravity(Gravity.CENTER_VERTICAL);
         TextView line = new TextView(this);
         line.setText(s.sellAmount + " " + s.sellToken + "  →  " + s.buyAmount + " " + s.buyToken);
-        line.setTextColor(Design.TEXT); line.setTextSize(14f);
+        line.setTextColor(Design.TEXT()); line.setTextSize(14f); line.setTypeface(Design.mono());
         top.addView(line, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         top.addView(Design.pill(this, statusLabel(s), statusBg(s), statusFg(s)));
         if (isTerminal(s)) {
-            TextView x = Design.pill(this, "✕", Design.SURFACE2, Design.DIM);
+            TextView x = Design.pill(this, "✕", Design.SURFACE2(), Design.DIM());
             LinearLayout.LayoutParams xlp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
             xlp.leftMargin = dp(6); x.setLayoutParams(xlp);
             x.setOnClickListener(v -> dismissSwap(s.hash));
@@ -1420,12 +1508,12 @@ public class MainActivity extends AppCompatActivity {
 
         TextView detail = new TextView(this);
         detail.setText(statusDetail(s));
-        detail.setTextColor(Design.DIM); detail.setTextSize(12.5f); detail.setPadding(0, dp(4), 0, 0);
+        detail.setTextColor(Design.DIM()); detail.setTextSize(12.5f); detail.setTypeface(Design.sans()); detail.setPadding(0, dp(5), 0, 0);
         c.addView(detail);
 
         TextView meta = new TextView(this);
         meta.setText(s.role.toLowerCase() + "  ·  " + countdown(s));
-        meta.setTextColor(Design.DIM2); meta.setTextSize(11.5f); meta.setPadding(0, dp(3), 0, 0);
+        meta.setTextColor(Design.DIM2()); meta.setTextSize(11.5f); meta.setTypeface(Design.sans()); meta.setPadding(0, dp(3), 0, 0);
         c.addView(meta);
 
         // surface a logged reject/error reason inline (so a stuck swap isn't a black box)
@@ -1433,13 +1521,13 @@ public class MainActivity extends AppCompatActivity {
         if (err != null) {
             TextView e = new TextView(this);
             e.setText("⚠ " + err);
-            e.setTextColor(Design.RED); e.setTextSize(12f); e.setPadding(0, dp(4), 0, 0);
+            e.setTextColor(Design.RED()); e.setTextSize(12f); e.setPadding(0, dp(4), 0, 0);
             c.addView(e);
         }
 
         // a manual "Check now" that runs a live on-chain inspection AND advances the swap
         if (!SwapDb.ST_COMPLETE.equals(s.status) && !SwapDb.ST_REFUNDED.equals(s.status)) {
-            TextView check = Design.pill(this, "Check now", Design.SURFACE2, Design.TEXT);
+            TextView check = Design.pill(this, "Check now", Design.SURFACE2(), Design.TEXT());
             LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
             clp.topMargin = dp(8); check.setLayoutParams(clp);
             check.setOnClickListener(v -> checkNow(s.hash));
@@ -1476,10 +1564,10 @@ public class MainActivity extends AppCompatActivity {
         box.setPadding(dp(20), dp(12), dp(20), dp(4));
         TextView t = new TextView(this);
         t.setText(sb.toString().trim());
-        t.setTextColor(Design.TEXT); t.setTextSize(13f); t.setTextIsSelectable(true);
+        t.setTextColor(Design.TEXT()); t.setTextSize(13f); t.setTextIsSelectable(true);
         box.addView(t);
         modalOpen = true;
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("Swap status")
                 .setView(wrapScroll(box))
                 .setPositiveButton("Check again", (d, w) -> checkNow(hash))
@@ -1519,14 +1607,14 @@ public class MainActivity extends AppCompatActivity {
         }
     }
     private int statusBg(SwapDb.Swap s) {
-        if (SwapDb.ST_COMPLETE.equals(s.status)) return Design.IN;
-        if (SwapDb.ST_REFUNDED.equals(s.status) || SwapDb.ST_ERROR.equals(s.status)) return Design.RED;
-        return Design.SURFACE2;
+        if (SwapDb.ST_COMPLETE.equals(s.status)) return Design.IN();
+        if (SwapDb.ST_REFUNDED.equals(s.status) || SwapDb.ST_ERROR.equals(s.status)) return Design.RED();
+        return Design.SURFACE2();
     }
     private int statusFg(SwapDb.Swap s) {
         if (SwapDb.ST_COMPLETE.equals(s.status) || SwapDb.ST_REFUNDED.equals(s.status) || SwapDb.ST_ERROR.equals(s.status))
-            return Design.ON_ACCENT;
-        return Design.DIM;
+            return Design.ON_ACCENT();
+        return Design.DIM();
     }
 
     /** Time left on MY locked leg (the one I'd refund). Minima leg → blocks; ETH leg → wall-clock. */
@@ -1569,16 +1657,16 @@ public class MainActivity extends AppCompatActivity {
         if (bestBid > 0 && bestAsk < Double.MAX_VALUE) {
             TextView sp = new TextView(this);
             sp.setText("spread " + fmtPrice(bestAsk - bestBid) + " " + sym + "  ·  " + sym + " per MINIMA, size in MINIMA");
-            sp.setTextColor(Design.DIM2); sp.setTextSize(11f); sp.setPadding(dp(2), dp(4), 0, dp(4));
+            sp.setTextColor(Design.DIM2()); sp.setTextSize(11f); sp.setTypeface(Design.sans()); sp.setPadding(dp(2), dp(4), 0, dp(4));
             col.addView(sp);
         }
 
         // column legend
         LinearLayout legend = new LinearLayout(this);
         legend.setOrientation(LinearLayout.HORIZONTAL);
-        legend.setPadding(dp(6), dp(2), dp(6), dp(2));
-        TextView lL = new TextView(this); lL.setText("SELL MINIMA (bid)"); lL.setTextColor(Design.IN); lL.setTextSize(11f);
-        TextView lR = new TextView(this); lR.setText("BUY MINIMA (ask)"); lR.setTextColor(Design.RED); lR.setTextSize(11f); lR.setGravity(Gravity.END);
+        legend.setPadding(dp(6), dp(4), dp(6), dp(2));
+        TextView lL = new TextView(this); lL.setText("SELL MINIMA (bid)"); lL.setTextColor(Design.IN()); lL.setTextSize(11f); lL.setTypeface(Design.sansBold()); lL.setLetterSpacing(0.04f);
+        TextView lR = new TextView(this); lR.setText("BUY MINIMA (ask)"); lR.setTextColor(Design.RED()); lR.setTextSize(11f); lR.setTypeface(Design.sansBold()); lR.setLetterSpacing(0.04f); lR.setGravity(Gravity.END);
         legend.addView(lL, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         legend.addView(lR, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         col.addView(legend);
@@ -1598,16 +1686,16 @@ public class MainActivity extends AppCompatActivity {
     private LinearLayout bestMarketCard(String sym, Order bidMaker, Order askMaker, double bestBid, double bestAsk) {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        box.setBackground(Design.roundBg(this, Design.SURFACE2, 12));
-        box.setPadding(dp(12), dp(8), dp(12), dp(8));
+        box.setBackground(Design.stroked(this, Design.SURFACE2(), 14));
+        box.setPadding(dp(12), dp(10), dp(12), dp(10));
         LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         blp.topMargin = dp(8); box.setLayoutParams(blp);
 
         TextView tag = new TextView(this);
         tag.setText("★ BEST MARKET");
-        tag.setTextColor(Design.ACCENT); tag.setTextSize(12.5f);
-        tag.setTypeface(tag.getTypeface(), android.graphics.Typeface.BOLD);
-        tag.setGravity(Gravity.CENTER); tag.setPadding(0, 0, 0, dp(4));
+        tag.setTextColor(Design.ACCENT()); tag.setTextSize(11f); tag.setLetterSpacing(0.06f);
+        tag.setTypeface(Design.sansBold());
+        tag.setGravity(Gravity.CENTER); tag.setPadding(0, 0, 0, dp(6));
         box.addView(tag);
 
         double bidSize = bidMaker != null ? bidMaker.usdtAvail / bestBid : 0;
@@ -1615,12 +1703,12 @@ public class MainActivity extends AppCompatActivity {
 
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL); row.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout left = quoteHalf(abbrev(bidSize), fmtPrice(bestBid), Design.IN, true, true, true);
-        LinearLayout right = quoteHalf(fmtPrice(bestAsk), abbrev(askSize), Design.RED, true, false, true);
-        if (!isMine(bidMaker)) left.setOnClickListener(v -> takeOrderDialog(bidMaker, sym, true));    // sell to best bid
-        if (!isMine(askMaker)) right.setOnClickListener(v -> takeOrderDialog(askMaker, sym, false));  // buy at best ask
+        LinearLayout left = quoteHalf(abbrev(bidSize), fmtPrice(bestBid), Design.IN(), true, true, true);
+        LinearLayout right = quoteHalf(fmtPrice(bestAsk), abbrev(askSize), Design.RED(), true, false, true);
+        if (!isMine(bidMaker)) { left.setOnClickListener(v -> takeOrderDialog(bidMaker, sym, true)); Design.pressable(left); }
+        if (!isMine(askMaker)) { right.setOnClickListener(v -> takeOrderDialog(askMaker, sym, false)); Design.pressable(right); }
 
-        TextView div = new TextView(this); div.setText("│"); div.setTextColor(Design.DIM2); div.setTextSize(14f);
+        TextView div = new TextView(this); div.setText("│"); div.setTextColor(Design.DIM2()); div.setTextSize(14f);
         div.setPadding(dp(8), 0, dp(8), 0);
         row.addView(left, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         row.addView(div);
@@ -1636,15 +1724,15 @@ public class MainActivity extends AppCompatActivity {
 
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        box.setBackground(Design.roundBg(this, Design.SURFACE, 12));
-        box.setPadding(dp(12), dp(8), dp(12), dp(8));
+        box.setBackground(Design.card(this, 12));
+        box.setPadding(dp(12), dp(9), dp(12), dp(9));
         LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         blp.topMargin = dp(8); box.setLayoutParams(blp);
 
         TextView tag = new TextView(this);
         tag.setText(mine ? "your order" : shortAddr(o.signerPk));
-        tag.setTextColor(mine ? Design.ACCENT : Design.DIM2); tag.setTextSize(11.5f);
-        tag.setGravity(Gravity.CENTER); tag.setPadding(0, 0, 0, dp(4));
+        tag.setTextColor(mine ? Design.ACCENT() : Design.DIM2()); tag.setTextSize(11f); tag.setTypeface(Design.sans());
+        tag.setGravity(Gravity.CENTER); tag.setPadding(0, 0, 0, dp(5));
         box.addView(tag);
 
         boolean hasBid = p.sell > 0, hasAsk = p.buy > 0;
@@ -1655,14 +1743,14 @@ public class MainActivity extends AppCompatActivity {
         row.setGravity(Gravity.CENTER_VERTICAL);
 
         LinearLayout left = quoteHalf(abbrev(bidSize), hasBid ? fmtPrice(p.sell) : "—",
-                Design.IN, hasBid && p.sell == bestBid, true, false);
+                Design.IN(), hasBid && p.sell == bestBid, true, false);
         LinearLayout right = quoteHalf(hasAsk ? fmtPrice(p.buy) : "—", abbrev(hasAsk ? o.minimaAvail : 0),
-                Design.RED, hasAsk && p.buy == bestAsk, false, false);
+                Design.RED(), hasAsk && p.buy == bestAsk, false, false);
 
-        if (!mine && hasBid) left.setOnClickListener(v -> takeOrderDialog(o, sym, true));    // sell MINIMA
-        if (!mine && hasAsk) right.setOnClickListener(v -> takeOrderDialog(o, sym, false));  // buy MINIMA
+        if (!mine && hasBid) { left.setOnClickListener(v -> takeOrderDialog(o, sym, true)); Design.pressable(left); }    // sell MINIMA
+        if (!mine && hasAsk) { right.setOnClickListener(v -> takeOrderDialog(o, sym, false)); Design.pressable(right); } // buy MINIMA
 
-        TextView div = new TextView(this); div.setText("│"); div.setTextColor(Design.DIM2); div.setTextSize(14f);
+        TextView div = new TextView(this); div.setText("│"); div.setTextColor(Design.DIM2()); div.setTextSize(14f);
         div.setPadding(dp(8), 0, dp(8), 0);
 
         row.addView(left, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
@@ -1682,10 +1770,10 @@ public class MainActivity extends AppCompatActivity {
         String priceText = leftHalf ? b : a;
 
         TextView size = new TextView(this);
-        size.setText(sizeText); size.setTextColor(Design.DIM); size.setTextSize(big ? 13f : 12f);
+        size.setText(sizeText); size.setTextColor(Design.DIM()); size.setTextSize(big ? 13f : 12f); size.setTypeface(Design.mono());
         TextView price = new TextView(this);
         price.setText(priceText); price.setTextColor(priceColor); price.setTextSize(big ? 18.5f : 15f);
-        if (best) price.setTypeface(price.getTypeface(), android.graphics.Typeface.BOLD);
+        price.setTypeface(best ? Design.monoBold() : Design.mono());
 
         if (leftHalf) { size.setPadding(0, 0, dp(8), 0); h.addView(size); h.addView(price); }
         else { price.setPadding(dp(8), 0, 0, 0); h.addView(price); h.addView(size); }
@@ -1711,16 +1799,16 @@ public class MainActivity extends AppCompatActivity {
     private LinearLayout walletCard(String title, String big, String sub, int bigColor) {
         LinearLayout c = new LinearLayout(this);
         c.setOrientation(LinearLayout.VERTICAL);
-        c.setBackground(Design.roundBg(this, Design.SURFACE, 16));
-        c.setPadding(dp(16), dp(14), dp(16), dp(14));
+        c.setBackground(Design.card(this, 16));
+        c.setPadding(dp(16), dp(15), dp(16), dp(15));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.topMargin = dp(10); c.setLayoutParams(lp);
-        TextView t = new TextView(this); t.setText(title); t.setTextColor(Design.DIM); t.setTextSize(12.5f);
-        TextView v = new TextView(this); v.setText(big); v.setTextColor(bigColor); v.setTextSize(20f); v.setTag(TAG_BAL);
-        v.setTypeface(v.getTypeface(), android.graphics.Typeface.BOLD); v.setPadding(0, dp(3), 0, 0);
+        TextView t = new TextView(this); t.setText(title); t.setTextColor(Design.DIM()); t.setTextSize(12f); t.setTypeface(Design.sans());
+        TextView v = new TextView(this); v.setText(big); v.setTextColor(bigColor); v.setTextSize(22f); v.setTag(TAG_BAL);
+        v.setTypeface(Design.monoBold()); v.setPadding(0, dp(4), 0, 0);   // balances in tabular mono
         c.addView(t); c.addView(v);
         if (sub != null) {
-            TextView s = new TextView(this); s.setText(sub); s.setTextColor(Design.DIM); s.setTextSize(13f); s.setPadding(0, dp(5), 0, 0);
+            TextView s = new TextView(this); s.setText(sub); s.setTextColor(Design.DIM()); s.setTextSize(12.5f); s.setTypeface(Design.sans()); s.setPadding(0, dp(6), 0, 0);
             c.addView(s);
         }
         return c;
@@ -1729,9 +1817,9 @@ public class MainActivity extends AppCompatActivity {
     private LinearLayout kv(String k, String val) {
         LinearLayout r = new LinearLayout(this);
         r.setOrientation(LinearLayout.HORIZONTAL);
-        r.setPadding(dp(18), dp(6), dp(18), dp(6));
-        TextView a = new TextView(this); a.setText(k); a.setTextColor(Design.DIM); a.setTextSize(14f);
-        TextView v = new TextView(this); v.setText(val); v.setTextColor(Design.TEXT); v.setTextSize(14f); v.setGravity(Gravity.END); v.setTag(TAG_BAL);
+        r.setPadding(dp(4), dp(9), dp(4), dp(3));
+        TextView a = new TextView(this); a.setText(k); a.setTextColor(Design.DIM()); a.setTextSize(14f); a.setTypeface(Design.sans());
+        TextView v = new TextView(this); v.setText(val); v.setTextColor(Design.TEXT()); v.setTextSize(14f); v.setGravity(Gravity.END); v.setTag(TAG_BAL); v.setTypeface(Design.mono());
         r.addView(a, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         r.addView(v, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         return r;
@@ -1740,12 +1828,13 @@ public class MainActivity extends AppCompatActivity {
     private TextView button(String label) {
         TextView t = new TextView(this);
         t.setText(label);
-        t.setTextColor(Design.ON_ACCENT);
-        t.setBackground(Design.roundBg(this, Design.ACCENT, 14));
+        t.setTextColor(Design.ON_ACCENT());
+        t.setBackground(Design.ripple(Design.gradientCta(this)));
         t.setGravity(Gravity.CENTER);
-        t.setTextSize(15f); t.setTypeface(t.getTypeface(), android.graphics.Typeface.BOLD);
-        t.setPadding(dp(16), dp(12), dp(16), dp(12));
-        return t;
+        t.setTextSize(15f); t.setTypeface(Design.sansBold());
+        t.setPadding(dp(16), dp(14), dp(16), dp(14));
+        t.setElevation(dp(3));
+        return t;   // ripple background provides the press feedback
     }
 
     private ScrollView wrapScroll(View v) {
@@ -1754,11 +1843,11 @@ public class MainActivity extends AppCompatActivity {
         return s;
     }
 
-    private View buildPairingBanner() {
+    private TextView buildPairingBanner() {
         TextView t = new TextView(this);
         t.setText("Enable minimaSwap in Minima Core → Apps to connect to your node.");
-        t.setTextColor(Design.ON_ACCENT); t.setBackgroundColor(Design.ACCENT);
-        t.setPadding(dp(16), dp(10), dp(16), dp(10)); t.setTextSize(13f);
+        t.setTextColor(Design.ON_ACCENT()); t.setBackgroundColor(Design.ACCENT());
+        t.setPadding(dp(16), dp(10), dp(16), dp(10)); t.setTextSize(13f); t.setTypeface(Design.sansBold());
         return t;
     }
 
@@ -1773,8 +1862,8 @@ public class MainActivity extends AppCompatActivity {
 
         TextView addr = new TextView(this);
         addr.setText(ethAddr);
-        addr.setTextColor(Design.TEXT); addr.setTextSize(13f);
-        addr.setTypeface(Typeface.MONOSPACE);
+        addr.setTextColor(Design.TEXT()); addr.setTextSize(13f);
+        addr.setTypeface(Design.mono());
         addr.setTextIsSelectable(true);
         addr.setGravity(Gravity.CENTER);
         box.addView(addr);
@@ -1794,11 +1883,11 @@ public class MainActivity extends AppCompatActivity {
 
         TextView note = new TextView(this);
         note.setText("Same address on all EVM networks — fund it with " + net.label + " ETH and tokens.");
-        note.setTextColor(Design.DIM2); note.setTextSize(12f); note.setGravity(Gravity.CENTER);
+        note.setTextColor(Design.DIM2()); note.setTextSize(12f); note.setGravity(Gravity.CENTER);
         note.setPadding(0, dp(14), 0, 0);
         box.addView(note);
 
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("Receive / Fund · " + net.label)
                 .setView(wrapScroll(box))
                 .setPositiveButton("Copy address", (d, w) -> copy(ethAddr, "ETH address copied"))
@@ -1808,7 +1897,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void exportKeyDialog() {
         if (!wallet.ready()) { toast("ETH wallet not ready yet"); return; }
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("Export ETH private key")
                 .setMessage("This key controls your ETH funds. Anyone who sees it can take them. It is also "
                         + "derived from your Minima node seed. Never share it or type it into a website.")
@@ -1826,17 +1915,17 @@ public class MainActivity extends AppCompatActivity {
 
         TextView warn = new TextView(this);
         warn.setText("⚠ Keep this secret.");
-        warn.setTextColor(Design.RED); warn.setTextSize(12.5f); warn.setPadding(0, 0, 0, dp(10));
+        warn.setTextColor(Design.RED()); warn.setTextSize(12.5f); warn.setPadding(0, 0, 0, dp(10));
         box.addView(warn);
 
         TextView key = new TextView(this);
         key.setText(pk);
-        key.setTextColor(Design.TEXT); key.setTextSize(13f);
-        key.setTypeface(Typeface.MONOSPACE);
+        key.setTextColor(Design.TEXT()); key.setTextSize(13f);
+        key.setTypeface(Design.mono());
         key.setTextIsSelectable(true);
         box.addView(key);
 
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("ETH private key")
                 .setView(wrapScroll(box))
                 .setPositiveButton("Copy key", (d, w) -> copy(pk, "Private key copied"))
