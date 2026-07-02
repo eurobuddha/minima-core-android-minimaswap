@@ -66,6 +66,7 @@ import java.math.BigInteger;
 import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -119,6 +120,13 @@ public class MainActivity extends AppCompatActivity {
     private String ethErr = null;
     private String ethBal = "…";
     private final LinkedHashMap<String, String> tokenBals = new LinkedHashMap<>();
+
+    // Balance-pulse feedback: bounce the headline balances when a swap NEWLY completes (incl. while backgrounded).
+    private TextView minimaBalView, ethBalView;
+    private final List<TextView> tokenBalViews = new ArrayList<>();
+    private boolean pulseMinimaPending = false, pulseEthPending = false;
+    private int lastCompleteCount = -1;                 // -1 until first read from prefs
+    private static final String TAG_BAL = "balBig";     // marks the big balance TextView in walletCard/kv
 
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -182,6 +190,7 @@ public class MainActivity extends AppCompatActivity {
         super.onResume();
         FOREGROUND = true;     // Activity polls while visible; SwapService stands down
         startWatcher();
+        checkForNewCompletion();   // a swap that completed while we were away → refresh + pulse on return
     }
 
     @Override protected void onPause() {
@@ -333,6 +342,10 @@ public class MainActivity extends AppCompatActivity {
                 }
                 lastMinimaUpdate = System.currentTimeMillis();
                 render();
+                if (pulseMinimaPending && !modalOpen && minimaBalView != null) {
+                    pulseMinimaPending = false;
+                    Design.pulse(minimaBalView, 0xFFFFFFFF);   // accent number → flash white
+                }
             }
             @Override public void onError(String m) { minimaBal = "— (node didn't answer)"; lastMinimaUpdate = System.currentTimeMillis(); render(); }
         });
@@ -404,6 +417,33 @@ public class MainActivity extends AppCompatActivity {
         if (wallet.ready()) fetchEthBalances(showLoading);
     }
 
+    /** If a swap has NEWLY reached COMPLETE since we last looked (foreground or while backgrounded), arm a
+     *  balance pulse and force a visible reload. The count is persisted so a completion that finished while
+     *  the app was gone still pulses on return, and pre-existing completions never false-trigger.
+     *  Returns true if it kicked off a reload (so callers can skip a redundant silent refresh). */
+    private boolean checkForNewCompletion() {
+        if (db == null) return false;
+        int complete = 0;
+        for (SwapDb.Swap s : db.allSwaps()) if (SwapDb.ST_COMPLETE.equals(s.status)) complete++;
+        if (lastCompleteCount < 0) {                                       // baseline on first run, then persist it
+            lastCompleteCount = prefs.getInt("swap_complete_count", complete);
+            prefs.edit().putInt("swap_complete_count", lastCompleteCount).apply();
+        }
+        if (complete > lastCompleteCount) {
+            pulseMinimaPending = true;
+            pulseEthPending = true;
+            lastCompleteCount = complete;
+            prefs.edit().putInt("swap_complete_count", complete).apply();
+            refreshBalances(true);
+            return true;
+        }
+        if (complete != lastCompleteCount) {   // terminal count can't really shrink; resync quietly if it did
+            lastCompleteCount = complete;
+            prefs.edit().putInt("swap_complete_count", complete).apply();
+        }
+        return false;
+    }
+
     private void fetchBlock() {
         if (!paired || minima == null) return;
         minima.currentBlock(new MinimaHtlc.BlockCb() {
@@ -439,6 +479,11 @@ public class MainActivity extends AppCompatActivity {
                 if (usdt != null) prefs.edit().putString("usdt_avail", usdt).apply();   // for the background republish
                 if (ferr != null) ethErr = ferr;
                 render();
+                if (pulseEthPending && !modalOpen && ethBalView != null) {
+                    pulseEthPending = false;
+                    Design.pulse(ethBalView, Design.ACCENT);                       // white number → flash orange
+                    for (TextView t : tokenBalViews) Design.pulse(t, Design.ACCENT);
+                }
             });
         });
     }
@@ -842,12 +887,20 @@ public class MainActivity extends AppCompatActivity {
         LinearLayout minimaCard = walletCard("Minima · tradeable (sendable)", minimaBal + " MINIMA", minimaBreakdown() + "  ·  long-press for coins", Design.ACCENT);
         minimaCard.setOnLongClickListener(v -> { minimaCoinDump(); return true; });
         col.addView(minimaCard);
+        minimaBalView = (TextView) minimaCard.findViewWithTag(TAG_BAL);   // fresh ref each render (tree is rebuilt)
 
         String addrLine = ethAddr == null ? (ethErr == null ? "deriving from node seed…" : "—") : shortAddr(ethAddr);
         LinearLayout ethCard = walletCard("Ethereum · " + net.label, ethBal, addrLine, Design.TEXT);
         if (ethAddr != null) ethCard.setOnClickListener(v -> receiveDialog());
         col.addView(ethCard);
-        for (Map.Entry<String, String> e : tokenBals.entrySet()) col.addView(kv(e.getKey(), e.getValue()));
+        ethBalView = (TextView) ethCard.findViewWithTag(TAG_BAL);
+        tokenBalViews.clear();
+        for (Map.Entry<String, String> e : tokenBals.entrySet()) {
+            LinearLayout row = kv(e.getKey(), e.getValue());
+            TextView tv = (TextView) row.findViewWithTag(TAG_BAL);
+            if (tv != null) tokenBalViews.add(tv);
+            col.addView(row);
+        }
 
         if (ethAddr != null) {
             LinearLayout walletActions = new LinearLayout(this);
@@ -1442,7 +1495,7 @@ public class MainActivity extends AppCompatActivity {
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.topMargin = dp(10); c.setLayoutParams(lp);
         TextView t = new TextView(this); t.setText(title); t.setTextColor(Design.DIM); t.setTextSize(12.5f);
-        TextView v = new TextView(this); v.setText(big); v.setTextColor(bigColor); v.setTextSize(20f);
+        TextView v = new TextView(this); v.setText(big); v.setTextColor(bigColor); v.setTextSize(20f); v.setTag(TAG_BAL);
         v.setTypeface(v.getTypeface(), android.graphics.Typeface.BOLD); v.setPadding(0, dp(3), 0, 0);
         c.addView(t); c.addView(v);
         if (sub != null) {
@@ -1457,7 +1510,7 @@ public class MainActivity extends AppCompatActivity {
         r.setOrientation(LinearLayout.HORIZONTAL);
         r.setPadding(dp(18), dp(6), dp(18), dp(6));
         TextView a = new TextView(this); a.setText(k); a.setTextColor(Design.DIM); a.setTextSize(14f);
-        TextView v = new TextView(this); v.setText(val); v.setTextColor(Design.TEXT); v.setTextSize(14f); v.setGravity(Gravity.END);
+        TextView v = new TextView(this); v.setText(val); v.setTextColor(Design.TEXT); v.setTextSize(14f); v.setGravity(Gravity.END); v.setTag(TAG_BAL);
         r.addView(a, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         r.addView(v, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         return r;
@@ -1590,7 +1643,7 @@ public class MainActivity extends AppCompatActivity {
 
     private final SwapEngine.Notifier notifier = new SwapEngine.Notifier() {
         @Override public void notify(String title, String body) { ui.post(() -> postNotification(title, body)); }
-        @Override public void onSwapsChanged() { ui.post(() -> { render(); refreshBalances(false); }); }   // a claim/refund moved funds → update the balance now
+        @Override public void onSwapsChanged() { ui.post(() -> { render(); if (!checkForNewCompletion()) refreshBalances(false); }); }   // completion → pulse+reload; other moves → silent refresh
     };
 
     private void postNotification(String title, String body) {
