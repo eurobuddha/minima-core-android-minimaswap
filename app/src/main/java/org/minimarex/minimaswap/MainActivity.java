@@ -682,12 +682,14 @@ public class MainActivity extends AppCompatActivity {
         final double liveMinima = parseD(minimaBal, 0);
         final double liveUsdt = parseD(Util.tidyAmount(tokenBals.get("USDT")), 0);
 
-        // ASKS (maker sells MINIMA, higher)
+        // ASKS (maker sells MINIMA, higher) — laid out ORDER-BOOK style: highest (A6) at the top, best/lowest
+        // ask A1 at the BOTTOM adjacent to the bids, so the spread sits in the middle. askRows[] stays indexed
+        // A1..A6 (A1 = best); only the visual insertion order is reversed.
         TextView ah = new TextView(this); ah.setText("ASKS — you SELL MINIMA (higher price)");
         ah.setTextColor(Design.RED()); ah.setTextSize(12.5f); ah.setTypeface(Design.sansBold()); ah.setLetterSpacing(0.03f); ah.setPadding(0, dp(12), 0, dp(2));
         box.addView(ah);
         final EditText[][] askRows = new EditText[Order.MAX_LEVELS][];
-        for (int i = 0; i < Order.MAX_LEVELS; i++) {
+        for (int i = Order.MAX_LEVELS - 1; i >= 0; i--) {   // A6 first (top) … A1 last (bottom, by the spread)
             boolean legacy0 = i == 0 && p.asks.isEmpty() && p.enable && p.buy > 0;   // seed row from the live single-price ask
             double px = i < p.asks.size() ? p.asks.get(i).price : (legacy0 ? p.buy : 0);
             double am = i < p.asks.size() ? p.asks.get(i).amount : (legacy0 ? liveMinima : 0);
