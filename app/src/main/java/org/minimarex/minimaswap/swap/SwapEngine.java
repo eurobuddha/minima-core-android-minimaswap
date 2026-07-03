@@ -61,6 +61,7 @@ public final class SwapEngine {
         void onSwapsChanged();                     // ask the UI to re-render swap cards
     }
     public interface StartCb { void ok(String hash); void err(String msg); }
+    public interface ConfirmCb { void done(boolean onChain); }
     public interface InspectCb { void report(java.util.List<String> lines); }
 
     private final NodeApi node;
@@ -187,6 +188,48 @@ public final class SwapEngine {
             }
             @Override public void err(String m) { cb.err(m); }
         });
+    }
+
+    /**
+     * Is MY first-leg lock for {@code hash} visible ON-CHAIN yet? Read-only. buy (myLegIsMinima=false) → the
+     * ETH HTLC contract reads back with a non-zero amount; sell → my Minima HTLC coin (state[5]==hash) exists.
+     * Used to gate a market sweep so the next (worse-priced) leg starts ONLY once the current best leg is
+     * actually locked in — and so a dropped leg halts the sweep instead of executing the worse one.
+     */
+    public void confirmMyLock(String hash, boolean myLegIsMinima, ConfirmCb cb) {
+        if (myLegIsMinima) {
+            minima.scanMyHtlcCoins(arr -> {
+                boolean found = false;
+                for (int i = 0; i < arr.length(); i++) {
+                    org.json.JSONObject c = arr.optJSONObject(i);
+                    if (c != null && sameHash(MinimaHtlc.stateAt(c, 5), hash)) { found = true; break; }
+                }
+                final boolean f = found;
+                ui.post(() -> cb.done(f));
+            }, e -> ui.post(() -> cb.done(false)));
+        } else {
+            if (io.isShutdown()) return;   // engine torn down (Activity destroyed) — the sweep is already abandoned
+            try {
+                io.execute(() -> {
+                    boolean ok = false;
+                    try {
+                        EthHtlc eth = new EthHtlc(rpc, wallet.creds(), net);
+                        EthHtlc.Contract c = eth.getContract(EthHtlc.contractId(hash));
+                        ok = c != null && c.amount != null && c.amount.signum() > 0;
+                    } catch (Exception ignore) {}
+                    final boolean f = ok;
+                    ui.post(() -> cb.done(f));
+                });
+            } catch (java.util.concurrent.RejectedExecutionException ignore) { /* shut down mid-call — drop */ }
+        }
+    }
+
+    private static boolean sameHash(String a, String b) {
+        if (a == null || b == null) return false;
+        a = a.trim(); b = b.trim();
+        if (a.regionMatches(true, 0, "0x", 0, 2)) a = a.substring(2);
+        if (b.regionMatches(true, 0, "0x", 0, 2)) b = b.substring(2);
+        return !a.isEmpty() && a.equalsIgnoreCase(b);
     }
 
     // ============================================================ inspect (live diagnostic for one swap)

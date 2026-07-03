@@ -17,6 +17,11 @@ public final class EthTx {
 
     private static final BigInteger FALLBACK_GAS_PRICE = BigInteger.valueOf(2_000_000_000L); // 2 gwei
 
+    // Nonce = the RPC's "pending" count. We deliberately do NOT keep a local counter: the two places rapid
+    // back-to-back sends occur are both already serialized on-chain — a market sweep waits for each leg's lock
+    // to be MINED before the next (see MainActivity.awaitLegConfirm), and ensureAllowanceBlocking waits for the
+    // approve to confirm before newContract — so "pending" is always fresh, and pure-pending self-heals if a
+    // tx is ever dropped (a local counter would leave a permanent nonce gap instead).
     public static String send(EthRpc rpc, Credentials creds, long chainId,
                               String to, String data, BigInteger value, BigInteger gasLimit) throws Exception {
         BigInteger nonce = rpc.getTransactionCount(creds.getAddress());

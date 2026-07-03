@@ -86,7 +86,10 @@ public class MainActivity extends AppCompatActivity {
     private static final String PREFS = "minimaswap";
     private static final String[] PAIR_TOKENS = Order.PAIR_TOKENS;   // single source of truth in Order
     private static final long WATCH_INTERVAL_MS = 90_000;
-    private static final long SWEEP_LEG_TIMEOUT_MS = 240_000;   // abort a sweep if a leg never calls back (> node's 180s send timeout)
+    private static final long SWEEP_LEG_TIMEOUT_MS = 300_000;    // start-phase watchdog: lock never broadcasts (covers approve+lock)
+    private static final long SWEEP_CONFIRM_WATCHDOG_MS = 420_000; // confirm-phase watchdog: confirmMyLock hangs (> the try-budget below)
+    private static final long SWEEP_CONFIRM_INTERVAL_MS = 8_000; // poll cadence while waiting for a leg's lock to hit chain
+    private static final int  SWEEP_CONFIRM_TRIES = 45;         // ~6 min budget — covers Minima coinage:2 (~150s) + slow ETH mining
     static final long REPUBLISH_INTERVAL_MS = 30 * 60_000;   // keep a published order live + fresh (bridge uses 30m)
     private static final long TERMINAL_GRACE_MS = 10 * 60_000;   // finished swaps auto-hide after this
 
@@ -227,6 +230,11 @@ public class MainActivity extends AppCompatActivity {
 
     @Override protected void onDestroy() {
         super.onDestroy();
+        // Release any in-flight sweep BEFORE tearing down: clear the static SWEEP_ACTIVE (else SwapService would
+        // stand down forever and never drive the locked legs), and drop every queued confirm-poll callback so
+        // none fires against the shut-down io pool. The background Service resumes the in-flight swaps from the DB.
+        SWEEP_ACTIVE = false; sweepRun = null; sweepWatchdog = null;
+        ui.removeCallbacksAndMessages(null);
         stopWatcher();
         if (engine != null) engine.shutdown();
         if (node != null) node.onDestroy();
@@ -991,16 +999,16 @@ public class MainActivity extends AppCompatActivity {
         if (sweepRun == null) return;
         final int total = sweepRun.legs.size();
         if (sweepIdx >= total) {
-            orderStatus = "✓ Sweep started — " + sweepOk + " of " + total + " parts locked. Watching for counterparties.";
+            orderStatus = "✓ Sweep done — " + sweepOk + " of " + total + " parts locked on-chain. Watching for counterparties.";
             endSweep();
             return;
         }
         final SweepLeg leg = sweepRun.legs.get(sweepIdx);
         final boolean sell = sweepRun.sell;
         final int shown = sweepIdx + 1;
-        orderStatus = "Sweeping — locking part " + shown + " of " + total + "…"; render();
+        orderStatus = "Sweeping — locking part " + shown + " of " + total + " (best price first)…"; render();
 
-        // Watchdog: if THIS leg neither ok's nor err's (e.g. a node hang drops the callback), release the wire so
+        // Watchdog: if THIS leg's start neither ok's nor err's (a node hang drops the callback), release the wire so
         // claim/refund polling resumes — a stuck sweepRun would otherwise starve every in-flight swap indefinitely.
         if (sweepWatchdog != null) ui.removeCallbacks(sweepWatchdog);
         final int idxAtStart = sweepIdx;
@@ -1014,16 +1022,48 @@ public class MainActivity extends AppCompatActivity {
 
         startLeg(leg.maker, "USDT", sell, leg.minima, leg.usdt, new SwapEngine.StartCb() {
             @Override public void ok(String hash) {
-                if (sweepRun == null || sweepIdx != idxAtStart) return;   // already torn down (watchdog/err) — ignore late callback
-                sweepOk++; sweepIdx++;
-                orderStatus = "✓ Part " + shown + "/" + total + " locked" + (sweepIdx < total ? " — starting part " + (sweepIdx + 1) + "…" : ".");
+                if (sweepRun == null || sweepIdx != idxAtStart) return;   // already torn down — ignore late callback
+                // Re-arm the watchdog for the CONFIRM phase — a hung confirmMyLock must still release SWEEP_ACTIVE
+                // (else the background service stays wedged). Longer than the confirm try-budget so the graceful
+                // "didn't confirm" path fires first for a genuinely unconfirmable leg.
+                if (sweepWatchdog != null) ui.removeCallbacks(sweepWatchdog);
+                sweepWatchdog = () -> {
+                    if (sweepRun != null && sweepIdx == idxAtStart) {
+                        orderStatus = "Sweep stalled confirming part " + shown + " — stopped. Locked parts continue; unmatched auto-refund.";
+                        endSweep();
+                    }
+                };
+                ui.postDelayed(sweepWatchdog, SWEEP_CONFIRM_WATCHDOG_MS);
+                orderStatus = "✓ Part " + shown + "/" + total + " lock sent — confirming on-chain before the next part…";
                 render();
-                fireSweepLeg();   // NEXT lock ONLY from prior ok — the sequential coin/nonce guarantee
+                awaitLegConfirm(hash, sell, idxAtStart, shown, total, 0);   // don't advance until it's actually locked in
             }
             @Override public void err(String msg) {
                 if (sweepRun == null || sweepIdx != idxAtStart) return;
-                orderStatus = "Sweep stopped — filled " + sweepOk + " of " + total + " parts (part " + shown
+                orderStatus = "Sweep stopped — " + sweepOk + " of " + total + " parts done (part " + shown
                         + " failed: " + msg + "). Locked parts continue; unmatched auto-refund.";
+                endSweep();
+            }
+        });
+    }
+
+    /** Poll until leg {@code idxAtStart}'s lock is confirmed ON-CHAIN, THEN fire the next leg. If it never
+     *  confirms (e.g. the lock tx was dropped), STOP — never execute a worse-priced leg behind an unconfirmed best. */
+    private void awaitLegConfirm(String hash, boolean sell, int idxAtStart, int shown, int total, int attempt) {
+        if (sweepRun == null || sweepIdx != idxAtStart) return;
+        engine.confirmMyLock(hash, sell, onChain -> {
+            if (sweepRun == null || sweepIdx != idxAtStart) return;
+            if (onChain) {
+                sweepOk++; sweepIdx++;
+                orderStatus = "✓ Part " + shown + "/" + total + " locked in on-chain"
+                        + (sweepIdx < total ? " — starting part " + (sweepIdx + 1) + "…" : ".");
+                render();
+                fireSweepLeg();   // NEXT leg only after THIS one is confirmed — best price locked in first
+            } else if (attempt < SWEEP_CONFIRM_TRIES) {
+                ui.postDelayed(() -> awaitLegConfirm(hash, sell, idxAtStart, shown, total, attempt + 1), SWEEP_CONFIRM_INTERVAL_MS);
+            } else {
+                orderStatus = "Sweep stopped — part " + shown + "'s lock didn't confirm on-chain in time; no further parts started. "
+                        + "That leg auto-refunds at its timelock; your other funds are untouched.";
                 endSweep();
             }
         });
