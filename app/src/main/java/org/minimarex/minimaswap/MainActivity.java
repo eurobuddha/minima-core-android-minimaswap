@@ -87,9 +87,9 @@ public class MainActivity extends AppCompatActivity {
     private static final String[] PAIR_TOKENS = Order.PAIR_TOKENS;   // single source of truth in Order
     private static final long WATCH_INTERVAL_MS = 90_000;
     private static final long SWEEP_LEG_TIMEOUT_MS = 300_000;    // start-phase watchdog: lock never broadcasts (covers approve+lock)
-    private static final long SWEEP_CONFIRM_WATCHDOG_MS = 420_000; // confirm-phase watchdog: confirmMyLock hangs (> the try-budget below)
-    private static final long SWEEP_CONFIRM_INTERVAL_MS = 8_000; // poll cadence while waiting for a leg's lock to hit chain
-    private static final int  SWEEP_CONFIRM_TRIES = 45;         // ~6 min budget — covers Minima coinage:2 (~150s) + slow ETH mining
+    private static final long SWEEP_CONFIRM_WATCHDOG_MS = 300_000; // SELL confirm-phase watchdog: confirmMyLock hangs (> the try-budget below)
+    private static final long SWEEP_CONFIRM_INTERVAL_MS = 8_000; // SELL poll cadence while waiting for a leg's MINIMA lock to hit chain
+    private static final int  SWEEP_CONFIRM_TRIES = 30;         // ~4 min budget (SELL-only) — a coinage:1 lock lands in ~1 block
     static final long REPUBLISH_INTERVAL_MS = 30 * 60_000;   // keep a published order live + fresh (bridge uses 30m)
     private static final long TERMINAL_GRACE_MS = 10 * 60_000;   // Activity-tab history: finished swaps auto-hide after this
     private static final long SWAP_PANEL_GRACE_MS = 30_000;       // Swap-tab panel: a just-finished swap shows only this long, then clears
@@ -167,9 +167,9 @@ public class MainActivity extends AppCompatActivity {
 
     private final Runnable watchTick = new Runnable() {
         @Override public void run() {
-            if (sweepRun == null) {                  // stand down mid-sweep — a poll-driven ETH claim or a
-                if (engine != null) engine.poll();   // republish could grab the same "pending" nonce / MINIMA
-                maybeAutoRepublish();                //  coins as a sweep leg and collide (legs must own the wire)
+            if (sweepRun == null || !sweepRun.sell) {  // stand down only mid-SELL-sweep — a poll republish/claim
+                if (engine != null) engine.poll();     // could re-select a sell leg's MINIMA coins. A BUY sweep is
+                maybeAutoRepublish();                  // nonce-serialized, so the poller may run alongside it.
             }
             refreshBalances(false);                 // keep balances current without a restart (read-only, always safe)
             scanTakeRequests();                      // receive buyers' hashlock handshakes (scan/add only, no tx)
@@ -980,12 +980,15 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // ---- sequential sweep executor: fire leg N+1 ONLY from leg N's ok (never parallel — coin/nonce safety) ----
+    // ---- sweep executor: BUY legs fire back-to-back on broadcast (EthTx nonce serializer keeps them ordered +
+    //      collision-free); SELL legs stay gated on each MINIMA lock confirming (no nonce for coin selection) ----
 
     private void startSweep(SweepPlan plan) {
         if (plan == null || plan.legs.isEmpty()) return;
         sweepRun = plan; sweepIdx = 0; sweepOk = 0;
-        SWEEP_ACTIVE = true;   // both the Activity watcher AND SwapService now stand down (ETH-nonce / MINIMA-coin safety)
+        // Only a SELL sweep must stand the pollers down — its unpinned MINIMA locks could double-select coins.
+        // A BUY sweep is nonce-serialized (EthTx), so the poll loop may keep claiming counter-legs alongside it.
+        SWEEP_ACTIVE = plan.sell;
         fireSweepLeg();
     }
 
@@ -998,14 +1001,15 @@ public class MainActivity extends AppCompatActivity {
 
     private void fireSweepLeg() {
         if (sweepRun == null) return;
+        final boolean sell = sweepRun.sell;
         final int total = sweepRun.legs.size();
         if (sweepIdx >= total) {
-            orderStatus = "✓ Sweep done — " + sweepOk + " of " + total + " parts locked on-chain. Watching for counterparties.";
+            orderStatus = "✓ Sweep done — " + sweepOk + " of " + total + " parts "
+                    + (sell ? "locked on-chain" : "sent") + ". Watching for counterparties.";
             endSweep();
             return;
         }
         final SweepLeg leg = sweepRun.legs.get(sweepIdx);
-        final boolean sell = sweepRun.sell;
         final int shown = sweepIdx + 1;
         orderStatus = "Sweeping — locking part " + shown + " of " + total + " (best price first)…"; render();
 
@@ -1024,9 +1028,19 @@ public class MainActivity extends AppCompatActivity {
         startLeg(leg.maker, "USDT", sell, leg.minima, leg.usdt, new SwapEngine.StartCb() {
             @Override public void ok(String hash) {
                 if (sweepRun == null || sweepIdx != idxAtStart) return;   // already torn down — ignore late callback
-                // Re-arm the watchdog for the CONFIRM phase — a hung confirmMyLock must still release SWEEP_ACTIVE
-                // (else the background service stays wedged). Longer than the confirm try-budget so the graceful
-                // "didn't confirm" path fires first for a genuinely unconfirmable leg.
+                if (!sell) {
+                    // BUY: the serializer already handed this lock a unique, in-order nonce, so fire the next leg
+                    // immediately on broadcast — no wait to mine. Best price still mines first (it got nonce N).
+                    sweepOk++; sweepIdx++;
+                    orderStatus = "✓ Part " + shown + "/" + total + " lock sent"
+                            + (sweepIdx < total ? " — sending part " + (sweepIdx + 1) + "…" : ". Watching for counterparties.");
+                    render();
+                    fireSweepLeg();
+                    return;
+                }
+                // SELL: MINIMA coin selection has no nonce — the next lock could re-select this leg's coins, so
+                // wait until this lock's inputs are spent on-chain (confirmMyLock, coinage:1) before advancing.
+                // Re-arm the watchdog for the CONFIRM phase — a hung confirmMyLock must still release SWEEP_ACTIVE.
                 if (sweepWatchdog != null) ui.removeCallbacks(sweepWatchdog);
                 sweepWatchdog = () -> {
                     if (sweepRun != null && sweepIdx == idxAtStart) {

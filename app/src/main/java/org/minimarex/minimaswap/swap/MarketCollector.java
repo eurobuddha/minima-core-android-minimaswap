@@ -27,7 +27,7 @@ public final class MarketCollector {
     /** One collection cycle. Safe to call repeatedly from the 90s tick; all writes are idempotent. */
     public static void poll(MinimaHtlc minima, SwapDb db, int tipBlock) {
         if (minima == null || db == null || !minima.ready()) return;
-        minima.scanAllHtlcCoins(HTLC_DEPTH, coins -> ingest(minima, db, coins, tipBlock), e -> {});
+        minima.scanAllHtlcCoins(0, HTLC_DEPTH, coins -> ingest(minima, db, coins, tipBlock), e -> {});
     }
 
     private static void ingest(MinimaHtlc minima, SwapDb db, JSONArray coins, int tipBlock) {

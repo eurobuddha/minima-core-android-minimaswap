@@ -226,30 +226,49 @@ public final class MinimaHtlc {
      * then query BARE with simplestate. Bounded by {@code depth} (a heavy reply on a busy shared address can
      * crash the node over the IPC). Includes the upstream miniSwap dapp's locks (same contract).
      */
-    public void scanAllHtlcCoins(int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
-        cmd("coinnotify action:add address:" + HTLC_ADDRESS, r -> doScanAllHtlc(depth, ok, err), e -> doScanAllHtlc(depth, ok, err));
+    public void scanAllHtlcCoins(int coinageMin, int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
+        cmd("coinnotify action:add address:" + HTLC_ADDRESS, r -> doScanAllHtlc(coinageMin, depth, ok, err), e -> doScanAllHtlc(coinageMin, depth, ok, err));
     }
 
-    private void doScanAllHtlc(int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
-        cmd("coins simplestate:true depth:" + depth + " address:" + HTLC_ADDRESS, r -> {
+    private void doScanAllHtlc(int coinageMin, int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
+        cmd("coins coinage:" + coinageMin + " simplestate:true depth:" + depth + " address:" + HTLC_ADDRESS, r -> {
             Object resp = r.opt("response");
             ok.accept(resp instanceof org.json.JSONArray ? (org.json.JSONArray) resp : new org.json.JSONArray());
         }, err);
     }
 
-    /**
-     * Scan the HTLC address for coins relevant to ME — verbatim the upstream query
-     * ({@code coins coinage:2 tokenid:0x00 simplestate:true relevant:true address:HTLC_ADDRESS}).
-     * {@code relevant:true} bounds the reply to coins my keys appear in (owner state[0] or receiver
-     * state[4]), which is both correct AND the safety bound — the shared address is global, so an
-     * unbounded scan could return a node-crashing reply.
-     */
-    public void scanMyHtlcCoins(Consumer<org.json.JSONArray> ok, Consumer<String> err) {
-        cmd("coins coinage:2 tokenid:0x00 simplestate:true relevant:true address:" + HTLC_ADDRESS, r -> {
+    /** Find HTLC coin(s) carrying a specific hashlock (state[5]==hash) via the reliable coinnotify-add +
+     *  state-filter path. Discovers a counterparty's MINIMA leg — which we only RECEIVE (state[4]), so the
+     *  node's one-shot relevant:true set can miss it (the second-leg-of-a-sweep bug) — and confirms our own
+     *  lock. The server-side state: filter returns only our coin(s), so it stays cheap at any global volume. */
+    public void scanHtlcByHash(String hash, int coinageMin, int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
+        scanHtlcByState(hash, coinageMin, depth, ok, err);
+    }
+
+    /** All open HTLC coins carrying MY key (owner state[0] for coins I locked, or receiver state[4] for coins
+     *  locked to me) — the bounded, relevance-independent replacement for the old relevant:true scan. The
+     *  server-side state: filter keeps the reply small even though the HTLC address is a global shared sink. */
+    public void scanMyHtlcByKey(String myPubkey, int coinageMin, int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
+        scanHtlcByState(myPubkey, coinageMin, depth, ok, err);
+    }
+
+    private void scanHtlcByState(String value, int coinageMin, int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
+        cmd("coinnotify action:add address:" + HTLC_ADDRESS,
+            r -> doScanHtlcByState(value, coinageMin, depth, ok, err),
+            e -> doScanHtlcByState(value, coinageMin, depth, ok, err));
+    }
+
+    private void doScanHtlcByState(String value, int coinageMin, int depth, Consumer<org.json.JSONArray> ok, Consumer<String> err) {
+        cmd("coins coinage:" + coinageMin + " tokenid:0x00 simplestate:true state:" + normKey(value)
+          + " address:" + HTLC_ADDRESS + " depth:" + depth, r -> {
             Object resp = r.opt("response");
             ok.accept(resp instanceof org.json.JSONArray ? (org.json.JSONArray) resp : new org.json.JSONArray());
         }, err);
     }
+
+    // (removed scanMyHtlcCoins: relevant:true reads the node's one-shot block-time relevance set, which is
+    //  unreliable for a coin I only RECEIVE — it missed the 2nd+ legs of a sweep. All callers now use the
+    //  coinnotify-add + state-filter scans above: scanHtlcByHash (per hash) and scanAllHtlcCoins (bare).)
 
     /**
      * Scan the notify address for revealed-secret coins (the 0.0001 coins a claim forces to {@link #NOTIFY}).

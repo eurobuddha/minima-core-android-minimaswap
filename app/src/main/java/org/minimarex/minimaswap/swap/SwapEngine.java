@@ -8,6 +8,7 @@ import org.minimarex.comms.NodeApi;
 import org.minimarex.minimaswap.eth.EthHtlc;
 import org.minimarex.minimaswap.eth.EthNet;
 import org.minimarex.minimaswap.eth.EthRpc;
+import org.minimarex.minimaswap.eth.EthTx;
 import org.minimarex.minimaswap.eth.EthWallet;
 import org.web3j.crypto.Credentials;
 
@@ -54,6 +55,7 @@ public final class SwapEngine {
     public static final long CP_SECS                    = (TIMELOCK_SECS / 2) / 2;           // 1800
     private static final long SECRETS_BACKLOG           = 50 + (TIMELOCK_SECS / 15);         // ETH blocks
     private static final int  NOTIFY_SCAN_DEPTH         = 256;                               // bounded notify scan
+    private static final int  HTLC_SCAN_DEPTH           = 256;                               // bounded HTLC coin scan
     private static final BigInteger MAX_UINT = BigInteger.TWO.pow(256).subtract(BigInteger.ONE);
 
     public interface Notifier {
@@ -99,6 +101,7 @@ public final class SwapEngine {
         lastSecretBlock = -1;             // re-scan secrets from the backlog on the new chain
         lastEthScanned = -1;
         approvePending.clear();
+        EthTx.resetAll();                 // cold-start the nonce serializer against the new node's "pending"
     }
     public void setMyMinimaPk(String pk) { this.myMinimaPk = pk; }
     /** The node's full 64-key set, so refunds work for a coin locked under any default key. */
@@ -166,12 +169,13 @@ public final class SwapEngine {
                         BigInteger sellRaw = parseUnits(sellTokenAmount, token.decimals);
                         BigInteger reqRaw = parseUnits(buyMinima, 18);
                         ensureAllowanceBlocking(eth, token.address, sellRaw);
-                        long timelock = nowUnix() + TIMELOCK_SECS;
-                        String txhash = eth.newContract(myMinimaPk, maker.ethAddress, hash,
-                                BigInteger.valueOf(timelock), token.address, sellRaw, reqRaw, false);
+                        final long timelock = nowUnix() + TIMELOCK_SECS;
+                        // Record secret + swap row BEFORE the lock broadcast: if newContract MINES but its RPC
+                        // response is lost (send() throws), checkEthContractFor still finds this row in
+                        // db.allSwaps() and refunds the USDT at timelock. A row whose broadcast never landed is
+                        // a harmless phantom (getContract → null → no-op).
                         ui.post(() -> {
                             db.insertSecret(hash, secret);
-                            db.logEvent(hash, SwapDb.EV_STARTED, "ETH:" + token.address, sellTokenAmount, txhash);
                             db.insertMyHtlc(hash, buyMinima, "minima");
                             SwapDb.Swap s = baseSwap(hash, "INITIATOR", "ERC20_TO_MINIMA",
                                     tokenSymbol, sellTokenAmount, "MINIMA", buyMinima, maker.minimaPublicKey);
@@ -179,6 +183,11 @@ public final class SwapEngine {
                             s.contractId = EthHtlc.contractId(hash);
                             db.upsertSwap(s);
                             notifier.onSwapsChanged();
+                        });
+                        String txhash = eth.newContract(myMinimaPk, maker.ethAddress, hash,
+                                BigInteger.valueOf(timelock), token.address, sellRaw, reqRaw, false);
+                        ui.post(() -> {
+                            db.logEvent(hash, SwapDb.EV_STARTED, "ETH:" + token.address, sellTokenAmount, txhash);
                             cb.ok(hash);
                         });
                     } catch (Exception e) {
@@ -198,11 +207,13 @@ public final class SwapEngine {
      */
     public void confirmMyLock(String hash, boolean myLegIsMinima, ConfirmCb cb) {
         if (myLegIsMinima) {
-            minima.scanMyHtlcCoins(arr -> {
+            // My own lock, found by its hashlock at coinage:1 — one confirmation already spends the inputs, so
+            // the next sweep leg can't re-select them. Reliable state-filter scan (not relevant:true).
+            minima.scanHtlcByHash(hash, 1, HTLC_SCAN_DEPTH, arr -> {
                 boolean found = false;
                 for (int i = 0; i < arr.length(); i++) {
                     org.json.JSONObject c = arr.optJSONObject(i);
-                    if (c != null && sameHash(MinimaHtlc.stateAt(c, 5), hash)) { found = true; break; }
+                    if (c != null && isMyOwnedKey(MinimaHtlc.stateAt(c, 0)) && sameHash(MinimaHtlc.stateAt(c, 5), hash)) { found = true; break; }
                 }
                 final boolean f = found;
                 ui.post(() -> cb.done(f));
@@ -242,7 +253,7 @@ public final class SwapEngine {
         // Read the Minima side first (async node.cmd), then the ETH side (blocking, on io), then report.
         minima.currentBlock(new MinimaHtlc.BlockCb() {
             @Override public void ok(int block) {
-                minima.scanMyHtlcCoins(coins -> {
+                minima.scanHtlcByHash(hash, 2, HTLC_SCAN_DEPTH, coins -> {
                     JSONObject myMinimaCoin = null, counterMinimaCoin = null;
                     for (int i = 0; i < coins.length(); i++) {
                         JSONObject c = coins.optJSONObject(i);
@@ -344,7 +355,25 @@ public final class SwapEngine {
         for (String h : pendingSecretHashes()) {
             minima.scanNotifySecret(h, NOTIFY_SCAN_DEPTH, coins -> harvestNotifySecrets(coins), e -> {});
         }
-        minima.scanMyHtlcCoins(coins -> {
+        // CLAIM discovery — find each counter MINIMA leg I'm owed BY ITS HASHLOCK (reliable), not via
+        // relevant:true (which can miss a coin I only RECEIVE — the second-leg-of-a-sweep bug). checkCanSwapCoin's
+        // own guards (secret-known, haveCollect, inflight, amountTokenOk) are unchanged.
+        for (String h : pendingClaimMinimaHashes()) {
+            final String hh = h;
+            minima.scanHtlcByHash(h, 2, HTLC_SCAN_DEPTH, coins -> {
+                for (int i = 0; i < coins.length(); i++) {
+                    JSONObject coin = coins.optJSONObject(i);
+                    if (coin == null) continue;
+                    if (isMyPublishKey(MinimaHtlc.stateAt(coin, 4)) && sameHash(MinimaHtlc.stateAt(coin, 5), hh))
+                        checkCanSwapCoin(coin, block);      // a MINIMA leg locked to me — claim it (I hold the secret)
+                }
+            }, e -> {});
+        }
+        // RESPONDER (incoming sell-take → lock ETH counter-leg) + REFUND (my expired coins) discovery — via a
+        // state-filter scan bounded to MY key (owner state[0] or receiver state[4]): reliable like the per-hash
+        // scans AND bounded like the old relevant:true, so it adds no unbounded global-address reply. coinage:2
+        // STAYS: the maker commits real USDT against a taker's MINIMA lock, so it must be ≥2-conf (reorg guard).
+        minima.scanMyHtlcByKey(myMinimaPk, 2, HTLC_SCAN_DEPTH, coins -> {
             for (int i = 0; i < coins.length(); i++) {
                 JSONObject coin = coins.optJSONObject(i);
                 if (coin == null) continue;
@@ -359,6 +388,19 @@ public final class SwapEngine {
                 } catch (Exception ignore) {}
             }
         }, e -> {});
+    }
+
+    /** Hashes of active swaps where I must CLAIM a MINIMA counter-leg (my own leg is the ETH one): I hold the
+     *  secret and haven't collected yet. Drives the per-hash counter-leg discovery in runMinimaChecks. */
+    private java.util.List<String> pendingClaimMinimaHashes() {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        for (SwapDb.Swap s : db.allSwaps()) {
+            if (s == null || s.hash == null || s.myLegIsMinima) continue;   // my leg is ETH → I claim the MINIMA leg
+            if (SwapDb.ST_COMPLETE.equals(s.status) || SwapDb.ST_REFUNDED.equals(s.status)
+                    || SwapDb.ST_ERROR.equals(s.status)) continue;
+            if (db.getSecret(s.hash) != null && !db.haveCollect(s.hash)) out.add(s.hash);
+        }
+        return out;
     }
 
     /** Port of _checkCanSwapCoin: I am the receiver(state[4]) of a Minima HTLC coin. */
@@ -431,18 +473,23 @@ public final class SwapEngine {
             BigInteger sellRaw = parseUnits(tokenHuman, token.decimals);
             BigInteger reqRaw = parseUnits(reqMinimaHuman, 18);
             if (!approveIfReady(eth, token.address, sellRaw)) { inflight.remove("cpEth:" + hash); return; }
-            long timelock = nowUnix() + CP_SECS;
-            String txhash = eth.newContract(myMinimaPk, receiverEth, hash,
-                    BigInteger.valueOf(timelock), token.address, sellRaw, reqRaw, false);
+            final long timelock = nowUnix() + CP_SECS;
+            // Record the swap row BEFORE the lock broadcast so a mined-but-response-lost counter-leg is still
+            // found + refunded by checkEthContractFor. EV_CPSENT (→ haveSentCounterParty) stays AFTER, so a
+            // genuine pre-mine failure still retries; a mined-but-lost lock is dup-guarded by the contract.
             ui.post(() -> {
-                db.logEvent(hash, SwapDb.EV_CPSENT, "ETH:" + token.address, tokenHuman, txhash);
                 SwapDb.Swap s = baseSwap(hash, "RESPONDER", "MINIMA_TO_ERC20",
                         token.symbol, tokenHuman, "MINIMA", reqMinimaHuman, receiverEth);
                 s.myTimelock = timelock; s.myLegIsMinima = false; s.contractId = EthHtlc.contractId(hash);
                 s.status = SwapDb.ST_LOCKED;
                 db.upsertSwap(s);
-                notifier.notify("Locked your " + token.symbol, "Waiting for the counterparty to reveal the secret");
                 notifier.onSwapsChanged();
+            });
+            String txhash = eth.newContract(myMinimaPk, receiverEth, hash,
+                    BigInteger.valueOf(timelock), token.address, sellRaw, reqRaw, false);
+            ui.post(() -> {
+                db.logEvent(hash, SwapDb.EV_CPSENT, "ETH:" + token.address, tokenHuman, txhash);
+                notifier.notify("Locked your " + token.symbol, "Waiting for the counterparty to reveal the secret");
                 inflight.remove("cpEth:" + hash);
             });
         } catch (Exception e) {
