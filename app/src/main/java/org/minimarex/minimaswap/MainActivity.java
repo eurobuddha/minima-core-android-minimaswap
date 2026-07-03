@@ -86,6 +86,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String PREFS = "minimaswap";
     private static final String[] PAIR_TOKENS = Order.PAIR_TOKENS;   // single source of truth in Order
     private static final long WATCH_INTERVAL_MS = 90_000;
+    private static final long SWEEP_LEG_TIMEOUT_MS = 240_000;   // abort a sweep if a leg never calls back (> node's 180s send timeout)
     static final long REPUBLISH_INTERVAL_MS = 30 * 60_000;   // keep a published order live + fresh (bridge uses 30m)
     private static final long TERMINAL_GRACE_MS = 10 * 60_000;   // finished swaps auto-hide after this
 
@@ -118,6 +119,9 @@ public class MainActivity extends AppCompatActivity {
     private String swapAmount = "";     // Swap tab "you send" amount — persists across tree rebuilds
     private boolean swapInputFocused = false;   // suppress background render() while typing the swap amount
     private boolean swapSyncing = false;        // guard so the send/receive fields don't loop while syncing
+    private SweepPlan sweepRun = null;          // non-null while a multi-leg market sweep is executing
+    private int sweepIdx = 0, sweepOk = 0;      // current leg index / legs successfully locked
+    private Runnable sweepWatchdog = null;      // aborts a sweep whose current leg never calls back
     private static final int USDT_TEAL = 0xFF26A69A;
     private static final int STG_PENDING = 0, STG_ACTIVE = 1, STG_DONE = 2, STG_WARN = 3;
     private static final int STAGE_WARN_COLOR = 0xFFE6A23C;
@@ -155,13 +159,16 @@ public class MainActivity extends AppCompatActivity {
     private boolean serviceStarted = false;
     /** True while the Activity is resumed — the SwapService stands down then so only one polls. */
     public static volatile boolean FOREGROUND = false;
+    public static volatile boolean SWEEP_ACTIVE = false;   // a market sweep owns the wire — SwapService must also stand down
 
     private final Runnable watchTick = new Runnable() {
         @Override public void run() {
-            if (engine != null) engine.poll();
-            refreshBalances(false);                 // keep balances current without a restart
-            maybeAutoRepublish();                   // keep a live order fresh (~30 min)
-            scanTakeRequests();                      // receive buyers' hashlock handshakes
+            if (sweepRun == null) {                  // stand down mid-sweep — a poll-driven ETH claim or a
+                if (engine != null) engine.poll();   // republish could grab the same "pending" nonce / MINIMA
+                maybeAutoRepublish();                //  coins as a sweep leg and collide (legs must own the wire)
+            }
+            refreshBalances(false);                 // keep balances current without a restart (read-only, always safe)
+            scanTakeRequests();                      // receive buyers' hashlock handshakes (scan/add only, no tx)
             ui.postDelayed(this, WATCH_INTERVAL_MS);
         }
     };
@@ -926,33 +933,100 @@ public class MainActivity extends AppCompatActivity {
 
     private void startSwap(Order maker, String symbol, boolean sellMinima, String minima, String usdt) {
         orderStatus = "Starting swap…"; render();
-        SwapEngine.StartCb cb = new SwapEngine.StartCb() {
+        startLeg(maker, symbol, sellMinima, minima, usdt, new SwapEngine.StartCb() {
             @Override public void ok(String hash) {
                 orderStatus = "✓ Swap started — leg 1 locked. Watching for the counterparty.";
                 render(); engine.poll();
             }
             @Override public void err(String msg) { orderStatus = "Swap failed: " + msg; render(); }
-        };
+        });
+    }
+
+    /**
+     * Start ONE atomic swap leg (both directions), invoking {@code legCb} once the first-leg lock is placed
+     * ({@code ok(hash)}) or on failure ({@code err}). Shared by the single-swap path and each sweep leg. For
+     * BUYs it also seals our hashlock to the maker after the USDT locks (so they discover it via getContract).
+     * The handshake's status messages are suppressed during a sweep so they don't clobber the sweep progress.
+     */
+    private void startLeg(Order maker, String symbol, boolean sellMinima, String minima, String usdt, SwapEngine.StartCb legCb) {
         if (sellMinima) {
             // give MINIMA (minima), receive USDT (usdt) → MINIMA→ERC20
-            engine.startMinimaToErc20(maker, minima, symbol, usdt, cb);
+            engine.startMinimaToErc20(maker, minima, symbol, usdt, legCb);
         } else {
-            // give USDT (usdt), receive MINIMA (minima) → ERC20→MINIMA. After the USDT locks, hand the maker
-            // our hashlock (sealed) so it can discover the lock via getContract instead of eth_getLogs.
+            // give USDT (usdt), receive MINIMA (minima) → ERC20→MINIMA, then hand the maker our sealed hashlock.
             engine.startErc20ToMinima(maker, symbol, usdt, minima, new SwapEngine.StartCb() {
                 @Override public void ok(String hash) {
-                    cb.ok(hash);
+                    legCb.ok(hash);
                     if (crypto == null || maker.commsPublicId == null || maker.commsPublicId.isEmpty()) {
-                        orderStatus = "✓ Buy started, but the maker's contact key is missing — they may not see it."; render(); return;
+                        if (sweepRun == null) { orderStatus = "✓ Buy started, but the maker's contact key is missing — they may not see it."; render(); }
+                        return;
                     }
                     SwapTake.send(node, crypto, maker.commsPublicId, identity.publicId(), hash, new CommsTransport.SendCb() {
-                        @Override public void onSent(String txpowid) { orderStatus = "✓ Buy started — maker notified, watching."; render(); }
-                        @Override public void onFailed(String message) { orderStatus = "Buy locked, but maker notify failed: " + message; render(); }
+                        @Override public void onSent(String txpowid) { if (sweepRun == null) { orderStatus = "✓ Buy started — maker notified, watching."; render(); } }
+                        @Override public void onFailed(String message) { if (sweepRun == null) { orderStatus = "Buy locked, but maker notify failed: " + message; render(); } }
                     });
                 }
-                @Override public void err(String msg) { cb.err(msg); }
+                @Override public void err(String msg) { legCb.err(msg); }
             });
         }
+    }
+
+    // ---- sequential sweep executor: fire leg N+1 ONLY from leg N's ok (never parallel — coin/nonce safety) ----
+
+    private void startSweep(SweepPlan plan) {
+        if (plan == null || plan.legs.isEmpty()) return;
+        sweepRun = plan; sweepIdx = 0; sweepOk = 0;
+        SWEEP_ACTIVE = true;   // both the Activity watcher AND SwapService now stand down (ETH-nonce / MINIMA-coin safety)
+        fireSweepLeg();
+    }
+
+    /** Tear a sweep down (done, failed, or stalled): stop the watchdog, release the wire, resume normal polling. */
+    private void endSweep() {
+        sweepRun = null; SWEEP_ACTIVE = false;
+        if (sweepWatchdog != null) { ui.removeCallbacks(sweepWatchdog); sweepWatchdog = null; }
+        render(); if (engine != null) engine.poll();
+    }
+
+    private void fireSweepLeg() {
+        if (sweepRun == null) return;
+        final int total = sweepRun.legs.size();
+        if (sweepIdx >= total) {
+            orderStatus = "✓ Sweep started — " + sweepOk + " of " + total + " parts locked. Watching for counterparties.";
+            endSweep();
+            return;
+        }
+        final SweepLeg leg = sweepRun.legs.get(sweepIdx);
+        final boolean sell = sweepRun.sell;
+        final int shown = sweepIdx + 1;
+        orderStatus = "Sweeping — locking part " + shown + " of " + total + "…"; render();
+
+        // Watchdog: if THIS leg neither ok's nor err's (e.g. a node hang drops the callback), release the wire so
+        // claim/refund polling resumes — a stuck sweepRun would otherwise starve every in-flight swap indefinitely.
+        if (sweepWatchdog != null) ui.removeCallbacks(sweepWatchdog);
+        final int idxAtStart = sweepIdx;
+        sweepWatchdog = () -> {
+            if (sweepRun != null && sweepIdx == idxAtStart) {
+                orderStatus = "Sweep stalled at part " + shown + " (no response) — stopped. Locked parts continue; unmatched auto-refund.";
+                endSweep();
+            }
+        };
+        ui.postDelayed(sweepWatchdog, SWEEP_LEG_TIMEOUT_MS);
+
+        startLeg(leg.maker, "USDT", sell, leg.minima, leg.usdt, new SwapEngine.StartCb() {
+            @Override public void ok(String hash) {
+                if (sweepRun == null || sweepIdx != idxAtStart) return;   // already torn down (watchdog/err) — ignore late callback
+                sweepOk++; sweepIdx++;
+                orderStatus = "✓ Part " + shown + "/" + total + " locked" + (sweepIdx < total ? " — starting part " + (sweepIdx + 1) + "…" : ".");
+                render();
+                fireSweepLeg();   // NEXT lock ONLY from prior ok — the sequential coin/nonce guarantee
+            }
+            @Override public void err(String msg) {
+                if (sweepRun == null || sweepIdx != idxAtStart) return;
+                orderStatus = "Sweep stopped — filled " + sweepOk + " of " + total + " parts (part " + shown
+                        + " failed: " + msg + "). Locked parts continue; unmatched auto-refund.";
+                endSweep();
+            }
+        });
     }
 
     // ---- UI ----
@@ -1241,17 +1315,20 @@ public class MainActivity extends AppCompatActivity {
             swapAmount = amt.getText().toString();
         }));
 
-        // best price line — cap is the best level's per-take size (ladder-aware), not the maker's whole balance
-        double size = sellMinima ? best.bidCap : best.askCap;
+        // best price line — best-level cap, plus total sweepable depth across the book (larger orders sweep)
+        double bestCap = sellMinima ? best.bidCap : best.askCap;
+        double depth = sweepDepthMinima(sellMinima);
         TextView bp = new TextView(this);
-        bp.setText("Best price " + fmtPrice(price) + " USDT/MINIMA  ·  up to ~" + abbrev(size) + " MINIMA" + (sellMinima ? "" : "  ·  ETH gas ~from your ETH balance"));
+        bp.setText("Best price " + fmtPrice(price) + " USDT/MINIMA  ·  up to ~" + abbrev(bestCap) + " at best"
+                + (depth > bestCap + 1e-9 ? ", ~" + abbrev(depth) + " across the book" : "")
+                + (sellMinima ? "" : "  ·  ETH gas per part"));
         bp.setTextColor(Design.DIM2()); bp.setTextSize(11.5f); bp.setTypeface(Design.sans()); bp.setPadding(0, dp(12), 0, 0);
         card.addView(bp);
 
         TextView cta = button("Review swap");
         LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         blp.topMargin = dp(16); cta.setLayoutParams(blp);
-        cta.setOnClickListener(v -> reviewSwap(maker, sellMinima, amt.getText().toString().trim(), price, sellMinima ? best.bidCap : best.askCap));
+        cta.setOnClickListener(v -> onSwapCta(sellMinima, amt.getText().toString().trim(), best));
         card.addView(cta);
 
         col.addView(card);
@@ -1331,6 +1408,109 @@ public class MainActivity extends AppCompatActivity {
                 .setTitle(sellMinima ? "Review — Sell MINIMA" : "Review — Buy MINIMA")
                 .setMessage(msg)
                 .setPositiveButton("Start swap", (d, w) -> { swapAmount = ""; startSwap(maker, "USDT", sellMinima, minima, usdt); })
+                .setNegativeButton("Cancel", null)
+                .setOnDismissListener(d -> { modalOpen = false; render(); })
+                .show();
+    }
+
+    /** Route the Swap-tab CTA: size within the best level → today's single swap; larger → market sweep. */
+    private void onSwapCta(boolean sell, String sendStr, Best best) {
+        swapInputFocused = false;   // leaving the amount field — panel re-renders live from here (0.8.1 lesson)
+        if (sendStr.isEmpty()) { toast("Enter an amount to " + (sell ? "sell" : "spend")); return; }
+        final Order bestMaker = sell ? best.bidMaker : best.askMaker;
+        final double bestPrice = sell ? best.bestBid : best.bestAsk;
+        final double bestCap = sell ? best.bidCap : best.askCap;   // MINIMA
+        if (bestMaker == null || bestPrice <= 0) { toast("No quote available right now."); return; }
+        final double EPS = 1e-9;
+
+        boolean fitsBest;
+        if (sell) {
+            fitsBest = parseD(sendStr, 0) <= bestCap + EPS;
+        } else {
+            String capUsdt = computeUsdt(trim(bestCap), bestPrice);
+            fitsBest = parseD(sendStr, 0) <= (capUsdt == null ? 0 : parseD(capUsdt, 0)) + EPS;
+        }
+        if (fitsBest) { reviewSwap(bestMaker, sell, sendStr, bestPrice, bestCap); return; }   // today's single path
+
+        // Sweep amplifies partial-lock risk (multiple sequential locks of MY funds) — don't plan beyond what I hold.
+        if (sell && parseD(sendStr, 0) > parseD(minimaBal, 0) + EPS) {
+            toast("You only have ~" + abbrev(parseD(minimaBal, 0)) + " MINIMA available to sell."); return;
+        }
+        if (!sell && parseD(sendStr, 0) > parseD(Util.tidyAmount(tokenBals.get("USDT")), 0) + EPS) {
+            toast("You only have ~" + trim(parseD(Util.tidyAmount(tokenBals.get("USDT")), 0)) + " USDT available to spend."); return;
+        }
+
+        SweepPlan plan = buildSweepPlan(sell, sendStr);
+        if (plan.legs.isEmpty()) { toast(sweepEmptyMsg(plan)); return; }
+        reviewSweep(plan);
+    }
+
+    private String sweepEmptyMsg(SweepPlan p) {
+        if ("below-min".equals(p.stopReason)) return "That's below the makers' minimum trade size.";
+        return "No liquidity available to fill that right now.";
+    }
+
+    /** Review a multi-leg market sweep: blended avg/worst price, per-leg breakdown, totals, partial-fill note. */
+    private void reviewSweep(SweepPlan plan) {
+        if (plan == null || plan.legs.isEmpty()) { toast("Nothing available to fill right now."); return; }
+        final boolean sell = plan.sell;
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(12), dp(20), dp(4));
+
+        TextView head = new TextView(this);
+        head.setText(sell
+                ? ("Sell " + abbrev(plan.filledMinima) + " MINIMA in " + plan.legs.size() + (plan.legs.size() == 1 ? " part" : " parts"))
+                : ("Buy ≈ " + abbrev(plan.filledMinima) + " MINIMA for ≈ " + trimSig(plan.totalUsdt) + " USDT in " + plan.legs.size() + (plan.legs.size() == 1 ? " part" : " parts")));
+        head.setTextColor(Design.TEXT()); head.setTextSize(15f); head.setTypeface(Design.sansBold()); head.setPadding(0, 0, 0, dp(6));
+        box.addView(head);
+
+        TextView metrics = new TextView(this);
+        metrics.setText("Avg " + fmtPrice(plan.avgPrice) + "  ·  worst " + fmtPrice(plan.worstPrice) + " USDT/MINIMA");
+        metrics.setTextColor(Design.DIM()); metrics.setTextSize(12.5f); metrics.setTypeface(Design.sans()); metrics.setPadding(0, 0, 0, dp(8));
+        box.addView(metrics);
+
+        for (int i = 0; i < plan.legs.size(); i++) {
+            SweepLeg leg = plan.legs.get(i);
+            TextView r = new TextView(this);
+            r.setText("Part " + (i + 1) + " · " + leg.minima + " MINIMA @ " + fmtPrice(leg.price) + " → " + leg.usdt + " USDT · " + shortAddr(leg.maker.signerPk));
+            r.setTextColor(Design.TEXT()); r.setTextSize(12f); r.setTypeface(Design.mono()); r.setPadding(0, dp(2), 0, dp(2));
+            box.addView(r);
+        }
+
+        TextView totals = new TextView(this);
+        totals.setText(sell
+                ? ("Total: sell " + trimSig(plan.filledMinima) + " MINIMA · receive ≈ " + trimSig(plan.totalUsdt) + " USDT")
+                : ("Total: pay ≈ " + trimSig(plan.totalUsdt) + " USDT · receive ≈ " + trimSig(plan.filledMinima) + " MINIMA"));
+        totals.setTextColor(Design.ACCENT()); totals.setTextSize(12.5f); totals.setTypeface(Design.sansBold()); totals.setPadding(0, dp(8), 0, dp(2));
+        box.addView(totals);
+
+        if (plan.partial) {
+            TextView pw = new TextView(this);
+            pw.setText(sell
+                    ? ("Fills " + abbrev(plan.filledMinima) + " of " + abbrev(plan.target) + " MINIMA — the rest isn't available right now.")
+                    : ("Uses ≈ " + trimSig(plan.totalUsdt) + " of " + trimSig(plan.target) + " USDT — the book isn't deep enough for the rest right now."));
+            pw.setTextColor(Design.RED()); pw.setTextSize(12f); pw.setTypeface(Design.sans()); pw.setLineSpacing(dp(2), 1f); pw.setPadding(0, dp(8), 0, dp(2));
+            box.addView(pw);
+        }
+
+        if (!sell) {
+            TextView gas = new TextView(this);
+            gas.setText("Each part is a separate Ethereum transaction — you pay ETH gas " + plan.legs.size() + " times.");
+            gas.setTextColor(Design.DIM2()); gas.setTextSize(11.5f); gas.setTypeface(Design.sans()); gas.setPadding(0, dp(8), 0, dp(2));
+            box.addView(gas);
+        }
+
+        TextView note = new TextView(this);
+        note.setText("Parts run one at a time. If one can't start we stop and you keep the rest; unmatched parts auto-refund after the timelock.");
+        note.setTextColor(Design.DIM2()); note.setTextSize(11.5f); note.setTypeface(Design.sans()); note.setLineSpacing(dp(2), 1f); note.setPadding(0, dp(8), 0, dp(2));
+        box.addView(note);
+
+        modalOpen = true;
+        dialog()
+                .setTitle(sell ? "Review — Sweep sell" : "Review — Sweep buy")
+                .setView(wrapScroll(box))
+                .setPositiveButton("Start sweep", (d, w) -> { swapAmount = ""; startSweep(plan); })
                 .setNegativeButton("Cancel", null)
                 .setOnDismissListener(d -> { modalOpen = false; render(); })
                 .show();
@@ -1489,6 +1669,121 @@ public class MainActivity extends AppCompatActivity {
         }
         if (r.askMaker == null) r.bestAsk = 0;   // normalize "none" to 0 for callers
         return r;
+    }
+
+    // ---- market sweep: split a large order across consecutive book levels, each an independent atomic swap ----
+
+    /** One planned leg = one atomic swap against a specific maker+price. */
+    private static final class SweepLeg {
+        final Order maker; final double price; final String minima, usdt; final double minimaD, usdtD;
+        SweepLeg(Order maker, double price, String minima, String usdt) {
+            this.maker = maker; this.price = price; this.minima = minima; this.usdt = usdt;
+            this.minimaD = parseD(minima, 0); this.usdtD = parseD(usdt, 0);
+        }
+    }
+    private static final class SweepPlan {
+        final boolean sell; final java.util.List<SweepLeg> legs = new java.util.ArrayList<>();
+        double target, filledMinima, totalUsdt, avgPrice, worstPrice;
+        boolean partial; String stopReason = "filled";   // filled | leg-cap | book-exhausted | below-min
+        SweepPlan(boolean sell) { this.sell = sell; }
+    }
+
+    /** Round a MINIMA quantity DOWN to 8dp (never over a level's cap) and tidy it for the wire. */
+    private static String legMinima(double v) {
+        return Util.tidyAmount(BigDecimal.valueOf(v).setScale(8, RoundingMode.DOWN).stripTrailingZeros().toPlainString());
+    }
+
+    /** Round a USDT amount DOWN to 6dp (never over budget) and tidy it; null if it collapses to zero. */
+    private static String floorUsdt(double v) {
+        if (v <= 0) return null;
+        String s = Util.tidyAmount(BigDecimal.valueOf(v).setScale(6, RoundingMode.DOWN).stripTrailingZeros().toPlainString());
+        return (s.isEmpty() || "0".equals(s)) ? null : s;
+    }
+
+    /**
+     * Walk the book best-price-first, splitting a large order into up to {@link Order#MAX_LEVELS} per-level legs.
+     * SELL is size-driven (send = MINIMA to sell); BUY is BUDGET-driven (send = USDT to spend) so the total
+     * spent never exceeds what the user typed even as deeper legs cost more. Each leg is clamped to the maker's
+     * display cap AND a per-maker running balance (so two tranches of one maker can't over-allocate). Never emits
+     * a sub-min leg. Excludes my own orders.
+     */
+    private SweepPlan buildSweepPlan(boolean sell, String sendAmountStr) {
+        final String sym = "USDT";
+        final double EPS = 1e-9;
+        SweepPlan plan = new SweepPlan(sell);
+        double target = parseD(sendAmountStr, 0);   // sell: MINIMA size; buy: USDT budget
+        plan.target = target;
+        if (target <= 0) { plan.stopReason = "book-exhausted"; return plan; }
+        // Ignore an unfillable rounding remainder (per-leg amounts round DOWN, so a few dust units always linger).
+        final double dust = Math.max(EPS, target * 1e-4);
+
+        java.util.Map<Order, Double> remUsdt = new java.util.HashMap<>();     // maker's remaining USDT balance
+        java.util.Map<Order, Double> remMinima = new java.util.HashMap<>();   // maker's remaining MINIMA balance
+        double remaining = target;                                           // sell: MINIMA left; buy: USDT budget left
+
+        for (Object[] row : aggSide(sym, sell, true)) {
+            if (plan.legs.size() >= Order.MAX_LEVELS) { plan.stopReason = "leg-cap"; plan.partial = true; break; }
+            if (remaining <= dust) break;
+            Order maker = (Order) row[0];
+            Order.Level lvl = (Order.Level) row[1];
+            double price = lvl.price;
+            if (price <= 0) continue;
+            Order.Pair pr = maker.pairs.get(sym);
+            double mn = pr != null ? pr.min : 0;
+
+            double capMinima;
+            if (sell) {   // maker BUYS my MINIMA with USDT → cap by their remaining USDT / price
+                double ru = remUsdt.containsKey(maker) ? remUsdt.get(maker) : maker.usdtAvail;
+                capMinima = Math.min(lvl.amount, price > 0 ? ru / price : 0);
+            } else {      // maker SELLS MINIMA → cap by their remaining MINIMA
+                double rm = remMinima.containsKey(maker) ? remMinima.get(maker) : maker.minimaAvail;
+                capMinima = Math.min(lvl.amount, rm);
+            }
+            if (capMinima <= EPS) continue;
+
+            double takeMinima = sell ? Math.min(capMinima, remaining) : Math.min(capMinima, remaining / price);
+            if (takeMinima <= EPS) continue;
+
+            if (mn > 0 && takeMinima < mn - EPS) {   // never emit a sub-min leg (the maker would auto-decline)
+                boolean remainderTooSmall = sell ? (remaining < mn - EPS) : (remaining / price < mn - EPS);
+                if (remainderTooSmall) { plan.stopReason = "below-min"; plan.partial = true; break; }
+                continue;   // this level can't honor its own maker's min → skip it, try deeper
+            }
+
+            // Build the leg so the maker's guard ALWAYS accepts. SELL: lock MINIMA, request usdt = floor6(minima×bid)
+            // → recvMinima×bid ≥ usdt ✓. BUY: lock USDT, derive minima = floor8(usdt/ask) DOWN → recvUsdt ≥ minima×ask
+            // ✓ (mirrors the single-swap path). Rounding the OTHER way makes the maker silently auto-decline the leg.
+            String minimaStr, usdtStr;
+            if (sell) {
+                minimaStr = legMinima(takeMinima);
+                usdtStr = computeUsdt(minimaStr, price);
+            } else {
+                usdtStr = floorUsdt(Math.min(remaining, takeMinima * price));   // budget- & cap-bounded USDT to lock
+                if (usdtStr == null) continue;
+                minimaStr = computeMinima(usdtStr, price);
+            }
+            if (minimaStr == null || usdtStr == null) continue;
+            SweepLeg leg = new SweepLeg(maker, price, minimaStr, usdtStr);
+            if (leg.minimaD <= EPS || leg.usdtD <= EPS) continue;
+            if (mn > 0 && leg.minimaD < mn - EPS) continue;   // rounding pushed this sliver below the maker's min — skip
+            plan.legs.add(leg);
+            plan.filledMinima += leg.minimaD;
+            plan.totalUsdt += leg.usdtD;
+            plan.worstPrice = price;   // best-first → the last added is the worst price
+            if (sell) remUsdt.put(maker, (remUsdt.containsKey(maker) ? remUsdt.get(maker) : maker.usdtAvail) - leg.usdtD);
+            else      remMinima.put(maker, (remMinima.containsKey(maker) ? remMinima.get(maker) : maker.minimaAvail) - leg.minimaD);
+            remaining -= sell ? leg.minimaD : leg.usdtD;
+        }
+
+        if (remaining > dust) plan.partial = true;   // dust-tolerant: a sub-0.01% remainder counts as filled
+        if (plan.partial && "filled".equals(plan.stopReason)) plan.stopReason = "book-exhausted";
+        plan.avgPrice = plan.filledMinima > 0 ? plan.totalUsdt / plan.filledMinima : 0;
+        return plan;
+    }
+
+    /** Total MINIMA takeable across the book (≤6 legs) on the given side — for the "up to ~X" depth hint. */
+    private double sweepDepthMinima(boolean sell) {
+        return buildSweepPlan(sell, "1000000000").filledMinima;   // huge target/budget → walks the whole depth
     }
 
     // ---- Wallet tab ----
@@ -1966,19 +2261,27 @@ public class MainActivity extends AppCompatActivity {
      * The order book as centred two-sided rows — one per maker: bidSize · bidPrice │ askPrice · askSize,
      * maker tag above. Tap the bid half to SELL MINIMA, the ask half to BUY MINIMA. Best bid/ask highlighted.
      */
+    /** {Order maker, Order.Level} rows for one side across the live book, best-price-first (sell→bids DESC,
+     *  buy→asks ASC). Legacy single-price makers contribute one synthetic level via effectiveBids/Asks.
+     *  excludeMine drops my own orders (the sweep planner never takes my own liquidity). */
+    private java.util.List<Object[]> aggSide(String sym, boolean sell, boolean excludeMine) {
+        java.util.List<Object[]> agg = new java.util.ArrayList<>();
+        for (Order o : orderBook.values()) {
+            if (excludeMine && isMine(o)) continue;
+            for (Order.Level l : (sell ? o.effectiveBids(sym) : o.effectiveAsks(sym))) agg.add(new Object[]{o, l});
+        }
+        java.util.Collections.sort(agg, (a, b) -> sell
+                ? Double.compare(((Order.Level) b[1]).price, ((Order.Level) a[1]).price)
+                : Double.compare(((Order.Level) a[1]).price, ((Order.Level) b[1]).price));
+        return agg;
+    }
+
     private void orderLadder(LinearLayout col) {
         final String sym = "USDT";
-        // Expand every maker's ladder into per-(maker,level) rows — legacy single-price makers contribute one
-        // synthetic level via effectiveBids/Asks, so 0.8.x orders appear seamlessly.
-        java.util.List<Object[]> bidsAgg = new java.util.ArrayList<>();   // {Order maker, Order.Level}
-        java.util.List<Object[]> asksAgg = new java.util.ArrayList<>();
-        for (Order o : orderBook.values()) {
-            for (Order.Level l : o.effectiveBids(sym)) bidsAgg.add(new Object[]{o, l});
-            for (Order.Level l : o.effectiveAsks(sym)) asksAgg.add(new Object[]{o, l});
-        }
+        // Display keeps my own orders (tagged "you"); the sweep planner calls aggSide with excludeMine=true.
+        java.util.List<Object[]> bidsAgg = aggSide(sym, true, false);
+        java.util.List<Object[]> asksAgg = aggSide(sym, false, false);
         if (bidsAgg.isEmpty() && asksAgg.isEmpty()) return;
-        java.util.Collections.sort(bidsAgg, (a, b) -> Double.compare(((Order.Level) b[1]).price, ((Order.Level) a[1]).price)); // bids: best (highest) first
-        java.util.Collections.sort(asksAgg, (a, b) -> Double.compare(((Order.Level) a[1]).price, ((Order.Level) b[1]).price)); // asks: best (lowest) first
 
         double bestBid = bidsAgg.isEmpty() ? 0 : ((Order.Level) bidsAgg.get(0)[1]).price;
         double bestAsk = asksAgg.isEmpty() ? 0 : ((Order.Level) asksAgg.get(0)[1]).price;

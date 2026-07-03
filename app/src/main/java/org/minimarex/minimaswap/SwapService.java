@@ -163,7 +163,9 @@ public class SwapService extends Service {
     /** 90s poll loop — stands down while the Activity is foreground (it polls then), so we never double-act. */
     private final Runnable tick = new Runnable() {
         @Override public void run() {
-            if (!MainActivity.FOREGROUND && engine != null) { engine.poll(); maybeAutoRepublish(); scanTakeRequests(); }
+            // Also stand down while the Activity is running a market sweep — its sequential legs own the ETH
+            // "pending" nonce / MINIMA coin selection, and a Service poll here could submit a colliding tx.
+            if (!MainActivity.FOREGROUND && !MainActivity.SWEEP_ACTIVE && engine != null) { engine.poll(); maybeAutoRepublish(); scanTakeRequests(); }
             h.postDelayed(this, INTERVAL_MS);
         }
     };
