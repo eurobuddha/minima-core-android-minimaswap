@@ -91,7 +91,8 @@ public class MainActivity extends AppCompatActivity {
     private static final long SWEEP_CONFIRM_INTERVAL_MS = 8_000; // poll cadence while waiting for a leg's lock to hit chain
     private static final int  SWEEP_CONFIRM_TRIES = 45;         // ~6 min budget — covers Minima coinage:2 (~150s) + slow ETH mining
     static final long REPUBLISH_INTERVAL_MS = 30 * 60_000;   // keep a published order live + fresh (bridge uses 30m)
-    private static final long TERMINAL_GRACE_MS = 10 * 60_000;   // finished swaps auto-hide after this
+    private static final long TERMINAL_GRACE_MS = 10 * 60_000;   // Activity-tab history: finished swaps auto-hide after this
+    private static final long SWAP_PANEL_GRACE_MS = 30_000;       // Swap-tab panel: a just-finished swap shows only this long, then clears
 
     private LazySodium ls;
     private NodeApi node;
@@ -1670,22 +1671,30 @@ public class MainActivity extends AppCompatActivity {
 
     /** The swap to surface on the Swap tab: most-recently-updated non-terminal swap, or one that finished
      *  within the grace window (so you see it land). */
+    /** The swap the front-page "YOUR SWAP" panel tracks: an IN-FLIGHT swap first (so a sweep shows its still-active
+     *  leg, not a finished one); else a JUST-finished one, briefly, so it doesn't linger once funds have confirmed. */
     private SwapDb.Swap latestRelevantSwap() {
         if (db == null) return null;
-        SwapDb.Swap pick = null;
+        SwapDb.Swap active = null, recentDone = null;
         long now = System.currentTimeMillis();
+        java.util.Set<String> dismissed = dismissedSwaps();
         for (SwapDb.Swap s : db.allSwaps()) {
-            if (isTerminal(s) && now - s.updated > TERMINAL_GRACE_MS) continue;
-            if (pick == null || s.created > pick.created) pick = s;   // the swap the user most recently started
+            if (dismissed.contains(s.hash)) continue;   // user hid it — keep it out of the front-page panel
+            if (!isTerminal(s)) {
+                if (active == null || s.created > active.created) active = s;
+            } else if (now - s.updated <= SWAP_PANEL_GRACE_MS) {
+                if (recentDone == null || s.updated > recentDone.updated) recentDone = s;
+            }
         }
-        return pick;
+        return active != null ? active : recentDone;   // in-flight first; else a just-finished one (~30s); else null → fresh prompt
     }
 
     /** Count of swaps still in flight (non-terminal) — used to hint at concurrent swaps. */
     private int activeSwapCount() {
         if (db == null) return 0;
         int n = 0;
-        for (SwapDb.Swap s : db.allSwaps()) if (!isTerminal(s)) n++;
+        java.util.Set<String> dismissed = dismissedSwaps();
+        for (SwapDb.Swap s : db.allSwaps()) if (!isTerminal(s) && !dismissed.contains(s.hash)) n++;
         return n;
     }
 
@@ -1967,7 +1976,7 @@ public class MainActivity extends AppCompatActivity {
         List<SwapDb.Swap> show = new java.util.ArrayList<>();
         int hidden = 0;
         for (SwapDb.Swap s : db.allSwaps()) {
-            if (isTerminal(s) && (dismissed.contains(s.hash) || now - s.updated > TERMINAL_GRACE_MS)) { hidden++; continue; }
+            if (dismissed.contains(s.hash) || (isTerminal(s) && now - s.updated > TERMINAL_GRACE_MS)) { hidden++; continue; }
             show.add(s);
         }
         if (show.isEmpty() && hidden == 0) return;
@@ -2147,6 +2156,19 @@ public class MainActivity extends AppCompatActivity {
         render();
     }
 
+    /** Hide a still-open swap card (e.g. one stuck because its lock never landed). UI-ONLY: the engine keeps
+     *  driving the underlying swap, so any funds actually locked on-chain still auto-refund at their timelock. */
+    private void confirmHideSwap(String hash) {
+        modalOpen = true;
+        dialog()
+                .setTitle("Hide this swap?")
+                .setMessage("This only removes the card. If any funds were locked on-chain they still auto-refund at the timelock — hiding doesn't touch them.")
+                .setPositiveButton("Hide", (d, w) -> dismissSwap(hash))
+                .setNegativeButton("Cancel", null)
+                .setOnDismissListener(d -> { modalOpen = false; render(); })
+                .show();
+    }
+
     private LinearLayout swapCard(SwapDb.Swap s) {
         LinearLayout c = new LinearLayout(this);
         c.setOrientation(LinearLayout.VERTICAL);
@@ -2162,11 +2184,12 @@ public class MainActivity extends AppCompatActivity {
         line.setTextColor(Design.TEXT()); line.setTextSize(14f); line.setTypeface(Design.mono());
         top.addView(line, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         top.addView(Design.pill(this, statusLabel(s), statusBg(s), statusFg(s)));
-        if (isTerminal(s)) {
+        {
             TextView x = Design.pill(this, "✕", Design.SURFACE2(), Design.DIM());
             LinearLayout.LayoutParams xlp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
             xlp.leftMargin = dp(6); x.setLayoutParams(xlp);
-            x.setOnClickListener(v -> dismissSwap(s.hash));
+            // terminal → dismiss immediately; still-open (e.g. a stuck swap whose lock never landed) → confirm first.
+            x.setOnClickListener(v -> { if (isTerminal(s)) dismissSwap(s.hash); else confirmHideSwap(s.hash); });
             top.addView(x);
         }
         c.addView(top);
@@ -2609,7 +2632,12 @@ public class MainActivity extends AppCompatActivity {
 
     private final SwapEngine.Notifier notifier = new SwapEngine.Notifier() {
         @Override public void notify(String title, String body) { ui.post(() -> postNotification(title, body)); }
-        @Override public void onSwapsChanged() { ui.post(() -> { render(); if (!checkForNewCompletion()) refreshBalances(false); }); }   // completion → pulse+reload; other moves → silent refresh
+        @Override public void onSwapsChanged() { ui.post(() -> {
+            // Drop the sticky action line ("Buy started — maker notified" / "Sweep done…") once everything has settled.
+            if (sweepRun == null && activeSwapCount() == 0) orderStatus = null;
+            render();
+            if (!checkForNewCompletion()) refreshBalances(false);   // completion → pulse+reload; other moves → silent refresh
+        }); }
     };
 
     private void postNotification(String title, String body) {
