@@ -1366,10 +1366,26 @@ public class MainActivity extends AppCompatActivity {
         bp.setTextColor(Design.DIM2()); bp.setTextSize(11.5f); bp.setTypeface(Design.sans()); bp.setPadding(0, dp(12), 0, 0);
         card.addView(bp);
 
+        // BUY slippage tolerance — the most above best you'll pay per MINIMA when filling across deeper levels.
+        if (!sellMinima) {
+            double curPct = buySlippage() * 100;
+            boolean is2 = Math.abs(curPct - 2) < 0.001, is42 = Math.abs(curPct - 4.2) < 0.001;
+            LinearLayout slip = new LinearLayout(this);
+            slip.setOrientation(LinearLayout.HORIZONTAL); slip.setGravity(Gravity.CENTER_VERTICAL);
+            LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            slp.topMargin = dp(10); slip.setLayoutParams(slp);
+            TextView lbl = new TextView(this); lbl.setText("Max slippage"); lbl.setTextColor(Design.DIM()); lbl.setTextSize(11.5f); lbl.setTypeface(Design.sans());
+            slip.addView(lbl);
+            slip.addView(slipPill("2%", is2, () -> setBuySlippage(2)));
+            slip.addView(slipPill("4.2%", is42, () -> setBuySlippage(4.2)));
+            slip.addView(slipPill((!is2 && !is42) ? pctStr(curPct) + "%" : "Custom", !is2 && !is42, this::customSlippageDialog));
+            card.addView(slip);
+        }
+
         TextView cta = button("Review swap");
         LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         blp.topMargin = dp(16); cta.setLayoutParams(blp);
-        cta.setOnClickListener(v -> onSwapCta(sellMinima, amt.getText().toString().trim(), best));
+        cta.setOnClickListener(v -> onSwapCta(sellMinima, (sellMinima ? amt : recv).getText().toString().trim(), best));   // MINIMA-side field
         card.addView(cta);
 
         col.addView(card);
@@ -1455,34 +1471,37 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /** Route the Swap-tab CTA: size within the best level → today's single swap; larger → market sweep. */
-    private void onSwapCta(boolean sell, String sendStr, Best best) {
+    /** {@code minimaStr} is the MINIMA amount to sell / to buy (the MINIMA-side field). */
+    private void onSwapCta(boolean sell, String minimaStr, Best best) {
         swapInputFocused = false;   // leaving the amount field — panel re-renders live from here (0.8.1 lesson)
-        if (sendStr.isEmpty()) { toast("Enter an amount to " + (sell ? "sell" : "spend")); return; }
+        if (minimaStr.isEmpty()) { toast("Enter how much MINIMA to " + (sell ? "sell" : "buy")); return; }
         final Order bestMaker = sell ? best.bidMaker : best.askMaker;
         final double bestPrice = sell ? best.bestBid : best.bestAsk;
         final double bestCap = sell ? best.bidCap : best.askCap;   // MINIMA
         if (bestMaker == null || bestPrice <= 0) { toast("No quote available right now."); return; }
         final double EPS = 1e-9;
+        final double want = parseD(minimaStr, 0);
+        if (want <= 0) { toast("Enter a valid MINIMA amount."); return; }
 
-        boolean fitsBest;
         if (sell) {
-            fitsBest = parseD(sendStr, 0) <= bestCap + EPS;
-        } else {
-            String capUsdt = computeUsdt(trim(bestCap), bestPrice);
-            fitsBest = parseD(sendStr, 0) <= (capUsdt == null ? 0 : parseD(capUsdt, 0)) + EPS;
-        }
-        if (fitsBest) { reviewSwap(bestMaker, sell, sendStr, bestPrice, bestCap); return; }   // today's single path
-
-        // Sweep amplifies partial-lock risk (multiple sequential locks of MY funds) — don't plan beyond what I hold.
-        if (sell && parseD(sendStr, 0) > parseD(minimaBal, 0) + EPS) {
-            toast("You only have ~" + abbrev(parseD(minimaBal, 0)) + " MINIMA available to sell."); return;
-        }
-        if (!sell && parseD(sendStr, 0) > parseD(Util.tidyAmount(tokenBals.get("USDT")), 0) + EPS) {
-            toast("You only have ~" + trim(parseD(Util.tidyAmount(tokenBals.get("USDT")), 0)) + " USDT available to spend."); return;
+            if (want > parseD(minimaBal, 0) + EPS) {
+                toast("You only have ~" + abbrev(parseD(minimaBal, 0)) + " MINIMA available to sell."); return;
+            }
+            if (want <= bestCap + EPS) { reviewSwap(bestMaker, true, minimaStr, bestPrice, bestCap); return; }   // single (send = MINIMA)
+            SweepPlan plan = buildSweepPlan(true, minimaStr, 0);
+            if (plan.legs.isEmpty()) { toast(sweepEmptyMsg(plan)); return; }
+            reviewSweep(plan);
+            return;
         }
 
-        SweepPlan plan = buildSweepPlan(sell, sendStr);
+        // BUY: target-driven with slippage — deliver `want` MINIMA across asks priced ≤ best × (1+slippage).
+        SweepPlan plan = buildSweepPlan(false, minimaStr, buySlippage());
         if (plan.legs.isEmpty()) { toast(sweepEmptyMsg(plan)); return; }
+        double haveUsdt = parseD(Util.tidyAmount(tokenBals.get("USDT")), 0);
+        if (plan.totalUsdt > haveUsdt + EPS) {
+            toast("Need ≈ " + trimSig(plan.totalUsdt) + " USDT for " + abbrev(plan.filledMinima) + " MINIMA (within "
+                    + pctStr(buySlippage() * 100) + "%) — you have " + trimSig(haveUsdt) + "."); return;
+        }
         reviewSweep(plan);
     }
 
@@ -1507,7 +1526,8 @@ public class MainActivity extends AppCompatActivity {
         box.addView(head);
 
         TextView metrics = new TextView(this);
-        metrics.setText("Avg " + fmtPrice(plan.avgPrice) + "  ·  worst " + fmtPrice(plan.worstPrice) + " USDT/MINIMA");
+        metrics.setText("Avg " + fmtPrice(plan.avgPrice) + "  ·  worst " + fmtPrice(plan.worstPrice) + " USDT/MINIMA"
+                + (!sell && plan.slippagePct > 0 ? "  ·  within " + pctStr(plan.slippagePct) + "% slippage" : ""));
         metrics.setTextColor(Design.DIM()); metrics.setTextSize(12.5f); metrics.setTypeface(Design.sans()); metrics.setPadding(0, 0, 0, dp(8));
         box.addView(metrics);
 
@@ -1528,9 +1548,12 @@ public class MainActivity extends AppCompatActivity {
 
         if (plan.partial) {
             TextView pw = new TextView(this);
-            pw.setText(sell
-                    ? ("Fills " + abbrev(plan.filledMinima) + " of " + abbrev(plan.target) + " MINIMA — the rest isn't available right now.")
-                    : ("Uses ≈ " + trimSig(plan.totalUsdt) + " of " + trimSig(plan.target) + " USDT — the book isn't deep enough for the rest right now."));
+            String msg = "Fills " + abbrev(plan.filledMinima) + " of " + abbrev(plan.target) + " MINIMA — ";
+            if (!sell && "slippage".equals(plan.stopReason))
+                msg += "the rest is priced beyond your " + pctStr(plan.slippagePct) + "% slippage.";
+            else
+                msg += "the rest isn't available in the book right now.";
+            pw.setText(msg);
             pw.setTextColor(Design.RED()); pw.setTextSize(12f); pw.setTypeface(Design.sans()); pw.setLineSpacing(dp(2), 1f); pw.setPadding(0, dp(8), 0, dp(2));
             box.addView(pw);
         }
@@ -1732,8 +1755,8 @@ public class MainActivity extends AppCompatActivity {
     }
     private static final class SweepPlan {
         final boolean sell; final java.util.List<SweepLeg> legs = new java.util.ArrayList<>();
-        double target, filledMinima, totalUsdt, avgPrice, worstPrice;
-        boolean partial; String stopReason = "filled";   // filled | leg-cap | book-exhausted | below-min
+        double target, filledMinima, totalUsdt, avgPrice, worstPrice, slippagePct;
+        boolean partial; String stopReason = "filled";   // filled | leg-cap | book-exhausted | below-min | slippage
         SweepPlan(boolean sell) { this.sell = sell; }
     }
 
@@ -1743,10 +1766,22 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /** Round a USDT amount DOWN to 6dp (never over budget) and tidy it; null if it collapses to zero. */
-    private static String floorUsdt(double v) {
-        if (v <= 0) return null;
-        String s = Util.tidyAmount(BigDecimal.valueOf(v).setScale(6, RoundingMode.DOWN).stripTrailingZeros().toPlainString());
-        return (s.isEmpty() || "0".equals(s)) ? null : s;
+    /** USDT for a target-driven BUY leg = ceil6(minima × price), computed EXACTLY in BigDecimal from the minima
+     *  STRING (not a double product), so {@code lockedUsdt ≥ minima × price} holds to the last tick against the
+     *  maker's own BigDecimal guard while I still receive my target MINIMA. Non-finite/garbage input → null (no throw). */
+    private static String ceilUsdt(String minima, double price) {
+        if (minima == null || !Double.isFinite(price) || price <= 0) return null;
+        try {
+            BigDecimal u = new BigDecimal(minima.trim()).multiply(BigDecimal.valueOf(price)).setScale(6, RoundingMode.UP);
+            if (u.signum() <= 0) return null;
+            String s = Util.tidyAmount(u.stripTrailingZeros().toPlainString());
+            return (s.isEmpty() || "0".equals(s)) ? null : s;
+        } catch (Exception e) { return null; }
+    }
+
+    /** Format a percentage to ≤2dp (kills the float noise from storing e.g. 4.2f: 4.199999809… → "4.2"). */
+    private static String pctStr(double v) {
+        return Util.tidyAmount(BigDecimal.valueOf(v).setScale(2, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString());
     }
 
     /**
@@ -1756,19 +1791,27 @@ public class MainActivity extends AppCompatActivity {
      * display cap AND a per-maker running balance (so two tranches of one maker can't over-allocate). Never emits
      * a sub-min leg. Excludes my own orders.
      */
-    private SweepPlan buildSweepPlan(boolean sell, String sendAmountStr) {
+    /**
+     * Split a large order into up to {@link Order#MAX_LEVELS} per-level legs, best-price-first. BOTH sides are
+     * MINIMA-TARGET-driven ({@code targetStr} = MINIMA to sell / to buy). BUY additionally caps at
+     * {@code bestAsk × (1+slippage)} — legs above that are not taken (partial). Leg rounding keeps the maker's
+     * guard satisfied: SELL locks MINIMA + requests {@code floor6(minima×bid)}; BUY locks {@code ceil6(minima×ask)}
+     * + requests exactly {@code minima}. Each leg clamped to the maker's live balance + a per-maker running total.
+     */
+    private SweepPlan buildSweepPlan(boolean sell, String targetStr, double slippage) {
         final String sym = "USDT";
         final double EPS = 1e-9;
         SweepPlan plan = new SweepPlan(sell);
-        double target = parseD(sendAmountStr, 0);   // sell: MINIMA size; buy: USDT budget
+        plan.slippagePct = slippage * 100;
+        double target = parseD(targetStr, 0);   // MINIMA to sell (sell) or MINIMA to buy (buy)
         plan.target = target;
         if (target <= 0) { plan.stopReason = "book-exhausted"; return plan; }
-        // Ignore an unfillable rounding remainder (per-leg amounts round DOWN, so a few dust units always linger).
-        final double dust = Math.max(EPS, target * 1e-4);
+        final double dust = Math.max(EPS, target * 1e-4);   // ignore a sub-0.01% rounding remainder
 
         java.util.Map<Order, Double> remUsdt = new java.util.HashMap<>();     // maker's remaining USDT balance
         java.util.Map<Order, Double> remMinima = new java.util.HashMap<>();   // maker's remaining MINIMA balance
-        double remaining = target;                                           // sell: MINIMA left; buy: USDT budget left
+        double remaining = target;                                           // MINIMA left to fill
+        double bestPrice = 0;                                                // first leg actually taken = the slippage anchor
 
         for (Object[] row : aggSide(sym, sell, true)) {
             if (plan.legs.size() >= Order.MAX_LEVELS) { plan.stopReason = "leg-cap"; plan.partial = true; break; }
@@ -1777,54 +1820,53 @@ public class MainActivity extends AppCompatActivity {
             Order.Level lvl = (Order.Level) row[1];
             double price = lvl.price;
             if (price <= 0) continue;
+
+            // BUY slippage cap — never pay more than best × (1+slippage) per MINIMA.
+            if (!sell && bestPrice > 0 && slippage > 0 && price > bestPrice * (1 + slippage) + EPS) {
+                plan.stopReason = "slippage"; plan.partial = true; break;
+            }
+
             Order.Pair pr = maker.pairs.get(sym);
             double mn = pr != null ? pr.min : 0;
 
             double capMinima;
             if (sell) {   // maker BUYS my MINIMA with USDT → cap by their remaining USDT / price
                 double ru = remUsdt.containsKey(maker) ? remUsdt.get(maker) : maker.usdtAvail;
-                capMinima = Math.min(lvl.amount, price > 0 ? ru / price : 0);
+                capMinima = Math.min(lvl.amount, ru / price);
             } else {      // maker SELLS MINIMA → cap by their remaining MINIMA
                 double rm = remMinima.containsKey(maker) ? remMinima.get(maker) : maker.minimaAvail;
                 capMinima = Math.min(lvl.amount, rm);
             }
             if (capMinima <= EPS) continue;
 
-            double takeMinima = sell ? Math.min(capMinima, remaining) : Math.min(capMinima, remaining / price);
+            double takeMinima = Math.min(capMinima, remaining);
             if (takeMinima <= EPS) continue;
 
             if (mn > 0 && takeMinima < mn - EPS) {   // never emit a sub-min leg (the maker would auto-decline)
-                boolean remainderTooSmall = sell ? (remaining < mn - EPS) : (remaining / price < mn - EPS);
-                if (remainderTooSmall) { plan.stopReason = "below-min"; plan.partial = true; break; }
+                if (remaining < mn - EPS) { plan.stopReason = "below-min"; plan.partial = true; break; }
                 continue;   // this level can't honor its own maker's min → skip it, try deeper
             }
 
-            // Build the leg so the maker's guard ALWAYS accepts. SELL: lock MINIMA, request usdt = floor6(minima×bid)
-            // → recvMinima×bid ≥ usdt ✓. BUY: lock USDT, derive minima = floor8(usdt/ask) DOWN → recvUsdt ≥ minima×ask
-            // ✓ (mirrors the single-swap path). Rounding the OTHER way makes the maker silently auto-decline the leg.
-            String minimaStr, usdtStr;
-            if (sell) {
-                minimaStr = legMinima(takeMinima);
-                usdtStr = computeUsdt(minimaStr, price);
-            } else {
-                usdtStr = floorUsdt(Math.min(remaining, takeMinima * price));   // budget- & cap-bounded USDT to lock
-                if (usdtStr == null) continue;
-                minimaStr = computeMinima(usdtStr, price);
-            }
-            if (minimaStr == null || usdtStr == null) continue;
+            String minimaStr = legMinima(takeMinima);
+            double m = parseD(minimaStr, 0);
+            if (m <= EPS) continue;
+            String usdtStr = sell ? computeUsdt(minimaStr, price) : ceilUsdt(minimaStr, price);
+            if (usdtStr == null) continue;
             SweepLeg leg = new SweepLeg(maker, price, minimaStr, usdtStr);
             if (leg.minimaD <= EPS || leg.usdtD <= EPS) continue;
             if (mn > 0 && leg.minimaD < mn - EPS) continue;   // rounding pushed this sliver below the maker's min — skip
+
+            if (bestPrice <= 0) bestPrice = price;   // anchor slippage on the FIRST leg actually taken (best fillable)
             plan.legs.add(leg);
             plan.filledMinima += leg.minimaD;
             plan.totalUsdt += leg.usdtD;
             plan.worstPrice = price;   // best-first → the last added is the worst price
             if (sell) remUsdt.put(maker, (remUsdt.containsKey(maker) ? remUsdt.get(maker) : maker.usdtAvail) - leg.usdtD);
             else      remMinima.put(maker, (remMinima.containsKey(maker) ? remMinima.get(maker) : maker.minimaAvail) - leg.minimaD);
-            remaining -= sell ? leg.minimaD : leg.usdtD;
+            remaining -= leg.minimaD;
         }
 
-        if (remaining > dust) plan.partial = true;   // dust-tolerant: a sub-0.01% remainder counts as filled
+        if (remaining > dust) plan.partial = true;
         if (plan.partial && "filled".equals(plan.stopReason)) plan.stopReason = "book-exhausted";
         plan.avgPrice = plan.filledMinima > 0 ? plan.totalUsdt / plan.filledMinima : 0;
         return plan;
@@ -1832,7 +1874,45 @@ public class MainActivity extends AppCompatActivity {
 
     /** Total MINIMA takeable across the book (≤6 legs) on the given side — for the "up to ~X" depth hint. */
     private double sweepDepthMinima(boolean sell) {
-        return buildSweepPlan(sell, "1000000000").filledMinima;   // huge target/budget → walks the whole depth
+        return buildSweepPlan(sell, "1000000000", sell ? 0 : buySlippage()).filledMinima;   // huge target → the whole (within-slippage) depth
+    }
+
+    // ---- buy slippage tolerance (deliver the MINIMA target across deeper legs, capped at best × (1+slippage)) ----
+
+    private double buySlippage() { return prefs.getFloat("buy_slippage_pct", 4.2f) / 100.0; }   // fraction, default 4.2%
+
+    private TextView slipPill(String label, boolean active, Runnable onTap) {
+        TextView p = Design.pill(this, label, active ? Design.ACCENT_SOFT() : Design.SURFACE2(), active ? Design.ACCENT() : Design.DIM());
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.leftMargin = dp(6); p.setLayoutParams(lp);
+        p.setOnClickListener(v -> onTap.run()); Design.pressable(p);
+        return p;
+    }
+
+    private void setBuySlippage(double pct) {
+        prefs.edit().putFloat("buy_slippage_pct", (float) Math.max(0.1, Math.min(50, pct))).apply();
+        render();
+    }
+
+    private void customSlippageDialog() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL); box.setPadding(dp(20), dp(12), dp(20), dp(4));
+        TextView h = new TextView(this);
+        h.setText("The most above the best price you'll pay per MINIMA when a buy fills across deeper levels.");
+        h.setTextColor(Design.DIM()); h.setTextSize(12.5f); h.setTypeface(Design.sans()); h.setLineSpacing(dp(2), 1f); h.setPadding(0, 0, 0, dp(10));
+        box.addView(h);
+        final EditText e = new EditText(this); decimalInput(e);
+        e.setText(trim(buySlippage() * 100)); e.setHint("%"); e.setHintTextColor(Design.DIM2());
+        e.setTextColor(Design.TEXT()); e.setTextSize(16f); e.setTypeface(Design.mono());
+        box.addView(e);
+        modalOpen = true;
+        dialog()
+                .setTitle("Custom max slippage")
+                .setView(box)
+                .setPositiveButton("Set", (d, w) -> setBuySlippage(parseD(e.getText().toString(), 4.2)))
+                .setNegativeButton("Cancel", null)
+                .setOnDismissListener(d -> { modalOpen = false; render(); })
+                .show();
     }
 
     // ---- Wallet tab ----
