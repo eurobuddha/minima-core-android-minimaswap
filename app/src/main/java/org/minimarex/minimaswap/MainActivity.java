@@ -835,10 +835,15 @@ public class MainActivity extends AppCompatActivity {
         EditText ae = new EditText(this); decimalInput(ae);
         ae.setHint("MINIMA"); ae.setHintTextColor(Design.DIM2());
         ae.setText(amount > 0 ? trimSig(amount) : ""); ae.setTextColor(Design.TEXT()); ae.setTextSize(14f); ae.setGravity(Gravity.END); ae.setTypeface(Design.mono());
+        TextView clr = new TextView(this); clr.setText("✕"); clr.setTextColor(Design.DIM2()); clr.setTextSize(15f);
+        clr.setTypeface(Design.sans()); clr.setGravity(Gravity.CENTER); clr.setPadding(dp(8), dp(4), dp(2), dp(4));
+        clr.setOnClickListener(v -> { pe.setText(""); ae.setText(""); });   // clear this level (watcher then refreshes the preview)
+        Design.pressable(clr);
         LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(dp(26), LinearLayout.LayoutParams.WRAP_CONTENT);
         LinearLayout.LayoutParams plp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); plp.leftMargin = dp(6);
         LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); alp.leftMargin = dp(8);
-        r.addView(t, tlp); r.addView(pe, plp); r.addView(ae, alp);
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(dp(30), LinearLayout.LayoutParams.WRAP_CONTENT); clp.leftMargin = dp(2);
+        r.addView(t, tlp); r.addView(pe, plp); r.addView(ae, alp); r.addView(clr, clp);
         parent.addView(r);
         return new EditText[]{ pe, ae };
     }
