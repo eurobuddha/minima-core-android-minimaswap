@@ -165,7 +165,7 @@ public class SwapService extends Service {
         @Override public void run() {
             // Also stand down while the Activity is running a market sweep — its sequential legs own the ETH
             // "pending" nonce / MINIMA coin selection, and a Service poll here could submit a colliding tx.
-            if (!MainActivity.FOREGROUND && !MainActivity.SWEEP_ACTIVE && engine != null) { engine.poll(); maybeAutoRepublish(); scanTakeRequests(); }
+            if (!MainActivity.FOREGROUND && !MainActivity.SWEEP_ACTIVE && engine != null) { engine.poll(); maybeAutoRepublish(); scanTakeRequests(); if (prefs.getBoolean("auto_publish", false)) engine.maintainLadderCoins(true); }
             h.postDelayed(this, INTERVAL_MS);
         }
     };
@@ -215,10 +215,10 @@ public class SwapService extends Service {
         for (Order.Pair p : o.pairs.values()) if (p.enable) { anyEnabled = true; break; }
         if (!anyEnabled) return;
         prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();
-        SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
+        engine.ensureLadderCoins(o, !MainActivity.SWEEP_ACTIVE, () -> SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
             @Override public void onSent(String txpowid) { engine.setMyOrder(o); }
             @Override public void onFailed(String message) {}
-        });
+        }));
     }
 
     // ----- engine notifier: OS notifications only (no UI here); SwapDb carries state to the Activity -----

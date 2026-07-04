@@ -170,6 +170,8 @@ public class MainActivity extends AppCompatActivity {
             if (sweepRun == null || !sweepRun.sell) {  // stand down only mid-SELL-sweep — a poll republish/claim
                 if (engine != null) engine.poll();     // could re-select a sell leg's MINIMA coins. A BUY sweep is
                 maybeAutoRepublish();                  // nonce-serialized, so the poller may run alongside it.
+                if (engine != null && prefs.getBoolean("auto_publish", false))
+                    engine.maintainLadderCoins(!SWEEP_ACTIVE);   // replenish coins consumed by fills (rate-limited)
             }
             refreshBalances(false);                 // keep balances current without a restart (read-only, always safe)
             scanTakeRequests();                      // receive buyers' hashlock handshakes (scan/add only, no tx)
@@ -622,8 +624,10 @@ public class MainActivity extends AppCompatActivity {
         prefs.edit().putBoolean("auto_publish", true).apply();   // opt in to keep it live + fresh
         orderStatus = "Publishing your order…";
         render();
-        // publishFresh re-reads the live SENDABLE balance so the advertised size is never a stale snapshot.
-        SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
+        // ensureLadderCoins clamps the ask ladder to the tranches I can actually lock right now (+ splits toward
+        // full depth in the background); publishFresh then re-reads the live SENDABLE balance so the advertised
+        // size is never a stale snapshot.
+        engine.ensureLadderCoins(o, !SWEEP_ACTIVE, () -> SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
             @Override public void onSent(String txpowid) {
                 prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();
                 engine.setMyOrder(o);
@@ -631,7 +635,7 @@ public class MainActivity extends AppCompatActivity {
                 render(); ui.postDelayed(MainActivity.this::scanOrderBook, 2000);
             }
             @Override public void onFailed(String message) { orderStatus = "Publish failed: " + message; render(); }
-        });
+        }));
     }
 
     /** Keep a published order live + its advertised size current: re-publish ~every 30 min (fresh sendable). */
@@ -642,10 +646,10 @@ public class MainActivity extends AppCompatActivity {
         final Order o = baseOrder();
         if (o == null) return;   // all pairs disabled → nothing to keep live
         prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();   // stamp now to avoid re-entry
-        SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
+        engine.ensureLadderCoins(o, !SWEEP_ACTIVE, () -> SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
             @Override public void onSent(String txpowid) { engine.setMyOrder(o); }
             @Override public void onFailed(String message) { /* retried next interval */ }
-        });
+        }));
     }
 
     // ---- order config (persisted; drives both publish AND the responder match guard) ----
@@ -985,6 +989,12 @@ public class MainActivity extends AppCompatActivity {
 
     private void startSweep(SweepPlan plan) {
         if (plan == null || plan.legs.isEmpty()) return;
+        // A SELL sweep and an in-flight coin-split both pick MINIMA coins unpinned — if they'd collide, the sweep
+        // could lose leg 1 and abort. Splits finish within ~a block; ask the user to retry rather than risk it.
+        if (plan.sell && engine != null && engine.isSplitting()) {
+            toast("Preparing coins for your order ladder — try the sell again in a moment.");
+            return;
+        }
         sweepRun = plan; sweepIdx = 0; sweepOk = 0;
         // Only a SELL sweep must stand the pollers down — its unpinned MINIMA locks could double-select coins.
         // A BUY sweep is nonce-serialized (EthTx), so the poll loop may keep claiming counter-legs alongside it.

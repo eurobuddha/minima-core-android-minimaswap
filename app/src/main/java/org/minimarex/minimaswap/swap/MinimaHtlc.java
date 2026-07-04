@@ -162,6 +162,29 @@ public final class MinimaHtlc {
         }, cb::err);
     }
 
+    /** My spendable native-MINIMA coins (confirmed, simple-address) — the pool an ask ladder can lock against.
+     *  Each element has an {@code amount}; used to count coins ≥ a tranche size and decide whether to split. */
+    public void myFreeCoins(Consumer<org.json.JSONArray> ok, Consumer<String> err) {
+        // coinage:1 → confirmed coins only, matching splitCoins' coinage:1 inputs: the target we compute here is
+        // always fundable by the split, so it never fails insufficient-funds on freshly-received (coinage:0) coins.
+        cmd("coins relevant:true sendable:true tokenid:0x00 coinage:1", r -> {
+            Object resp = r.opt("response");
+            ok.accept(resp instanceof org.json.JSONArray ? (org.json.JSONArray) resp : new org.json.JSONArray());
+        }, err);
+    }
+
+    /** Split my own coins into {@code count} equal coins totalling {@code totalAmount} MINIMA, in ONE tx, from
+     *  CONFIRMED inputs only (coinage:1) — so a multi-tranche ask ladder has enough separately-spendable coins to
+     *  lock every leg of a sweep concurrently (native {@code send split:} sends to my own address). */
+    public void splitCoins(int count, String totalAmount, PostCb cb) {
+        String send = "send amount:" + totalAmount + " address:" + myAddress
+                + " tokenid:0x00 split:" + count + " coinage:1 mine:true";
+        cmd(send, r -> {
+            JSONObject resp = r.optJSONObject("response");
+            cb.ok(resp == null ? "" : resp.optString("txpowid", ""));
+        }, cb::err);
+    }
+
     // ---- CLAIM: counterparty reveals the secret + pays the notify coin ----
 
     /** coin = the HTLC coin JSON (needs coinid, tokenid, amount, state[]). I am the receiver (state[4]). */

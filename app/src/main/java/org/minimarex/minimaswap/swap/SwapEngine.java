@@ -108,6 +108,74 @@ public final class SwapEngine {
     public void setMyPubkeys(Set<String> keys) { this.myPubkeys = keys == null ? Collections.emptySet() : keys; }
     public void setMyOrder(Order o) { this.myOrder = o; }
 
+    // ── maker coin-readiness: keep the ask ladder backed by enough separately-spendable MINIMA coins ──────────
+    // Minima is UTXO-based: locking N concurrent counter-legs for a swept N-tranche ask ladder needs N coins each
+    // ≥ a tranche. With one big coin, lock 1 spends it and its change is unconfirmed, so later locks starve (the
+    // 750-sweep leg-1 non-fill). We clamp the advertised ladder to what's lockable NOW and split coins toward full
+    // depth in the background. The split is a self-send (all coins stay mine) → benign if it ever races a lock.
+    private volatile long lastSplitMs = 0;
+    private static final long SPLIT_MIN_INTERVAL_MS = 120_000;   // ≥ ~2 blocks between splits (rate limit)
+
+    /** At publish: trim the ask ladder to the tranches I can actually lock right now, run {@code afterPublish},
+     *  then (if short + allowed) notify + split toward full depth. */
+    public void ensureLadderCoins(Order o, boolean allowSplit, Runnable afterPublish) {
+        checkLadderCoins(o, allowSplit, true, afterPublish);
+    }
+
+    /** Between publishes (poll tick): replenish coins consumed by fills so the already-advertised ladder stays
+     *  backable — no clamp, no republish. */
+    public void maintainLadderCoins(boolean allowSplit) {
+        Order o = myOrder;
+        if (o != null) checkLadderCoins(o, allowSplit, false, null);
+    }
+
+    private void checkLadderCoins(Order o, boolean allowSplit, boolean clamp, Runnable afterPublish) {
+        String sym = null;
+        for (java.util.Map.Entry<String, Order.Pair> e : o.pairs.entrySet()) {
+            if (e.getValue().enable && !e.getValue().asks.isEmpty()) { sym = e.getKey(); break; }
+        }
+        final int N = sym == null ? 0 : o.effectiveAsks(sym).size();
+        final double T = sym == null ? 0 : o.maxAskAmount(sym);
+        if (N < 2 || T <= 0) { if (afterPublish != null) afterPublish.run(); return; }   // single/no ladder → as-is
+        final String fsym = sym;
+        minima.myFreeCoins(coins -> {
+            int backable = 0; double totalFree = 0;
+            for (int i = 0; i < coins.length(); i++) {
+                org.json.JSONObject c = coins.optJSONObject(i);
+                if (c == null) continue;
+                double amt = sd(c.optString("amount", "0"));
+                totalFree += amt;
+                if (amt + 1e-9 >= T) backable++;
+            }
+            final int target = Math.min(N, (int) Math.floor((totalFree + 1e-9) / T));
+            if (clamp) o.trimAsks(fsym, Math.min(N, backable));   // never advertise a tranche I can't lock now
+            if (afterPublish != null) afterPublish.run();
+            maybeSplitLadderCoins(allowSplit, backable, target, T);
+        }, e -> { if (afterPublish != null) afterPublish.run(); });
+    }
+
+    private void maybeSplitLadderCoins(boolean allowSplit, int backable, int target, double T) {
+        if (!allowSplit || target < 2 || backable >= target) return;   // enough coins, or liquidity-capped
+        if (System.currentTimeMillis() - lastSplitMs < SPLIT_MIN_INTERVAL_MS) return;
+        if (!inflight.add("split")) return;                            // one split in flight at a time
+        lastSplitMs = System.currentTimeMillis();
+        String total = new java.math.BigDecimal(Double.toString(T))
+                .multiply(java.math.BigDecimal.valueOf(target)).stripTrailingZeros().toPlainString();
+        notifier.notify("Preparing coins", "Splitting into " + target + " coins to back your order ladder…");
+        minima.splitCoins(target, total, new MinimaHtlc.PostCb() {
+            @Override public void ok(String txpowid) { inflight.remove("split"); }
+            @Override public void err(String m) { inflight.remove("split"); }
+        });
+    }
+
+    private static double sd(String s) {
+        try { return Double.parseDouble(s.trim()); } catch (Exception e) { return 0; }
+    }
+
+    /** True while a coin-split self-send is in flight — a SELL sweep should wait, since both pick MINIMA coins
+     *  unpinned and could select the same one (fund-safe: the loser is dropped, but the sweep could abort). */
+    public boolean isSplitting() { return inflight.contains("split"); }
+
     /** A taker told us (via the sealed handshake) the hashlock of a USDT lock addressed to us. We discover it
      *  by deterministic contractId via getContract (free-RPC-safe) instead of eth_getLogs, then respond. */
     public void addIncomingHashlock(String hash) {

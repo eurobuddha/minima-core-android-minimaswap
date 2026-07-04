@@ -130,6 +130,24 @@ public final class Order {
         return Collections.emptyList();
     }
 
+    /** Largest ask per-take cap across a symbol's enabled tranches (0 if none) — one coin ≥ this backs any tranche. */
+    public double maxAskAmount(String sym) {
+        double m = 0;
+        for (Level l : effectiveAsks(sym)) if (l.amount > m) m = l.amount;
+        return m;
+    }
+
+    /** Trim a symbol's advertised ask ladder to its first {@code k} (best-price) tranches — so a maker never
+     *  advertises a tranche it has too few spendable coins to lock. No-op for a synthetic single-level order. */
+    public void trimAsks(String sym, int k) {
+        Pair p = pairs.get(sym);
+        if (p == null || p.asks.isEmpty() || k < 0) return;
+        while (p.asks.size() > k) p.asks.remove(p.asks.size() - 1);
+        // If we trimmed the ladder to nothing, also clear the legacy best-ask scalar — else effectiveAsks would
+        // resurrect a SYNTHETIC single ask for the whole balance (exactly the unbacked tranche we're avoiding).
+        if (p.asks.isEmpty()) p.buy = 0;
+    }
+
     // ---- (de)serialization — ONE pair codec shared by the signed wire format AND the local config ----
 
     /** Pair → JSON. Always writes en/buy/sell/min (0.8.x compat) + bids/asks when present. */
