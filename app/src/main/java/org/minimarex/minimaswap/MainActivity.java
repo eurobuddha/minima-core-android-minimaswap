@@ -548,7 +548,13 @@ public class MainActivity extends AppCompatActivity {
     private void scanOrderBook() {
         if (!paired) return;
         SwapOrderBook.scan(node, ls,
-                book -> { orderBook.clear(); orderBook.putAll(book); render(); },
+                book -> {
+                    // If I've withdrawn (auto_publish off), don't let my own still-on-chain order linger in MY
+                    // view until it ages out (~1h) — drop it now. My tombstone withdraws it for peers next block.
+                    if (identity != null && !prefs.getBoolean("auto_publish", false))
+                        book.remove("0x" + org.minimarex.comms.Hex.to(identity.signPk));
+                    orderBook.clear(); orderBook.putAll(book); render();
+                },
                 err -> { orderStatus = "Book scan: " + err; render(); });
         scanTakeRequests();
     }
@@ -650,6 +656,29 @@ public class MainActivity extends AppCompatActivity {
             @Override public void onSent(String txpowid) { engine.setMyOrder(o); }
             @Override public void onFailed(String message) { /* retried next interval */ }
         }));
+    }
+
+    /** Push a just-saved order to the book NOW so an edit — especially DISABLE — takes effect in seconds, not
+     *  after the ~30-min auto-republish or the ~1-h coin age-out. A still-liquid order re-publishes (update); an
+     *  emptied/disabled one publishes an empty order as a TOMBSTONE (freshest-per-signer + empty effectiveBids/
+     *  Asks ⇒ peers drop my liquidity on their next scan) and stops auto-publishing. Only runs for a LIVE order. */
+    private void pushOrderEdit(Order o) {
+        if (identity == null || myMinimaPk == null || !wallet.ready()) return;
+        final boolean live = o.hasLiquidity();
+        if (!live) prefs.edit().putBoolean("auto_publish", false).apply();   // disabled/emptied → stop keeping it live
+        orderStatus = live ? "Updating your order…" : "Withdrawing your order…";
+        render();
+        final CommsTransport.SendCb cb = new CommsTransport.SendCb() {
+            @Override public void onSent(String txpowid) {
+                prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();
+                engine.setMyOrder(o);
+                orderStatus = live ? "✓ Order updated" : "✓ Order withdrawn — removed from the book";
+                render(); ui.postDelayed(MainActivity.this::scanOrderBook, 2000);
+            }
+            @Override public void onFailed(String message) { orderStatus = (live ? "Update" : "Withdraw") + " failed: " + message; render(); }
+        };
+        if (live) engine.ensureLadderCoins(o, !SWEEP_ACTIVE, () -> SwapOrderBook.publishFresh(node, ls, identity, o, cb));
+        else      SwapOrderBook.publish(node, ls, identity, o, cb);   // tombstone: no coins/balance read needed
     }
 
     // ---- order config (persisted; drives both publish AND the responder match guard) ----
@@ -770,6 +799,9 @@ public class MainActivity extends AppCompatActivity {
                         toast("Enabled, but no levels set — add a bid or ask to publish");
                     else
                         toast(Order.crossed(p) ? "⚠ Saved, but your best bid ≥ best ask (crossed market)" : "Ladder saved");
+                    // If an order is already live, reflect this edit in the book NOW — especially a DISABLE, which
+                    // publishes a tombstone so it's withdrawn in seconds, not after the ~30-min auto-republish.
+                    if (prefs.getBoolean("auto_publish", false)) pushOrderEdit(o);
                 })
                 .setNegativeButton("Cancel", null)
                 .setOnDismissListener(d -> { modalOpen = false; render(); })

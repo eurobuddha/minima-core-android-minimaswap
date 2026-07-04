@@ -130,6 +130,15 @@ public final class Order {
         return Collections.emptyList();
     }
 
+    /** True if any enabled pair currently advertises at least one bid or ask level (real or synthetic). A saved
+     *  order with this false is effectively withdrawn — publishing it acts as a tombstone in the freshest-per-
+     *  signer book (peers drop my liquidity on their next scan). */
+    public boolean hasLiquidity() {
+        for (String sym : pairs.keySet())
+            if (!effectiveBids(sym).isEmpty() || !effectiveAsks(sym).isEmpty()) return true;
+        return false;
+    }
+
     /** Largest ask per-take cap across a symbol's enabled tranches (0 if none) — one coin ≥ this backs any tranche. */
     public double maxAskAmount(String sym) {
         double m = 0;
