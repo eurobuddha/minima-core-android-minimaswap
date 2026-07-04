@@ -116,6 +116,14 @@ public final class SwapEngine {
     private volatile long lastSplitMs = 0;
     private static final long SPLIT_MIN_INTERVAL_MS = 120_000;   // ≥ ~2 blocks between splits (rate limit)
 
+    // Serialize the responder's MINIMA counter-leg locks: only ONE unconfirmed at a time, so N concurrent takes
+    // (a swept ladder) never fire N back-to-back unpinned sends that double-select the same coin (Minima has no
+    // nonce / no coin-reservation → the losers are rejected as double-spends but still look "locked", and the
+    // taker can never discover them). cpLockPending = the hash whose lock we're waiting to confirm on-chain.
+    private final java.util.concurrent.atomic.AtomicReference<String> cpLockPending = new java.util.concurrent.atomic.AtomicReference<>();
+    private volatile long cpLockSince = 0;
+    private static final long CP_LOCK_TIMEOUT_SECS = 600;   // watchdog: release a never-confirming lock (its leg refunds); ≫ a normal ~2-block confirm
+
     /** At publish: trim the ask ladder to the tranches I can actually lock right now, run {@code afterPublish},
      *  then (if short + allowed) notify + split toward full depth. */
     public void ensureLadderCoins(Order o, boolean allowSplit, Runnable afterPublish) {
@@ -587,6 +595,15 @@ public final class SwapEngine {
         try { eth = new EthHtlc(rpc, wallet.creds(), net); } catch (Exception e) { return; }
         final String myEth = wallet.address();
 
+        // Release the responder single-flight gate: the pending counter-leg lock has confirmed on-chain (its
+        // coin is spendable-safe at coinage:1), so the NEXT take may lock this cycle; or it never confirmed
+        // (dropped/replaced) and the watchdog frees the gate so we don't wedge — that one leg simply refunds.
+        final String pend = cpLockPending.get();
+        if (pend != null) {
+            if (nowUnix() - cpLockSince > CP_LOCK_TIMEOUT_SECS) cpLockPending.compareAndSet(pend, null);
+            else confirmMyLock(pend, true, onChain -> { if (onChain) cpLockPending.compareAndSet(pend, null); });
+        }
+
         // PRIMARY (works on free/keyless RPCs): for every known swap, read its ETH leg by deterministic
         // contractId = sha256(hashlock) via getContract (eth_call) — claim, harvest the revealed preimage,
         // or refund. No eth_getLogs, which free nodes gate as an "archive" request.
@@ -727,8 +744,15 @@ public final class SwapEngine {
         if (c.timelock - nowUnix() < CP_SECS_CHECK) { declineNote(hash, "their USDT lock is too close to its timeout"); return; }
         if (myOrder == null) return;                                      // order not loaded yet — retry next cycle
         if (!acceptTakerBuyMinima(c)) { declineNote(hash, "it didn't fit any level of your ladder (price, level size, or minimum)"); return; }
-        if (!inflight.add("cpMin:" + hash)) return;
-        lockMinimaCounterLeg(c, minimaBlock);
+        if (!cpLockPending.compareAndSet(null, hash)) return;       // serialize: atomically claim the single-flight slot (same-cycle safe)
+        cpLockSince = nowUnix();
+        if (!inflight.add("cpMin:" + hash)) { cpLockPending.compareAndSet(hash, null); return; }
+        // Cross-process belt: don't lock while ANY MINIMA is still settling — catches the other engine's lock
+        // across a foreground↔background handoff (the chain's unconfirmed pool is global). Retries next cycle.
+        minima.hasPendingMinima(pending -> {
+            if (pending) { inflight.remove("cpMin:" + hash); cpLockPending.compareAndSet(hash, null); return; }
+            lockMinimaCounterLeg(c, minimaBlock);
+        }, e -> { inflight.remove("cpMin:" + hash); cpLockPending.compareAndSet(hash, null); });
     }
 
     /** Tell the maker (once) why a handshake-announced buy was declined, so a reject isn't silent. */
@@ -774,7 +798,10 @@ public final class SwapEngine {
                 notifier.onSwapsChanged();
                 inflight.remove("cpMin:" + hash);
             }
-            @Override public void err(String m) { inflight.remove("cpMin:" + hash); }
+            @Override public void err(String m) {
+                inflight.remove("cpMin:" + hash);
+                cpLockPending.compareAndSet(hash, null);   // send never broadcast → release the gate, retry next cycle
+            }
         }));
     }
 
