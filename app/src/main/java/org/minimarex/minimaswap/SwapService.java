@@ -51,6 +51,7 @@ public class SwapService extends Service {
     private static final String CH_ALERT = "minimaswap"; // swap event alerts (same channel MainActivity uses)
     private static final int FG_ID = 4101;
     private static final long INTERVAL_MS = 90_000;
+    private static final long DISCOVERY_INTERVAL_MS = 30_000;   // fast, LIGHT handshake-discovery scan (heavy poll stays 90s)
     private int alertId = 5100;
 
     private final Handler h = new Handler(Looper.getMainLooper());
@@ -139,6 +140,8 @@ public class SwapService extends Service {
 
         h.removeCallbacks(tick);
         h.post(tick);
+        h.removeCallbacks(discoveryTick);
+        h.postDelayed(discoveryTick, DISCOVERY_INTERVAL_MS);
     }
 
     /** Derive the comms signing identity from the node seed (only needed to republish the maker's order). */
@@ -165,8 +168,17 @@ public class SwapService extends Service {
         @Override public void run() {
             // Also stand down while the Activity is running a market sweep — its sequential legs own the ETH
             // "pending" nonce / MINIMA coin selection, and a Service poll here could submit a colliding tx.
-            if (!MainActivity.FOREGROUND && !MainActivity.SWEEP_ACTIVE && engine != null) { engine.poll(); maybeAutoRepublish(); scanTakeRequests(); if (prefs.getBoolean("auto_publish", false)) engine.maintainLadderCoins(true); }
+            if (!MainActivity.FOREGROUND && !MainActivity.SWEEP_ACTIVE && engine != null) { engine.poll(); maybeAutoRepublish(); if (prefs.getBoolean("auto_publish", false)) engine.maintainLadderCoins(true); }
             h.postDelayed(this, INTERVAL_MS);
+        }
+    };
+
+    /** Fast, LIGHT discovery tick (~30s): only the bounded handshake scan (kicks checkBuyNow on a new buy) so a
+     *  buyer is seen in ~1 block, not up to a 90s poll. Stands down when the Activity is foreground/sweeping. */
+    private final Runnable discoveryTick = new Runnable() {
+        @Override public void run() {
+            if (!MainActivity.FOREGROUND && !MainActivity.SWEEP_ACTIVE && engine != null) scanTakeRequests();
+            h.postDelayed(this, DISCOVERY_INTERVAL_MS);
         }
     };
 
@@ -191,6 +203,7 @@ public class SwapService extends Service {
             boolean isNew = set.add(hash);
             if (isNew) prefs.edit().putString("incoming_hashlocks", android.text.TextUtils.join(",", set)).apply();
             engine.addIncomingHashlock(hash);
+            if (isNew && !MainActivity.SWEEP_ACTIVE) engine.checkBuyNow(hash);   // act now — don't wait for the next 90s poll
             if (isNew) alert("Buy request received", "A buyer wants your MINIMA — finding their USDT lock, then locking.");
             return isNew;
         } catch (Exception e) { return false; }

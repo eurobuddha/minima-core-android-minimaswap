@@ -635,15 +635,7 @@ public final class SwapEngine {
         // deterministic contractId via getContract (no eth_getLogs) and run the normal responder path (lock the
         // MINIMA counter-leg). Once it becomes a known swap, the loop above + the secondary path take over.
         for (String hash : new java.util.ArrayList<>(incoming)) {
-            if (db.getSwap(hash) != null || db.haveSentCounterParty(hash)) { incoming.remove(hash); continue; }
-            try {
-                EthHtlc.Contract c = eth.getContract(EthHtlc.contractId(hash));
-                if (c == null) continue;                                  // buyer's USDT leg not visible yet — retry
-                if (c.withdrawn || c.refunded) { incoming.remove(hash); continue; }   // terminal — stop polling it
-                if (c.receiver != null && c.receiver.equalsIgnoreCase(myEth)) {
-                    checkCanCollectEth(eth, c, minimaBlock);
-                }
-            } catch (Exception ignore) {}
+            if (processIncomingBuy(eth, myEth, hash, minimaBlock)) incoming.remove(hash);
         }
 
         // SECONDARY (best-effort): eth_getLogs to discover a brand-new incoming ERC20→MINIMA lock whose
@@ -659,6 +651,38 @@ public final class SwapEngine {
             }
             lastEthScanned = ethBlock;
         } catch (Exception ignore) { /* free RPC without eth_getLogs — getContract path above still works */ }
+    }
+
+    /** Process ONE announced buy hashlock's ETH leg: if the taker's USDT lock is visible + addressed to me, run the
+     *  responder path (lock the MINIMA counter-leg). Shared by the runEthChecks incoming loop and the checkBuyNow
+     *  fast-path. Returns true if the hash is terminal/handled and can be dropped from {@code incoming}. */
+    private boolean processIncomingBuy(EthHtlc eth, String myEth, String hash, int minimaBlock) {
+        if (db.getSwap(hash) != null || db.haveSentCounterParty(hash)) return true;   // already known — drop
+        try {
+            EthHtlc.Contract c = eth.getContract(EthHtlc.contractId(hash));
+            if (c == null) return false;                                  // buyer's USDT leg not visible yet — retry
+            if (c.withdrawn || c.refunded) return true;                   // terminal — stop polling it
+            if (c.receiver != null && c.receiver.equalsIgnoreCase(myEth)) checkCanCollectEth(eth, c, minimaBlock);
+        } catch (Exception ignore) {}
+        return false;
+    }
+
+    /** Discovery fast-path: act on ONE freshly-announced buy handshake IMMEDIATELY instead of waiting for the next
+     *  ~90s poll (cuts a full poll cycle off buy discovery). Same guards as the poll loop (the getSwap/CP_LOCKING
+     *  dedup in checkCanCollectEth) → idempotent and fund-safe, just earlier. Called from addIncoming on a NEW hash. */
+    public void checkBuyNow(final String hash) {
+        if (!ready() || hash == null || hash.isEmpty()) return;
+        if (db.getSwap(hash) != null || db.haveSentCounterParty(hash)) return;   // already handled
+        minima.currentBlock(new MinimaHtlc.BlockCb() {
+            @Override public void ok(int block) {
+                io.execute(() -> {
+                    EthHtlc eth;
+                    try { eth = new EthHtlc(rpc, wallet.creds(), net); } catch (Exception e) { return; }
+                    processIncomingBuy(eth, wallet.address(), hash, block);
+                });
+            }
+            @Override public void err(String m) { /* node busy; the next poll covers it */ }
+        });
     }
 
     /** Read one swap's ETH leg by deterministic contractId and drive it: claim (receiver), harvest the

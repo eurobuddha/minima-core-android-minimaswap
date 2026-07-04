@@ -86,6 +86,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String PREFS = "minimaswap";
     private static final String[] PAIR_TOKENS = Order.PAIR_TOKENS;   // single source of truth in Order
     private static final long WATCH_INTERVAL_MS = 90_000;
+    private static final long DISCOVERY_INTERVAL_MS = 30_000;   // fast, LIGHT handshake-discovery scan — the heavy poll stays 90s
     private static final long SWEEP_LEG_TIMEOUT_MS = 300_000;    // start-phase watchdog: lock never broadcasts (covers approve+lock)
     private static final long SWEEP_CONFIRM_WATCHDOG_MS = 300_000; // SELL confirm-phase watchdog: confirmMyLock hangs (> the try-budget below)
     private static final long SWEEP_CONFIRM_INTERVAL_MS = 8_000; // SELL poll cadence while waiting for a leg's MINIMA lock to hit chain
@@ -174,8 +175,17 @@ public class MainActivity extends AppCompatActivity {
                     engine.maintainLadderCoins(!SWEEP_ACTIVE);   // replenish coins consumed by fills (rate-limited)
             }
             refreshBalances(false);                 // keep balances current without a restart (read-only, always safe)
-            scanTakeRequests();                      // receive buyers' hashlock handshakes (scan/add only, no tx)
             ui.postDelayed(this, WATCH_INTERVAL_MS);
+        }
+    };
+
+    /** Fast, LIGHT discovery tick (~30s): only the bounded handshake scan (which now kicks checkBuyNow on a new
+     *  buy), so a buyer is seen in ~1 block instead of up to a 90s poll. The heavy poll (balances/ladder/ETH
+     *  loops) stays at 90s. Read-only scan/add — safe even mid-sweep (the ACT is gated in addIncoming). */
+    private final Runnable discoveryTick = new Runnable() {
+        @Override public void run() {
+            scanTakeRequests();
+            ui.postDelayed(this, DISCOVERY_INTERVAL_MS);
         }
     };
 
@@ -248,10 +258,12 @@ public class MainActivity extends AppCompatActivity {
         if (watching || engine == null) return;
         watching = true;
         ui.post(watchTick);
+        ui.postDelayed(discoveryTick, DISCOVERY_INTERVAL_MS);
     }
     private void stopWatcher() {
         watching = false;
         ui.removeCallbacks(watchTick);
+        ui.removeCallbacks(discoveryTick);
     }
 
     private void applyInsets() {
@@ -586,6 +598,9 @@ public class MainActivity extends AppCompatActivity {
         if (isNew) prefs.edit().putString("incoming_hashlocks", android.text.TextUtils.join(",", set)).apply();
         if (engine != null) engine.addIncomingHashlock(hash);
         if (isNew) {   // make the handshake visible — the buyer wants to know it landed
+            // Act NOW — don't wait for the next ~90s poll. Stand down only mid-SELL-sweep (same as watchTick),
+            // since that path also selects MINIMA coins and a concurrent responder lock could double-select.
+            if (engine != null && (sweepRun == null || !sweepRun.sell)) engine.checkBuyNow(hash);
             postNotification("Buy request received", "A buyer wants your MINIMA — finding their USDT lock, then locking.");
             orderStatus = "↧ Buy request received — locking MINIMA for a buyer…"; render();
         }
