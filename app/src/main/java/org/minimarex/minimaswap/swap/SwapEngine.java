@@ -130,6 +130,8 @@ public final class SwapEngine {
     }
 
     private void checkLadderCoins(Order o, boolean allowSplit, boolean clamp, Runnable afterPublish) {
+        // Single MINIMA/USDT pair today: inspect the first enabled ask ladder. A second MINIMA-quoted pair would
+        // draw asks from the SAME coin pool, so multi-pair support would need pooled accounting across pairs here.
         String sym = null;
         for (java.util.Map.Entry<String, Order.Pair> e : o.pairs.entrySet()) {
             if (e.getValue().enable && !e.getValue().asks.isEmpty()) { sym = e.getKey(); break; }
@@ -143,7 +145,7 @@ public final class SwapEngine {
             for (int i = 0; i < coins.length(); i++) {
                 org.json.JSONObject c = coins.optJSONObject(i);
                 if (c == null) continue;
-                double amt = sd(c.optString("amount", "0"));
+                double amt = safeDouble(c.optString("amount", "0"));
                 totalFree += amt;
                 if (amt + 1e-9 >= T) backable++;
             }
@@ -151,24 +153,37 @@ public final class SwapEngine {
             if (clamp) o.trimAsks(fsym, Math.min(N, backable));   // never advertise a tranche I can't lock now
             if (afterPublish != null) afterPublish.run();
             maybeSplitLadderCoins(allowSplit, backable, target, T);
-        }, e -> { if (afterPublish != null) afterPublish.run(); });
+        }, e -> {
+            // Coin read failed → fail SAFE, not open: advertise only the best (1st) tranche rather than the full
+            // unbacked ladder, so a node hiccup can't silently re-enable the over-advertise this feature prevents.
+            if (clamp) o.trimAsks(fsym, 1);
+            if (afterPublish != null) afterPublish.run();
+        });
     }
 
     private void maybeSplitLadderCoins(boolean allowSplit, int backable, int target, double T) {
         if (!allowSplit || target < 2 || backable >= target) return;   // enough coins, or liquidity-capped
         if (System.currentTimeMillis() - lastSplitMs < SPLIT_MIN_INTERVAL_MS) return;
         if (!inflight.add("split")) return;                            // one split in flight at a time
-        lastSplitMs = System.currentTimeMillis();
-        String total = new java.math.BigDecimal(Double.toString(T))
-                .multiply(java.math.BigDecimal.valueOf(target)).stripTrailingZeros().toPlainString();
-        notifier.notify("Preparing coins", "Splitting into " + target + " coins to back your order ladder…");
-        minima.splitCoins(target, total, new MinimaHtlc.PostCb() {
-            @Override public void ok(String txpowid) { inflight.remove("split"); }
-            @Override public void err(String m) { inflight.remove("split"); }
-        });
+        // Skip if MINIMA is still settling (a prior split — possibly from the other process's engine after a
+        // foreground↔background handoff — not yet confirmed); else we'd double-split the same deficit. We split
+        // the FULL `target` count (not just the deficit) so a single send guarantees ≥ target lockable coins —
+        // the node's largest-first selection spends reserve coins, not existing tranche coins, and any
+        // over-provision is harmless (more backable coins).
+        minima.hasPendingMinima(pending -> {
+            if (pending) { inflight.remove("split"); return; }
+            lastSplitMs = System.currentTimeMillis();
+            String total = new java.math.BigDecimal(Double.toString(T))
+                    .multiply(java.math.BigDecimal.valueOf(target)).stripTrailingZeros().toPlainString();
+            notifier.notify("Preparing coins", "Splitting into " + target + " coins to back your order ladder…");
+            minima.splitCoins(target, total, new MinimaHtlc.PostCb() {
+                @Override public void ok(String txpowid) { inflight.remove("split"); }
+                @Override public void err(String m) { inflight.remove("split"); }
+            });
+        }, e -> inflight.remove("split"));
     }
 
-    private static double sd(String s) {
+    private static double safeDouble(String s) {
         try { return Double.parseDouble(s.trim()); } catch (Exception e) { return 0; }
     }
 

@@ -173,6 +173,21 @@ public final class MinimaHtlc {
         }, err);
     }
 
+    /** Is there any UNCONFIRMED native MINIMA in my wallet (a split/lock/payment still settling)? The chain's
+     *  unconfirmed pool is global, so this is a cross-process check — it stops a second engine (after a
+     *  foreground↔background handoff) from re-issuing a split whose coins from the first engine haven't landed yet. */
+    public void hasPendingMinima(Consumer<Boolean> ok, Consumer<String> err) {
+        cmd("balance tokenid:0x00", r -> {
+            Object resp = r.opt("response");
+            org.json.JSONObject t = null;
+            if (resp instanceof org.json.JSONArray && ((org.json.JSONArray) resp).length() > 0) t = ((org.json.JSONArray) resp).optJSONObject(0);
+            else if (resp instanceof org.json.JSONObject) t = (org.json.JSONObject) resp;
+            double unc = 0;
+            try { unc = Double.parseDouble(t == null ? "0" : t.optString("unconfirmed", "0")); } catch (Exception e) {}
+            ok.accept(unc > 0);
+        }, err);
+    }
+
     /** Split my own coins into {@code count} equal coins totalling {@code totalAmount} MINIMA, in ONE tx, from
      *  CONFIRMED inputs only (coinage:1) — so a multi-tranche ask ladder has enough separately-spendable coins to
      *  lock every leg of a sweep concurrently (native {@code send split:} sends to my own address). */
