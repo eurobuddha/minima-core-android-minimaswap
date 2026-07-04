@@ -162,6 +162,34 @@ public final class MinimaHtlc {
         }, cb::err);
     }
 
+    /** Lock the HTLC counter-leg from a SPECIFIC coin (pinned by coinid) — produces the SAME output coin as
+     *  {@link #lock} (byte-identical state[0..7]) but with NO node coin-selection, so several concurrent burst
+     *  locks each pinned to a DISTINCT coin can never double-select. Change (coinAmount − amount) → myAddress.
+     *  Built via the same txncreate…txnpost sequence claim/refund use, with the exact state values lock() writes. */
+    public void lockFromCoin(String coinid, String coinAmount, String amount, String requestAmount, String reqToken,
+                             String receiverPubkey, String ownerEthKey, String hashlock, int timelockBlock,
+                             String otc, PostCb cb) {
+        if (!ready()) { cb.err("Minima wallet not ready"); return; }
+        String change = subtract(coinAmount, amount);
+        String id = txnId();
+        List<String> seq = new ArrayList<>();
+        seq.add("txncreate id:" + id);
+        seq.add("txninput id:" + id + " coinid:" + coinid);
+        seq.add("txnstate id:" + id + " port:0 value:" + myPubkey);
+        seq.add("txnstate id:" + id + " port:1 value:" + requestAmount);
+        seq.add("txnstate id:" + id + " port:2 value:[" + reqToken + "]");
+        seq.add("txnstate id:" + id + " port:3 value:" + timelockBlock);
+        seq.add("txnstate id:" + id + " port:4 value:" + receiverPubkey);
+        seq.add("txnstate id:" + id + " port:5 value:" + hashlock);
+        seq.add("txnstate id:" + id + " port:6 value:" + ownerEthKey);
+        seq.add("txnstate id:" + id + " port:7 value:" + otc);
+        seq.add("txnoutput id:" + id + " amount:" + amount + " address:" + HTLC_ADDRESS + " tokenid:0x00 storestate:true");
+        if (positive(change)) seq.add("txnoutput id:" + id + " amount:" + change + " address:" + myAddress + " tokenid:0x00 storestate:false");
+        seq.add("txnsign id:" + id + " publickey:auto");
+        seq.add("txnpost id:" + id + " mine:true auto:true txndelete:true");
+        runSeq(seq, last -> cb.ok(txpowOf(last)), e -> { deleteTxn(id); cb.err(e); });
+    }
+
     /** My spendable native-MINIMA coins (confirmed, simple-address) — the pool an ask ladder can lock against.
      *  Each element has an {@code amount}; used to count coins ≥ a tranche size and decide whether to split. */
     public void myFreeCoins(Consumer<org.json.JSONArray> ok, Consumer<String> err) {

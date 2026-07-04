@@ -116,13 +116,22 @@ public final class SwapEngine {
     private volatile long lastSplitMs = 0;
     private static final long SPLIT_MIN_INTERVAL_MS = 120_000;   // ≥ ~2 blocks between splits (rate limit)
 
-    // Serialize the responder's MINIMA counter-leg locks: only ONE unconfirmed at a time, so N concurrent takes
-    // (a swept ladder) never fire N back-to-back unpinned sends that double-select the same coin (Minima has no
-    // nonce / no coin-reservation → the losers are rejected as double-spends but still look "locked", and the
-    // taker can never discover them). cpLockPending = the hash whose lock we're waiting to confirm on-chain.
-    private final java.util.concurrent.atomic.AtomicReference<String> cpLockPending = new java.util.concurrent.atomic.AtomicReference<>();
-    private volatile long cpLockSince = 0;
-    private static final long CP_LOCK_TIMEOUT_SECS = 600;   // watchdog: release a never-confirming lock (its leg refunds); ≫ a normal ~2-block confirm
+    // Bounded-BURST responder locking: up to CP_LOCK_BURST counter-leg locks in flight at once, each PINNED to a
+    // DISTINCT coin (lockFromCoin) so the concurrent sends can never double-select (the losers would be rejected
+    // as double-spends but still look "locked", and the taker could never discover them). A slot frees when its
+    // lock confirms on-chain (or a watchdog fires — that one leg refunds). Serial (K=1) was correct but ~1
+    // leg/cycle; this is ~CP_LOCK_BURST× faster with the same coin-collision safety.
+    private static final int  CP_LOCK_BURST = 2;            // max concurrent responder locks (each on a distinct coin)
+    private static final long CP_LOCK_TIMEOUT_SECS = 600;   // per-leg watchdog (its leg refunds if it never confirms); ≫ a normal ~2-block confirm
+    private final Map<String,String> cpInFlight  = Collections.synchronizedMap(new HashMap<>());  // hash → pinned coinid ("" = slot reserved, coin not yet picked)
+    private final Map<String,Long>   cpLockSince = Collections.synchronizedMap(new HashMap<>());  // hash → lock time (watchdog)
+    // PROCESS-WIDE per-hash marker: MainActivity + SwapService run SEPARATE engines (same process). The MINIMA leg
+    // has no on-chain hash-uniqueness, so without this a fg↔bg handoff mid-lock could lock a SECOND coin for the
+    // SAME hash → the taker claims both with one secret → the maker loses the second coin. Shared + released on
+    // err/watchdog/confirm; keyed by hash so it blocks a same-hash re-lock WITHOUT blocking distinct-hash bursts.
+    private static final Map<String,Long> CP_LOCKING = Collections.synchronizedMap(new HashMap<>());
+
+    private void releaseCpLeg(String hash) { cpInFlight.remove(hash); cpLockSince.remove(hash); CP_LOCKING.remove(hash); }
 
     /** At publish: trim the ask ladder to the tranches I can actually lock right now, run {@code afterPublish},
      *  then (if short + allowed) notify + split toward full depth. */
@@ -595,13 +604,12 @@ public final class SwapEngine {
         try { eth = new EthHtlc(rpc, wallet.creds(), net); } catch (Exception e) { return; }
         final String myEth = wallet.address();
 
-        // Release the responder single-flight gate: the pending counter-leg lock has confirmed on-chain (its
-        // coin is spendable-safe at coinage:1), so the NEXT take may lock this cycle; or it never confirmed
-        // (dropped/replaced) and the watchdog frees the gate so we don't wedge — that one leg simply refunds.
-        final String pend = cpLockPending.get();
-        if (pend != null) {
-            if (nowUnix() - cpLockSince > CP_LOCK_TIMEOUT_SECS) cpLockPending.compareAndSet(pend, null);
-            else confirmMyLock(pend, true, onChain -> { if (onChain) cpLockPending.compareAndSet(pend, null); });
+        // Free any burst slot whose lock has confirmed on-chain (coinage:1 → its coin is safely spent, so the
+        // NEXT take can lock), or whose watchdog fired (never confirmed → that one leg refunds; no wedge).
+        for (String h : new java.util.ArrayList<>(cpInFlight.keySet())) {
+            Long since = cpLockSince.get(h);
+            if (since != null && nowUnix() - since > CP_LOCK_TIMEOUT_SECS) { releaseCpLeg(h); continue; }
+            confirmMyLock(h, true, onChain -> { if (onChain) releaseCpLeg(h); });
         }
 
         // PRIMARY (works on free/keyless RPCs): for every known swap, read its ETH leg by deterministic
@@ -744,15 +752,19 @@ public final class SwapEngine {
         if (c.timelock - nowUnix() < CP_SECS_CHECK) { declineNote(hash, "their USDT lock is too close to its timeout"); return; }
         if (myOrder == null) return;                                      // order not loaded yet — retry next cycle
         if (!acceptTakerBuyMinima(c)) { declineNote(hash, "it didn't fit any level of your ladder (price, level size, or minimum)"); return; }
-        if (!cpLockPending.compareAndSet(null, hash)) return;       // serialize: atomically claim the single-flight slot (same-cycle safe)
-        cpLockSince = nowUnix();
-        if (!inflight.add("cpMin:" + hash)) { cpLockPending.compareAndSet(hash, null); return; }
-        // Cross-process belt: don't lock while ANY MINIMA is still settling — catches the other engine's lock
-        // across a foreground↔background handoff (the chain's unconfirmed pool is global). Retries next cycle.
-        minima.hasPendingMinima(pending -> {
-            if (pending) { inflight.remove("cpMin:" + hash); cpLockPending.compareAndSet(hash, null); return; }
-            lockMinimaCounterLeg(c, minimaBlock);
-        }, e -> { inflight.remove("cpMin:" + hash); cpLockPending.compareAndSet(hash, null); });
+        // Claim a burst slot AND the cross-engine per-hash marker atomically (under the shared CP_LOCKING monitor):
+        // up to CP_LOCK_BURST distinct-hash locks in flight (each gets a DISTINCT coin in lockMinimaCounterLeg),
+        // and no OTHER engine can re-lock this same hash mid-flight. Both released together in releaseCpLeg.
+        synchronized (CP_LOCKING) {
+            Long lk = CP_LOCKING.get(hash);
+            if (lk != null && nowUnix() - lk < CP_LOCK_TIMEOUT_SECS) return;              // another engine is locking this hash
+            if (cpInFlight.size() >= CP_LOCK_BURST || cpInFlight.containsKey(hash)) return; // burst full / already mine
+            CP_LOCKING.put(hash, nowUnix());
+            cpInFlight.put(hash, "");
+        }
+        cpLockSince.put(hash, nowUnix());
+        if (!inflight.add("cpMin:" + hash)) { releaseCpLeg(hash); return; }
+        lockMinimaCounterLeg(c, minimaBlock);
     }
 
     /** Tell the maker (once) why a handshake-announced buy was declined, so a reject isn't silent. */
@@ -782,27 +794,45 @@ public final class SwapEngine {
         final int timelock = minimaBlock + CP_BLOCKS;
         final String reqMinimaHuman = EthWallet.format(c.requestAmount, 18, 18);   // MINIMA they want from me
         final String receiverPubkey = c.minimaPublicKey;                           // initiator's Minima pubkey
-        ui.post(() -> minima.lock(reqMinimaHuman, reqMinimaHuman, "minima", receiverPubkey,
-                myEth(), hash, timelock, "FALSE", new MinimaHtlc.PostCb() {
-            @Override public void ok(String txpowid) {
-                db.logEvent(hash, SwapDb.EV_CPSENT, "minima", reqMinimaHuman, txpowid);
-                EthNet.Token tk = net.tokenByAddress(c.tokenContract);
-                String sym = tk == null ? "token" : tk.symbol;
-                SwapDb.Swap s = baseSwap(hash, "RESPONDER", "ERC20_TO_MINIMA",
-                        "MINIMA", reqMinimaHuman, sym, EthWallet.format(c.amount, decimalsOf(c.tokenContract), 18),
-                        receiverPubkey);
-                s.myTimelock = timelock; s.myLegIsMinima = true; s.contractId = c.contractId;
-                s.status = SwapDb.ST_LOCKED;
-                db.upsertSwap(s);
-                notifier.notify("Locked your MINIMA", "Waiting for the counterparty to reveal the secret");
-                notifier.onSwapsChanged();
-                inflight.remove("cpMin:" + hash);
+        ui.post(() -> minima.myFreeCoins(coins -> {
+            // Pin a DISTINCT confirmed coin ≥ the lock amount, not already reserved by another in-flight lock —
+            // so this burst lock can't double-select with its siblings. Pick + reserve atomically.
+            final java.math.BigDecimal need = new java.math.BigDecimal(reqMinimaHuman);   // exact ≥ compare (no float edge)
+            String pickId = null, pickAmt = null;
+            synchronized (cpInFlight) {
+                java.util.Collection<String> used = cpInFlight.values();
+                for (int i = 0; i < coins.length(); i++) {
+                    JSONObject cc = coins.optJSONObject(i);
+                    if (cc == null) continue;
+                    String cid = cc.optString("coinid", ""), amt = cc.optString("amount", "0");
+                    if (cid.isEmpty() || used.contains(cid)) continue;
+                    try { if (new java.math.BigDecimal(amt).compareTo(need) >= 0) { pickId = cid; pickAmt = amt; cpInFlight.put(hash, cid); break; } } catch (Exception ignore) {}
+                }
             }
-            @Override public void err(String m) {
-                inflight.remove("cpMin:" + hash);
-                cpLockPending.compareAndSet(hash, null);   // send never broadcast → release the gate, retry next cycle
-            }
-        }));
+            if (pickId == null) { releaseCpLeg(hash); inflight.remove("cpMin:" + hash); return; }   // no free coin now — retry next cycle
+            minima.lockFromCoin(pickId, pickAmt, reqMinimaHuman, reqMinimaHuman, "minima", receiverPubkey,
+                    myEth(), hash, timelock, "FALSE", new MinimaHtlc.PostCb() {
+                @Override public void ok(String txpowid) {
+                    db.logEvent(hash, SwapDb.EV_CPSENT, "minima", reqMinimaHuman, txpowid);
+                    EthNet.Token tk = net.tokenByAddress(c.tokenContract);
+                    String sym = tk == null ? "token" : tk.symbol;
+                    SwapDb.Swap s = baseSwap(hash, "RESPONDER", "ERC20_TO_MINIMA",
+                            "MINIMA", reqMinimaHuman, sym, EthWallet.format(c.amount, decimalsOf(c.tokenContract), 18),
+                            receiverPubkey);
+                    s.myTimelock = timelock; s.myLegIsMinima = true; s.contractId = c.contractId;
+                    s.status = SwapDb.ST_LOCKED;
+                    db.upsertSwap(s);
+                    notifier.notify("Locked your MINIMA", "Waiting for the counterparty to reveal the secret");
+                    notifier.onSwapsChanged();
+                    inflight.remove("cpMin:" + hash);
+                    // keep cpInFlight[hash] reserved until the lock CONFIRMS (freed in runEthChecks) — holds the coin
+                }
+                @Override public void err(String m) {
+                    inflight.remove("cpMin:" + hash);
+                    releaseCpLeg(hash);   // never broadcast → free the slot + coin, retry next cycle
+                }
+            });
+        }, e -> { releaseCpLeg(hash); inflight.remove("cpMin:" + hash); }));
     }
 
     // ============================================================ order-match guards (fund safety)
