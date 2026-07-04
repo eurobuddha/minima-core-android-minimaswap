@@ -165,7 +165,12 @@ public final class MinimaHtlc {
     /** Lock the HTLC counter-leg from a SPECIFIC coin (pinned by coinid) — produces the SAME output coin as
      *  {@link #lock} (byte-identical state[0..7]) but with NO node coin-selection, so several concurrent burst
      *  locks each pinned to a DISTINCT coin can never double-select. Change (coinAmount − amount) → myAddress.
-     *  Built via the same txncreate…txnpost sequence claim/refund use, with the exact state values lock() writes. */
+     *  Built via the same txncreate…txnpost sequence claim/refund use, with the exact state values lock() writes.
+     *  <p>COST: this is ~14 node commands vs the 1 a plain {@code send} uses — heavier per lock on the embedded
+     *  node (the price of pinning a distinct coin). If it ever dominates, a 1-command alternative is
+     *  {@code send fromaddress:<addr>} over distinct-address split coins, reusing the proven {@code send state:}
+     *  encoding. The err carries a "POSTED:" prefix iff the failure was at txnpost (broadcast MAY have landed
+     *  with a lost response) so the caller can avoid a re-lock; a build-phase failure has no prefix (safe retry). */
     public void lockFromCoin(String coinid, String coinAmount, String amount, String requestAmount, String reqToken,
                              String receiverPubkey, String ownerEthKey, String hashlock, int timelockBlock,
                              String otc, PostCb cb) {
@@ -186,8 +191,13 @@ public final class MinimaHtlc {
         seq.add("txnoutput id:" + id + " amount:" + amount + " address:" + HTLC_ADDRESS + " tokenid:0x00 storestate:true");
         if (positive(change)) seq.add("txnoutput id:" + id + " amount:" + change + " address:" + myAddress + " tokenid:0x00 storestate:false");
         seq.add("txnsign id:" + id + " publickey:auto");
-        seq.add("txnpost id:" + id + " mine:true auto:true txndelete:true");
-        runSeq(seq, last -> cb.ok(txpowOf(last)), e -> { deleteTxn(id); cb.err(e); });
+        // Split the broadcast (txnpost) from the build: a build failure PROVABLY didn't broadcast (caller may
+        // retry); a txnpost failure MAY have broadcast with a lost response, so it's tagged "POSTED:" and the
+        // caller must NOT retry (the MINIMA leg has no on-chain hash-uniqueness → a retry would double-lock).
+        runSeq(seq, built -> cmd("txnpost id:" + id + " mine:true auto:true txndelete:true",
+                posted -> cb.ok(txpowOf(posted)),
+                e -> { deleteTxn(id); cb.err("POSTED:" + e); }),
+            e -> { deleteTxn(id); cb.err(e); });
     }
 
     /** My spendable native-MINIMA coins (confirmed, simple-address) — the pool an ask ladder can lock against.

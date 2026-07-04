@@ -186,6 +186,12 @@ public final class SwapDb {
         }
     }
 
+    /** Remove a swap row — used to release a record-before-broadcast reservation when the responder's lock
+     *  PROVABLY never broadcast, so the leg can be retried. Never call this for a lock that may have landed. */
+    public synchronized void deleteSwap(String hash) {
+        helper.getWritableDatabase().delete("swaps", "hash=?", new String[]{norm(hash)});
+    }
+
     /** All swaps, newest first. */
     public synchronized List<Swap> allSwaps() {
         List<Swap> out = new ArrayList<>();

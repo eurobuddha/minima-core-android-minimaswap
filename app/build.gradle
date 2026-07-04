@@ -10,8 +10,8 @@ android {
         applicationId "org.minimarex.minimaswap"
         minSdk 28
         targetSdk 35
-        versionCode 1303
-        versionName "0.13.3"
+        versionCode 1304
+        versionName "0.13.4"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }

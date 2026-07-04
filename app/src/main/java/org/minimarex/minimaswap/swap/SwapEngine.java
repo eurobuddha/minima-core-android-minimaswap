@@ -131,7 +131,11 @@ public final class SwapEngine {
     // err/watchdog/confirm; keyed by hash so it blocks a same-hash re-lock WITHOUT blocking distinct-hash bursts.
     private static final Map<String,Long> CP_LOCKING = Collections.synchronizedMap(new HashMap<>());
 
-    private void releaseCpLeg(String hash) { cpInFlight.remove(hash); cpLockSince.remove(hash); CP_LOCKING.remove(hash); }
+    // All cpInFlight/CP_LOCKING mutations go through the shared CP_LOCKING monitor (single lock, one invariant:
+    // cpInFlight.size() ≤ CP_LOCK_BURST) — never two monitors on the same state.
+    private void releaseCpLeg(String hash) {
+        synchronized (CP_LOCKING) { cpInFlight.remove(hash); cpLockSince.remove(hash); CP_LOCKING.remove(hash); }
+    }
 
     /** At publish: trim the ask ladder to the tranches I can actually lock right now, run {@code afterPublish},
      *  then (if short + allowed) notify + split toward full depth. */
@@ -606,7 +610,14 @@ public final class SwapEngine {
 
         // Free any burst slot whose lock has confirmed on-chain (coinage:1 → its coin is safely spent, so the
         // NEXT take can lock), or whose watchdog fired (never confirmed → that one leg refunds; no wedge).
-        for (String h : new java.util.ArrayList<>(cpInFlight.keySet())) {
+        final java.util.List<String> pendLegs;
+        synchronized (CP_LOCKING) {
+            pendLegs = new java.util.ArrayList<>(cpInFlight.keySet());
+            // Prune stale CP_LOCKING markers (owning engine died mid-flight so its confirm-release never ran;
+            // the DB row + haveSentCounterParty already dedup). Bounds the static map in a long-running process.
+            CP_LOCKING.entrySet().removeIf(e -> nowUnix() - e.getValue() > CP_LOCK_TIMEOUT_SECS);
+        }
+        for (String h : pendLegs) {
             Long since = cpLockSince.get(h);
             if (since != null && nowUnix() - since > CP_LOCK_TIMEOUT_SECS) { releaseCpLeg(h); continue; }
             confirmMyLock(h, true, onChain -> { if (onChain) releaseCpLeg(h); });
@@ -749,6 +760,10 @@ public final class SwapEngine {
         // I don't know the secret → I'm an ERC20→MINIMA responder; lock the MINIMA counter-leg.
         if (c.otc) return;
         if (db.haveSentCounterParty(hash)) return;
+        // Persistent dedup (survives a restart / a lost txnpost response that the in-memory CP_LOCKING can't):
+        // lockMinimaCounterLeg records the swap row BEFORE broadcast, so a row here means this hash is already
+        // being (or was) locked — never re-lock it (the MINIMA leg has no on-chain hash-uniqueness).
+        if (db.getSwap(hash) != null) return;
         if (c.timelock - nowUnix() < CP_SECS_CHECK) { declineNote(hash, "their USDT lock is too close to its timeout"); return; }
         if (myOrder == null) return;                                      // order not loaded yet — retry next cycle
         if (!acceptTakerBuyMinima(c)) { declineNote(hash, "it didn't fit any level of your ladder (price, level size, or minimum)"); return; }
@@ -756,6 +771,7 @@ public final class SwapEngine {
         // up to CP_LOCK_BURST distinct-hash locks in flight (each gets a DISTINCT coin in lockMinimaCounterLeg),
         // and no OTHER engine can re-lock this same hash mid-flight. Both released together in releaseCpLeg.
         synchronized (CP_LOCKING) {
+            if (db.getSwap(hash) != null) return;                                        // re-check the persistent row ATOMICALLY with the reserve (closes a stale-getSwap TOCTOU)
             Long lk = CP_LOCKING.get(hash);
             if (lk != null && nowUnix() - lk < CP_LOCK_TIMEOUT_SECS) return;              // another engine is locking this hash
             if (cpInFlight.size() >= CP_LOCK_BURST || cpInFlight.containsKey(hash)) return; // burst full / already mine
@@ -799,7 +815,7 @@ public final class SwapEngine {
             // so this burst lock can't double-select with its siblings. Pick + reserve atomically.
             final java.math.BigDecimal need = new java.math.BigDecimal(reqMinimaHuman);   // exact ≥ compare (no float edge)
             String pickId = null, pickAmt = null;
-            synchronized (cpInFlight) {
+            synchronized (CP_LOCKING) {                       // single monitor for all cpInFlight mutations
                 java.util.Collection<String> used = cpInFlight.values();
                 for (int i = 0; i < coins.length(); i++) {
                     JSONObject cc = coins.optJSONObject(i);
@@ -810,18 +826,23 @@ public final class SwapEngine {
                 }
             }
             if (pickId == null) { releaseCpLeg(hash); inflight.remove("cpMin:" + hash); return; }   // no free coin now — retry next cycle
+            // RECORD-BEFORE-BROADCAST (mirrors lockEthCounterLeg's Fix D): persist the swap row NOW, so a process
+            // kill or a lost txnpost response between broadcast and ok() can't re-lock this hash on restart. The
+            // row (gated in checkCanCollectEth via getSwap!=null) is the only restart-proof dedup the MINIMA leg
+            // has (no on-chain hash-uniqueness). EV_CPSENT stays AFTER (→ haveSentCounterParty).
+            EthNet.Token tk = net.tokenByAddress(c.tokenContract);
+            String sym = tk == null ? "token" : tk.symbol;
+            SwapDb.Swap s = baseSwap(hash, "RESPONDER", "ERC20_TO_MINIMA",
+                    "MINIMA", reqMinimaHuman, sym, EthWallet.format(c.amount, decimalsOf(c.tokenContract), 18),
+                    receiverPubkey);
+            s.myTimelock = timelock; s.myLegIsMinima = true; s.contractId = c.contractId;
+            s.status = SwapDb.ST_LOCKED;
+            db.upsertSwap(s);
+            notifier.onSwapsChanged();
             minima.lockFromCoin(pickId, pickAmt, reqMinimaHuman, reqMinimaHuman, "minima", receiverPubkey,
                     myEth(), hash, timelock, "FALSE", new MinimaHtlc.PostCb() {
                 @Override public void ok(String txpowid) {
                     db.logEvent(hash, SwapDb.EV_CPSENT, "minima", reqMinimaHuman, txpowid);
-                    EthNet.Token tk = net.tokenByAddress(c.tokenContract);
-                    String sym = tk == null ? "token" : tk.symbol;
-                    SwapDb.Swap s = baseSwap(hash, "RESPONDER", "ERC20_TO_MINIMA",
-                            "MINIMA", reqMinimaHuman, sym, EthWallet.format(c.amount, decimalsOf(c.tokenContract), 18),
-                            receiverPubkey);
-                    s.myTimelock = timelock; s.myLegIsMinima = true; s.contractId = c.contractId;
-                    s.status = SwapDb.ST_LOCKED;
-                    db.upsertSwap(s);
                     notifier.notify("Locked your MINIMA", "Waiting for the counterparty to reveal the secret");
                     notifier.onSwapsChanged();
                     inflight.remove("cpMin:" + hash);
@@ -829,7 +850,10 @@ public final class SwapEngine {
                 }
                 @Override public void err(String m) {
                     inflight.remove("cpMin:" + hash);
-                    releaseCpLeg(hash);   // never broadcast → free the slot + coin, retry next cycle
+                    // Retry ONLY if the failure provably didn't broadcast (build phase, no "POSTED:" tag); a
+                    // txnpost failure may have landed with a lost response → keep the row so we never re-lock.
+                    if (m == null || !m.startsWith("POSTED:")) db.deleteSwap(hash);
+                    releaseCpLeg(hash);
                 }
             });
         }, e -> { releaseCpLeg(hash); inflight.remove("cpMin:" + hash); }));
