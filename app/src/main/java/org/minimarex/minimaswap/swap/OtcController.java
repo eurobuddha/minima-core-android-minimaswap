@@ -37,8 +37,7 @@ public final class OtcController {
     private volatile CommsIdentity identity;
     private volatile String myMinimaPk = "", myEthAddr = "";
     private volatile boolean myOfferEnabled = false;
-    private volatile String myOfferSide = OtcOffer.LP_SELLS_MINIMA;
-    private volatile double myOfferSize = 0;
+    private volatile double myOfferSellSize = 0, myOfferBuySize = 0;
     private volatile long lastProposeNote = 0;
 
     public OtcController(NodeApi node, OtcDb otcDb, SwapEngine engine, Ui ui) {
@@ -55,10 +54,8 @@ public final class OtcController {
 
     /** My current published OTC availability — used to validate an inbound PROPOSE (I only accept deals on the side
      *  I advertise and within my advertised size; if I'm not live, I'm not an LP and ignore PROPOSEs). */
-    public void setMyOffer(boolean enabled, String side, double size) {
-        this.myOfferEnabled = enabled;
-        this.myOfferSide = side == null ? OtcOffer.LP_SELLS_MINIMA : side;
-        this.myOfferSize = size;
+    public void setMyOffer(boolean enabled, double sellSize, double buySize) {
+        this.myOfferEnabled = enabled; this.myOfferSellSize = sellSize; this.myOfferBuySize = buySize;
     }
 
     private static double parseD(String s) { try { return Double.parseDouble(s.trim()); } catch (Exception e) { return 0; } }
@@ -99,8 +96,9 @@ public final class OtcController {
         OtcDb.Deal d = otcDb.getDeal(m.ref);
         if (OtcMessage.PROPOSE.equals(m.type)) {
             if (d != null) return;                                         // first PROPOSE only (ref is unique)
-            if (!myOfferEnabled || !myOfferSide.equals(m.side)) return;    // I must be a LIVE LP on this exact side
-            if (parseD(m.amount) <= 0 || parseD(m.amount) > myOfferSize + 1e-9) return;   // within my advertised size
+            double cap = OtcOffer.LP_SELLS_MINIMA.equals(m.side) ? myOfferSellSize : myOfferBuySize;
+            if (!myOfferEnabled || cap <= 0) return;                       // I must be a LIVE LP on THIS side
+            if (parseD(m.amount) <= 0 || parseD(m.amount) > cap + 1e-9) return;   // within my advertised size for that side
             if (parseD(m.price) <= 0) return;
             d = new OtcDb.Deal();
             d.ref = m.ref; d.role = OtcDb.ROLE_LP;
@@ -162,13 +160,13 @@ public final class OtcController {
     // ---------- send (outbound) ----------
 
     /** Instigator opens a deal against an LP offer. */
-    public void propose(OtcOffer lp, String amount, String price, SendResult res) {
+    public void propose(OtcOffer lp, String dealSide, String amount, String price, SendResult res) {
         if (!ready()) { res.err("still connecting"); return; }
         if (parseD(amount) <= 0 || parseD(price) <= 0) { res.err("enter amount + price"); return; }
         OtcDb.Deal d = new OtcDb.Deal();
         d.ref = rndHex(16); d.role = OtcDb.ROLE_INSTIGATOR;
         d.peerCommsId = lp.commsPublicId; d.peerMinimaPk = lp.minimaPublicKey; d.peerEthAddr = lp.ethAddress;
-        d.side = lp.side; d.amount = amount; d.price = price;
+        d.side = dealSide; d.amount = amount; d.price = price;
         d.status = OtcDb.ST_PROPOSED; d.whoseTurn = OtcDb.TURN_PEER;
         otcDb.upsertDeal(d);
         sendMsg(d, OtcMessage.PROPOSE, "", res);

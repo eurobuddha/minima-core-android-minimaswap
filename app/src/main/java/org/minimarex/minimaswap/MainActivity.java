@@ -609,7 +609,7 @@ public class MainActivity extends AppCompatActivity {
         if (otc != null && crypto != null && identity != null && myMinimaPk != null && ethAddr != null) {
             otc.setSelf(crypto, identity, myMinimaPk, ethAddr);
             otc.setMyOffer(prefs.getBoolean("otc_enable", false),
-                    prefs.getString("otc_side", OtcOffer.LP_SELLS_MINIMA), parseD(prefs.getString("otc_size", "0"), 0));
+                    parseD(prefs.getString("otc_sell_size", "0"), 0), parseD(prefs.getString("otc_buy_size", "0"), 0));
         }
     }
 
@@ -2853,27 +2853,18 @@ public class MainActivity extends AppCompatActivity {
         otcSectionHead(col, "MY AVAILABILITY");
         LinearLayout box = otcCardBox(col);
         final boolean enabled = prefs.getBoolean("otc_enable", false);
-        final String[] side = { prefs.getString("otc_side", OtcOffer.LP_SELLS_MINIMA) };
 
-        LinearLayout sideRow = new LinearLayout(this); sideRow.setOrientation(LinearLayout.HORIZONTAL); sideRow.setPadding(0, 0, 0, dp(8));
-        final TextView sell = Design.pill(this, "I SELL MINIMA", Design.SURFACE2(), Design.TEXT());
-        final TextView buy = Design.pill(this, "I BUY MINIMA", Design.SURFACE2(), Design.TEXT());
-        final Runnable paint = () -> {
-            boolean s = OtcOffer.LP_SELLS_MINIMA.equals(side[0]);
-            sell.setBackground(Design.roundBg(this, s ? Design.ACCENT() : Design.SURFACE2(), 16)); sell.setTextColor(s ? Design.ON_ACCENT() : Design.TEXT());
-            buy.setBackground(Design.roundBg(this, !s ? Design.ACCENT() : Design.SURFACE2(), 16)); buy.setTextColor(!s ? Design.ON_ACCENT() : Design.TEXT());
-        };
-        sell.setOnClickListener(v -> { side[0] = OtcOffer.LP_SELLS_MINIMA; paint.run(); });
-        buy.setOnClickListener(v -> { side[0] = OtcOffer.LP_BUYS_MINIMA; paint.run(); });
-        Design.pressable(sell); Design.pressable(buy);
-        LinearLayout.LayoutParams s1 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); s1.rightMargin = dp(6);
-        LinearLayout.LayoutParams s2 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        sideRow.addView(sell, s1); sideRow.addView(buy, s2); box.addView(sideRow); paint.run();
+        box.addView(fieldLabel("I SELL MINIMA up to"));
+        final EditText sellE = new EditText(this); decimalInput(sellE);
+        sellE.setHint("max MINIMA (blank = off)"); sellE.setHintTextColor(Design.DIM2());
+        sellE.setText(prefs.getString("otc_sell_size", "")); sellE.setTextColor(Design.TEXT()); sellE.setTextSize(15f); sellE.setTypeface(Design.mono());
+        box.addView(sellE);
 
-        final EditText sizeE = new EditText(this); decimalInput(sizeE);
-        sizeE.setHint("max MINIMA per deal"); sizeE.setHintTextColor(Design.DIM2());
-        sizeE.setText(prefs.getString("otc_size", "")); sizeE.setTextColor(Design.TEXT()); sizeE.setTextSize(15f); sizeE.setTypeface(Design.mono());
-        box.addView(sizeE);
+        box.addView(fieldLabel("I BUY MINIMA up to"));
+        final EditText buyE = new EditText(this); decimalInput(buyE);
+        buyE.setHint("max MINIMA (blank = off)"); buyE.setHintTextColor(Design.DIM2());
+        buyE.setText(prefs.getString("otc_buy_size", "")); buyE.setTextColor(Design.TEXT()); buyE.setTextSize(15f); buyE.setTypeface(Design.mono());
+        box.addView(buyE);
 
         TextView st = new TextView(this);
         st.setText(enabled ? "● Live — LPs can negotiate with you" : "○ Off"); st.setTextColor(enabled ? Design.IN() : Design.DIM());
@@ -2882,10 +2873,11 @@ public class MainActivity extends AppCompatActivity {
         LinearLayout btns = new LinearLayout(this); btns.setOrientation(LinearLayout.HORIZONTAL);
         TextView pubBtn = Design.pill(this, enabled ? "Update" : "Go live", Design.ACCENT(), Design.ON_ACCENT());
         pubBtn.setOnClickListener(v -> {
-            double sz = parseD(sizeE.getText().toString(), 0);
-            if (sz <= 0) { toast("Enter a max MINIMA size"); return; }
-            prefs.edit().putString("otc_side", side[0]).putString("otc_size", trim(sz)).putBoolean("otc_enable", true).putBoolean("otc_auto", true).apply();
-            publishOtcOffer(side[0], sz);
+            double sell = parseD(sellE.getText().toString(), 0), buy = parseD(buyE.getText().toString(), 0);
+            if (sell <= 0 && buy <= 0) { toast("Enter a sell and/or buy size"); return; }
+            prefs.edit().putString("otc_sell_size", sell > 0 ? trim(sell) : "").putString("otc_buy_size", buy > 0 ? trim(buy) : "")
+                    .putBoolean("otc_enable", true).putBoolean("otc_auto", true).apply();
+            publishOtcOffer(sell, buy);
         });
         Design.pressable(pubBtn); btns.addView(pubBtn);
         if (enabled) {
@@ -2904,12 +2896,26 @@ public class MainActivity extends AppCompatActivity {
             if (!o.hasLiquidity() || o.commsPublicId == null || o.commsPublicId.isEmpty()) continue;
             any = true;
             LinearLayout box = otcCardBox(col);
+            StringBuilder sides = new StringBuilder();
+            if (o.sells()) sides.append("sells up to ").append(trimSig(o.sellSize)).append(" MINIMA");
+            if (o.buys()) { if (sides.length() > 0) sides.append("   ·   "); sides.append("buys up to ").append(trimSig(o.buySize)).append(" MINIMA"); }
             TextView t = new TextView(this);
-            t.setText((OtcOffer.LP_SELLS_MINIMA.equals(o.side) ? "SELLS MINIMA" : "BUYS MINIMA") + " · up to " + trimSig(o.size) + " MINIMA");
-            t.setTextColor(Design.TEXT()); t.setTextSize(15f); t.setTypeface(Design.sansBold()); box.addView(t);
-            TextView who = new TextView(this); who.setText("LP " + shortAddr(o.signerPk) + " · tap to negotiate");
-            who.setTextColor(Design.DIM()); who.setTextSize(12f); who.setTypeface(Design.sans()); who.setPadding(0, dp(4), 0, 0); box.addView(who);
-            box.setOnClickListener(v -> otcProposeDialog(o)); Design.pressable(box);
+            t.setText(sides.toString()); t.setTextColor(Design.TEXT()); t.setTextSize(14.5f); t.setTypeface(Design.sansBold()); box.addView(t);
+            TextView who = new TextView(this); who.setText("LP " + shortAddr(o.signerPk));
+            who.setTextColor(Design.DIM()); who.setTextSize(12f); who.setTypeface(Design.sans()); who.setPadding(0, dp(4), 0, dp(8)); box.addView(who);
+            LinearLayout row = new LinearLayout(this); row.setOrientation(LinearLayout.HORIZONTAL);
+            if (o.sells()) {   // LP sells → I can BUY MINIMA from them
+                TextView b = Design.pill(this, "Buy MINIMA", Design.ACCENT(), Design.ON_ACCENT());
+                b.setOnClickListener(v -> otcProposeDialog(o, OtcOffer.LP_SELLS_MINIMA)); Design.pressable(b);
+                LinearLayout.LayoutParams m = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT); m.rightMargin = dp(8);
+                row.addView(b, m);
+            }
+            if (o.buys()) {    // LP buys → I can SELL MINIMA to them
+                TextView s = Design.pill(this, "Sell MINIMA", Design.SURFACE2(), Design.TEXT());
+                s.setOnClickListener(v -> otcProposeDialog(o, OtcOffer.LP_BUYS_MINIMA)); Design.pressable(s);
+                row.addView(s);
+            }
+            box.addView(row);
         }
         if (!any) { TextView none = new TextView(this); none.setText("No OTC LPs online right now."); none.setTextColor(Design.DIM()); none.setTextSize(13f); none.setTypeface(Design.sans()); none.setPadding(0, 0, 0, dp(10)); col.addView(none); }
     }
@@ -2968,20 +2974,22 @@ public class MainActivity extends AppCompatActivity {
         return Design.DIM();
     }
 
-    private void otcProposeDialog(final OtcOffer lp) {
+    private void otcProposeDialog(final OtcOffer lp, final String dealSide) {
+        final boolean iBuy = OtcOffer.LP_SELLS_MINIMA.equals(dealSide);
+        final double cap = lp.capFor(dealSide);
         LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(dp(4), dp(4), dp(4), dp(4));
-        box.addView(fieldLabel("MINIMA amount (≤ " + trimSig(lp.size) + ")"));
+        box.addView(fieldLabel("MINIMA amount (≤ " + trimSig(cap) + ")"));
         final EditText amtE = new EditText(this); decimalInput(amtE); amtE.setTextColor(Design.TEXT()); amtE.setTextSize(16f); amtE.setTypeface(Design.mono()); box.addView(amtE);
         box.addView(fieldLabel("Price (USDT per MINIMA)"));
         final EditText prE = new EditText(this); decimalInput(prE); prE.setTextColor(Design.TEXT()); prE.setTextSize(16f); prE.setTypeface(Design.mono()); box.addView(prE);
         modalOpen = true;
-        dialog().setTitle(OtcOffer.LP_SELLS_MINIMA.equals(lp.side) ? "Propose a BUY" : "Propose a SELL")
+        dialog().setTitle(iBuy ? "Buy MINIMA" : "Sell MINIMA")
                 .setView(wrapScroll(box))
                 .setPositiveButton("Send offer", (dg, w) -> {
                     double a = parseD(amtE.getText().toString(), 0), p = parseD(prE.getText().toString(), 0);
                     if (a <= 0 || p <= 0) { toast("Enter amount + price"); return; }
-                    if (a > lp.size + 1e-9) { toast("Above the LP's max size"); return; }
-                    if (otc != null) otc.propose(lp, trim(a), trimSig(p), otcRes("Offer sent"));
+                    if (a > cap + 1e-9) { toast("Above the LP's max size"); return; }
+                    if (otc != null) otc.propose(lp, dealSide, trim(a), trimSig(p), otcRes("Offer sent"));
                 })
                 .setNegativeButton("Cancel", null)
                 .setOnDismissListener(dg -> { modalOpen = false; render(); })
@@ -3006,10 +3014,10 @@ public class MainActivity extends AppCompatActivity {
                 .show();
     }
 
-    private void publishOtcOffer(String side, double size) {
+    private void publishOtcOffer(double sellSize, double buySize) {
         if (identity == null || myMinimaPk == null || !wallet.ready()) { toast("Still connecting…"); return; }
         OtcOffer o = new OtcOffer();
-        o.side = side; o.size = size; o.enable = true;
+        o.sellSize = Math.max(0, sellSize); o.buySize = Math.max(0, buySize); o.enable = true;
         o.minimaPublicKey = myMinimaPk; o.ethAddress = ethAddr == null ? "" : ethAddr; o.commsPublicId = identity.publicId();
         OtcBook.publish(node, ls, identity, o, new CommsTransport.SendCb() {
             @Override public void onSent(String txpowid) { prefs.edit().putLong("otc_last_publish", System.currentTimeMillis()).apply(); ui.post(() -> { toast("You're live for OTC"); render(); }); }
@@ -3021,7 +3029,7 @@ public class MainActivity extends AppCompatActivity {
         prefs.edit().putBoolean("otc_enable", false).putBoolean("otc_auto", false).apply();
         if (identity == null || myMinimaPk == null) { render(); return; }
         OtcOffer o = new OtcOffer();
-        o.side = prefs.getString("otc_side", OtcOffer.LP_SELLS_MINIMA); o.size = 0; o.enable = false;
+        o.sellSize = 0; o.buySize = 0; o.enable = false;
         o.minimaPublicKey = myMinimaPk; o.ethAddress = ethAddr == null ? "" : ethAddr; o.commsPublicId = identity.publicId();
         OtcBook.publish(node, ls, identity, o, new CommsTransport.SendCb() {
             @Override public void onSent(String txpowid) { ui.post(() -> { toast("Withdrawn"); render(); }); }
@@ -3035,7 +3043,7 @@ public class MainActivity extends AppCompatActivity {
         if (!prefs.getBoolean("otc_auto", false)) return;
         if (System.currentTimeMillis() - prefs.getLong("otc_last_publish", 0) < REPUBLISH_INTERVAL_MS) return;
         prefs.edit().putLong("otc_last_publish", System.currentTimeMillis()).apply();
-        publishOtcOffer(prefs.getString("otc_side", OtcOffer.LP_SELLS_MINIMA), parseD(prefs.getString("otc_size", "0"), 0));
+        publishOtcOffer(parseD(prefs.getString("otc_sell_size", "0"), 0), parseD(prefs.getString("otc_buy_size", "0"), 0));
     }
 
     private int dp(int v) { return Design.dp(this, v); }

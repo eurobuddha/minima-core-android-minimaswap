@@ -212,8 +212,10 @@ public class SwapService extends Service {
         if (crypto == null || identity == null || engine == null || otc == null) return;
         if (myMinimaPk != null && wallet.ready()) {
             otc.setSelf(crypto, identity, myMinimaPk, wallet.address());
-            double sz; try { sz = Double.parseDouble(prefs.getString("otc_size", "0")); } catch (Exception e) { sz = 0; }
-            otc.setMyOffer(prefs.getBoolean("otc_enable", false), prefs.getString("otc_side", OtcOffer.LP_SELLS_MINIMA), sz);
+            double sell = 0, buy = 0;
+            try { sell = Double.parseDouble(prefs.getString("otc_sell_size", "0")); } catch (Exception ignore) {}
+            try { buy = Double.parseDouble(prefs.getString("otc_buy_size", "0")); } catch (Exception ignore) {}
+            otc.setMyOffer(prefs.getBoolean("otc_enable", false), sell, buy);
         }
         if (otcScanner == null)
             otcScanner = new CommsScanner(node, crypto, new PrefsMeta(prefs), OtcMessage.ADDRESS, otc::route, (ok, n) -> {});
