@@ -35,14 +35,16 @@ public final class PriceOracle {
     private PriceOracle() {}
 
     public static final String SOURCE = "MEXC";
+    private static final String DEPTH_URL = "https://api.mexc.com/api/v3/depth?symbol=MINIMAUSDT&limit=20";
     private static final String BOOK_URL = "https://api.mexc.com/api/v3/ticker/bookTicker?symbol=MINIMAUSDT";
-    private static final String LAST_URL = "https://api.mexc.com/api/v3/ticker/price?symbol=MINIMAUSDT";
 
     public static final long FRESH_MS = 5 * 60_000;          // max age a price may still price an order
     public static final long WITHDRAW_MS = 10 * 60_000;      // feed down this long → withdraw the pegged order
+    private static final long WITHDRAW_GRACE_MS = 60_000;    // must have been TRYING this long (this process) first
     private static final long FETCH_GAP_MS = 30_000;         // min gap between fetch attempts
     private static final long MIN_REPRICE_GAP_MS = 3 * 60_000;   // chain-spam floor between peg republishes
     private static final double JUMP_FRACTION = 0.5;         // a >50% move needs two consecutive agreeing reads
+    private static final double DEPTH_MIN_USDT = 25;         // effective bid/ask = book level where cumulative notional ≥ this
 
     // peg config — shared "minimaswap" prefs so MainActivity + SwapService read one source of truth
     public static final String P_ENABLE = "peg_enable";      // boolean: ladder pegged to the oracle
@@ -52,6 +54,8 @@ public final class PriceOracle {
     public static final String P_REPRICE = "peg_reprice_pct";// string double: republish when moved ≥ this %
     public static final String P_LAST_MID = "peg_last_mid";  // string double: oracle mid at the last pegged publish
     public static final String P_WITHDRAWN = "peg_withdrawn";// boolean: order pulled because the feed went stale
+    public static final String P_TOMBSTONED = "peg_tombstoned"; // boolean: the withdraw tombstone CONFIRMED on the wire
+    public static final String P_LAST_OK = "peg_last_ok";    // long: when the last good read landed (survives restarts)
 
     public static final int PEG_OFF = 0;      // not pegged (or unconfigured) — order left untouched
     public static final int PEG_APPLIED = 1;  // ladder regenerated from a fresh oracle price
@@ -67,6 +71,20 @@ public final class PriceOracle {
     private static double suspect = 0;                    // big-jump candidate awaiting a confirming read
     private static boolean fetching = false;
     private static String lastError = null;
+    private static SharedPreferences sPrefs;              // set by init(); only P_LAST_OK is written from here
+    private static double appliedMid = 0;                 // mid the last applyPeg priced from (for commitPeg)
+
+    /** Hand the oracle the shared "minimaswap" prefs and restore the persisted last-good stamp, so the
+     *  feed-down withdraw clock SURVIVES process restarts — OEM kills / AlarmManager relaunches must not
+     *  reset the safety window while a stale-priced order is still live on-chain. Call from both hosts'
+     *  onCreate, before the first tick. */
+    public static void init(SharedPreferences prefs) {
+        synchronized (LOCK) {
+            sPrefs = prefs;
+            long t = prefs.getLong(P_LAST_OK, 0), now = System.currentTimeMillis();
+            if (goodAtMs == 0 && t > 0 && t <= now) goodAtMs = t;   // timestamp only: price stays 0, so nothing quotes from it
+        }
+    }
 
     // ---- cached snapshot ----
 
@@ -78,11 +96,16 @@ public final class PriceOracle {
 
     public static boolean fresh() { return mid() > 0 && ageMs() <= FRESH_MS; }
 
-    /** No good read for longer than the safety window (counted from the first attempt if none ever landed). */
+    /** No good read for longer than the safety window. The baseline is the persisted last-good stamp (via
+     *  init), so process restarts don't reset the clock; and we require ≥ one grace period of actual TRYING
+     *  in this process first, so a cold start with an old stamp doesn't tombstone before the first fetch
+     *  has had a chance to land. */
     public static boolean feedDownPastLimit() {
         synchronized (LOCK) {
+            long now = System.currentTimeMillis();
+            if (firstTryMs == 0 || now - firstTryMs < WITHDRAW_GRACE_MS) return false;
             long ref = goodAtMs > 0 ? goodAtMs : firstTryMs;
-            return ref > 0 && System.currentTimeMillis() - ref > WITHDRAW_MS;
+            return now - ref > WITHDRAW_MS;
         }
     }
 
@@ -138,14 +161,26 @@ public final class PriceOracle {
 
     private static void fetchOnce() {
         try {
-            double b = 0, a = 0, m;
+            double b = 0, a = 0;
             try {
+                // PRIMARY: order-book depth. On a thin market the top-of-book is dust and trivially movable,
+                // so the effective bid/ask is the level where CUMULATIVE notional reaches DEPTH_MIN_USDT per
+                // side — dragging that price requires committing real size, not a dust order.
+                JSONObject depth = httpGet(DEPTH_URL);
+                b = effectiveLevel(depth.optJSONArray("bids"));
+                a = effectiveLevel(depth.optJSONArray("asks"));
+            } catch (IOException ignore) {
+                // FALLBACK: top-of-book only (depth endpoint unreachable). Weaker but still spread-checked.
                 JSONObject book = httpGet(BOOK_URL);
                 b = book.optDouble("bidPrice", 0);
                 a = book.optDouble("askPrice", 0);
-            } catch (IOException ignore) { /* fall through to last-trade */ }
-            if (b > 0 && a > 0 && b <= a && (a - b) / a < 0.2) m = (a + b) / 2;   // sane book → mid
-            else { m = httpGet(LAST_URL).optDouble("price", 0); b = a = 0; }       // else last trade
+            }
+            // No last-trade tier: on a thin market a dust self-trade can print any price inside the book —
+            // an empty/absent book means there is no market, and the freshness/withdraw machinery handles
+            // "no price" safely. Better no quote than a fake one.
+            if (!(b > 0) || !(a > 0) || b > a) throw new IOException("thin/empty book");
+            if ((a - b) / a >= 0.2) throw new IOException("spread too wide — book too thin to quote");
+            double m = (a + b) / 2;
             if (!(m > 0) || Double.isInfinite(m)) throw new IOException("bad price");
             synchronized (LOCK) {
                 if (price > 0 && Math.abs(m - price) / price > JUMP_FRACTION) {
@@ -159,10 +194,28 @@ public final class PriceOracle {
                 price = m; bid = b; ask = a;
                 goodAtMs = System.currentTimeMillis();
                 lastError = null;
+                if (sPrefs != null) sPrefs.edit().putLong(P_LAST_OK, goodAtMs).apply();   // withdraw clock survives restarts
             }
         } catch (Exception e) {
             synchronized (LOCK) { lastError = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(); }
         }
+    }
+
+    /** Price at which cumulative notional (price × qty) reaches DEPTH_MIN_USDT, or 0 if the side can't absorb
+     *  it (too thin to quote). Rows are ["price","qty"] pairs, best level first. */
+    private static double effectiveLevel(org.json.JSONArray side) {
+        try {
+            if (side == null) return 0;
+            double cum = 0;
+            for (int i = 0; i < side.length(); i++) {
+                org.json.JSONArray row = side.getJSONArray(i);
+                double px = Double.parseDouble(row.getString(0)), qty = Double.parseDouble(row.getString(1));
+                if (!(px > 0) || !(qty > 0)) return 0;
+                cum += px * qty;
+                if (cum >= DEPTH_MIN_USDT) return px;
+            }
+            return 0;
+        } catch (Exception e) { return 0; }
     }
 
     private static JSONObject httpGet(String u) throws IOException {
@@ -194,10 +247,12 @@ public final class PriceOracle {
 
     /**
      * Regenerate the order's ladder around the current oracle mid per the saved peg config, and persist
-     * the result to "order_config" (so a restart arms the responder guard with what was last published)
-     * plus the mid it was priced from (the reprice baseline). Clears {@link #P_WITHDRAWN} — a successful
-     * apply IS the recovery. Returns {@link #PEG_OFF} (order untouched), {@link #PEG_APPLIED}, or
-     * {@link #PEG_STALE} — on STALE the caller MUST NOT publish the order.
+     * the result to "order_config" (so a restart arms the responder guard with what is being published).
+     * The reprice BASELINE and the withdrawn-clear are NOT committed here — capture {@link #appliedMid()}
+     * right after a PEG_APPLIED return and call {@link #commitPeg} from the publish onSent, so a FAILED
+     * publish keeps the old baseline (the reprice retries) and stays withdrawn (the restore retries).
+     * Returns {@link #PEG_OFF} (order untouched), {@link #PEG_APPLIED}, or {@link #PEG_STALE} — on STALE
+     * the caller MUST NOT publish the order.
      */
     public static int applyPeg(Order o, SharedPreferences prefs) {
         if (!prefs.getBoolean(P_ENABLE, false)) return PEG_OFF;
@@ -218,10 +273,21 @@ public final class PriceOracle {
         p.buy = 0; p.sell = 0;   // re-derived from the fresh levels (editor-authoritative pattern)
         Order.sanitize(p);       // drops any bid a huge step pushed ≤ 0
         if (p.asks.isEmpty() && p.bids.isEmpty()) return PEG_STALE;   // belt: nothing valid → don't publish
-        prefs.edit().putString("order_config", Order.toConfigJson(o))
-                .putString(P_LAST_MID, Double.toString(m))
-                .putBoolean(P_WITHDRAWN, false).apply();
+        prefs.edit().putString("order_config", Order.toConfigJson(o)).apply();
+        synchronized (LOCK) { appliedMid = m; }
         return PEG_APPLIED;
+    }
+
+    /** The mid the LAST {@link #applyPeg} priced from. Capture into a final local immediately after a
+     *  PEG_APPLIED return (all callers run on the main thread) and hand it to {@link #commitPeg}. */
+    public static double appliedMid() { synchronized (LOCK) { return appliedMid; } }
+
+    /** Commit a pegged publish that CONFIRMED on the wire: advance the reprice baseline and clear the
+     *  withdrawn/tombstoned state. Call ONLY from the publish onSent — never before. */
+    public static void commitPeg(SharedPreferences prefs, double mid) {
+        prefs.edit().putString(P_LAST_MID, Double.toString(mid))
+                .putBoolean(P_WITHDRAWN, false)
+                .putBoolean(P_TOMBSTONED, false).apply();
     }
 
     /**

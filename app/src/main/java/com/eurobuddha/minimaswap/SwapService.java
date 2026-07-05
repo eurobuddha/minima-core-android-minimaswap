@@ -85,6 +85,7 @@ public class SwapService extends Service {
         startForegroundCompat();
 
         prefs = getSharedPreferences("minimaswap", MODE_PRIVATE);
+        PriceOracle.init(prefs);   // restore the persisted last-good stamp — the withdraw clock survives restarts
         ls = Sodium.get();
         EthNet net = EthNet.MAINNET;
         EthRpc rpc = new EthRpc(prefs.getString("rpc_mainnet", net.defaultRpc));
@@ -185,14 +186,15 @@ public class SwapService extends Service {
             // Also stand down while the Activity is running a market sweep — its sequential legs own the ETH
             // "pending" nonce / MINIMA coin selection, and a Service poll here could submit a colliding tx.
             if (!MainActivity.FOREGROUND && !MainActivity.SWEEP_ACTIVE && engine != null) {
-                engine.poll();
+                // Peg housekeeping BEFORE poll(): the armSafe guard re-sync must land before this engine can
+                // act on takes — after a fg/bg handoff the Activity may have withdrawn/restored while this
+                // engine still held the pre-handoff order (armSafe → empty while withdrawn).
                 if (prefs.getBoolean(PriceOracle.P_ENABLE, false) && prefs.getBoolean("auto_publish", false)) {
                     PriceOracle.refreshAsync();   // keep the peg's price fresh in the background (rate-limited)
-                    // Re-sync THIS engine's guard from the shared config each tick: a withdraw/restore done by
-                    // the Activity's engine must disarm/re-arm this one too (armSafe → empty while withdrawn).
                     engine.setMyOrder(PriceOracle.armSafe(loadOrder(), prefs));
                     maybePegWithdraw();           // feed down too long → pull the order + disarm the guard
                 }
+                engine.poll();
                 maybeAutoRepublish();
                 if (prefs.getBoolean("auto_publish", false)) engine.maintainLadderCoins(true);
             }
@@ -275,9 +277,11 @@ public class SwapService extends Service {
         final boolean restored = prefs.getBoolean(PriceOracle.P_WITHDRAWN, false);
         final int peg = PriceOracle.applyPeg(o, prefs);
         if (peg == PriceOracle.PEG_STALE) return;   // never republish at a stale oracle price (withdraw runs on the tick)
+        final double pegMid = PriceOracle.appliedMid();
         prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();
         engine.ensureLadderCoins(o, !MainActivity.SWEEP_ACTIVE, () -> SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
             @Override public void onSent(String txpowid) {
+                if (peg == PriceOracle.PEG_APPLIED) PriceOracle.commitPeg(prefs, pegMid);   // baseline moves only on a CONFIRMED publish
                 engine.setMyOrder(o);
                 if (restored && peg == PriceOracle.PEG_APPLIED)
                     alert(PriceOracle.SOURCE + " feed recovered", "Your pegged order is live again.");
@@ -291,18 +295,25 @@ public class SwapService extends Service {
      *  left behind. auto_publish stays ON — the order re-publishes automatically when the feed recovers. */
     private void maybePegWithdraw() {
         if (identity == null || myMinimaPk == null || !wallet.ready() || engine == null) return;
-        if (!PriceOracle.feedDownPastLimit() || prefs.getBoolean(PriceOracle.P_WITHDRAWN, false)) return;
-        prefs.edit().putBoolean(PriceOracle.P_WITHDRAWN, true).apply();
+        final boolean withdrawn = prefs.getBoolean(PriceOracle.P_WITHDRAWN, false);
+        if (withdrawn && prefs.getBoolean(PriceOracle.P_TOMBSTONED, false)) return;   // tombstone confirmed — done
+        if (withdrawn && PriceOracle.fresh()) return;    // feed already back — the restore republish takes over
+        if (!withdrawn && !PriceOracle.feedDownPastLimit()) return;
+        final boolean first = !withdrawn;                // else: retrying a tombstone whose broadcast failed
+        if (first) prefs.edit().putBoolean(PriceOracle.P_WITHDRAWN, true)
+                .putBoolean(PriceOracle.P_TOMBSTONED, false).apply();   // withdrawn state FIRST — kill-safe
         engine.setMyOrder(new Order());   // disarm NOW — an empty order declines every take — even if the publish fails
         Order o = loadOrder();            // tombstone: the saved order with no liquidity (freshest-per-signer wins)
         for (Order.Pair p : o.pairs.values()) p.enable = false;
         o.minimaPublicKey = myMinimaPk;
         o.ethAddress = wallet.address();
         SwapOrderBook.publish(node, ls, identity, o, new CommsTransport.SendCb() {
-            @Override public void onSent(String txpowid) {}
-            @Override public void onFailed(String message) { /* guard already disarmed; peers age the order out */ }
+            @Override public void onSent(String txpowid) {   // confirmed on the wire — stop retrying
+                prefs.edit().putBoolean(PriceOracle.P_TOMBSTONED, true).apply();
+            }
+            @Override public void onFailed(String message) { /* still un-TOMBSTONED → retried next tick */ }
         });
-        alert(PriceOracle.SOURCE + " price feed lost",
+        if (first) alert(PriceOracle.SOURCE + " price feed lost",
                 "Your pegged order was withdrawn for safety. It re-publishes automatically when the feed recovers.");
     }
 
