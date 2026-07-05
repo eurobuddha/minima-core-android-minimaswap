@@ -2938,7 +2938,11 @@ public class MainActivity extends AppCompatActivity {
             if (otc != null && OtcDb.TURN_ME.equals(d.whoseTurn) && (OtcDb.ST_PROPOSED.equals(d.status) || OtcDb.ST_COUNTERED.equals(d.status))) {
                 LinearLayout row = new LinearLayout(this); row.setOrientation(LinearLayout.HORIZONTAL); row.setPadding(0, dp(8), 0, 0);
                 TextView acc = Design.pill(this, "Accept", Design.IN(), Design.ON_ACCENT());
-                acc.setOnClickListener(v -> otc.accept(d, otcRes("Accepted")));
+                acc.setOnClickListener(v -> {
+                    String fundErr = otcCheckFunds(d.role, d.side, d.amount, d.price);
+                    if (fundErr != null) { toast(fundErr); return; }
+                    otc.accept(d, otcRes("Accepted"));
+                });
                 TextView cnt = Design.pill(this, "Counter", Design.SURFACE2(), Design.TEXT());
                 cnt.setOnClickListener(v -> otcCounterDialog(d));
                 TextView rej = Design.pill(this, "Reject", Design.SURFACE2(), Design.RED());
@@ -2974,6 +2978,27 @@ public class MainActivity extends AppCompatActivity {
         return Design.DIM();
     }
 
+    /** Pre-check that I can fund the leg I'll lock for an OTC deal (my role + the deal's side), from cached balances.
+     *  Returns null if OK (or the balance is unknown), else a user-facing shortfall message. The on-chain lock is the
+     *  authoritative backstop — this is a fast UX guard so I never offer/accept terms I can't fund. */
+    private String otcCheckFunds(String role, String side, String amount, String price) {
+        double amt = parseD(amount, 0), pr = parseD(price, 0);
+        boolean iLockMinima = (OtcDb.ROLE_INSTIGATOR.equals(role) && OtcOffer.LP_BUYS_MINIMA.equals(side))
+                || (OtcDb.ROLE_LP.equals(role) && OtcOffer.LP_SELLS_MINIMA.equals(side));
+        if (iLockMinima) {                                               // I'd lock MINIMA = amount
+            double have = parseD(minimaBal, -1);                         // "sendable" (tradeable) MINIMA
+            if (have < 0) return null;                                   // unknown → don't block; execute is the gate
+            if (amt > have + 1e-9) return "Not enough MINIMA — need " + trim(amt) + ", have " + trim(have);
+        } else {                                                        // I'd lock USDT = amount × price
+            String u = tokenBals.get("USDT");
+            if (u == null) return null;                                 // not loaded → don't block
+            double have = parseD(Util.tidyAmount(u), -1), need = amt * pr;
+            if (have < 0) return null;
+            if (need > have + 1e-9) return "Not enough USDT — need " + trim(need) + ", have " + trim(have);
+        }
+        return null;
+    }
+
     private void otcProposeDialog(final OtcOffer lp, final String dealSide) {
         final boolean iBuy = OtcOffer.LP_SELLS_MINIMA.equals(dealSide);
         final double cap = lp.capFor(dealSide);
@@ -2989,6 +3014,8 @@ public class MainActivity extends AppCompatActivity {
                     double a = parseD(amtE.getText().toString(), 0), p = parseD(prE.getText().toString(), 0);
                     if (a <= 0 || p <= 0) { toast("Enter amount + price"); return; }
                     if (a > cap + 1e-9) { toast("Above the LP's max size"); return; }
+                    String fundErr = otcCheckFunds(OtcDb.ROLE_INSTIGATOR, dealSide, trim(a), trimSig(p));
+                    if (fundErr != null) { toast(fundErr); return; }
                     if (otc != null) otc.propose(lp, dealSide, trim(a), trimSig(p), otcRes("Offer sent"));
                 })
                 .setNegativeButton("Cancel", null)
@@ -3007,6 +3034,8 @@ public class MainActivity extends AppCompatActivity {
                 .setPositiveButton("Send counter", (dg, w) -> {
                     double a = parseD(amtE.getText().toString(), 0), p = parseD(prE.getText().toString(), 0);
                     if (a <= 0 || p <= 0) { toast("Enter amount + price"); return; }
+                    String fundErr = otcCheckFunds(d.role, d.side, trim(a), trimSig(p));
+                    if (fundErr != null) { toast(fundErr); return; }
                     if (otc != null) otc.counter(d, trim(a), trimSig(p), otcRes("Counter sent"));
                 })
                 .setNegativeButton("Cancel", null)
