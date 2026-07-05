@@ -61,6 +61,7 @@ import org.minimarex.minimaswap.swap.OtcController;
 import org.minimarex.minimaswap.swap.OtcDb;
 import org.minimarex.minimaswap.swap.OtcMessage;
 import org.minimarex.minimaswap.swap.OtcOffer;
+import org.minimarex.minimaswap.swap.PriceOracle;
 import org.minimarex.minimaswap.swap.SwapDb;
 import org.minimarex.minimaswap.swap.SwapEngine;
 import org.minimarex.minimaswap.swap.SwapOrderBook;
@@ -179,6 +180,14 @@ public class MainActivity extends AppCompatActivity {
         @Override public void run() {
             if (sweepRun == null || !sweepRun.sell) {  // stand down only mid-SELL-sweep — a poll republish/claim
                 if (engine != null) engine.poll();     // could re-select a sell leg's MINIMA coins. A BUY sweep is
+                if (prefs.getBoolean(PriceOracle.P_ENABLE, false) && prefs.getBoolean("auto_publish", false)) {
+                    PriceOracle.refreshAsync();        // keep the peg's price fresh (rate-limited inside)
+                    // Re-sync THIS engine's guard from the shared config each tick: the Activity and the Service
+                    // each host their own engine, and a withdraw/restore done by the OTHER one must disarm/re-arm
+                    // this one too (armSafe → empty order while withdrawn = decline every take).
+                    if (engine != null) engine.setMyOrder(PriceOracle.armSafe(loadOrder(), prefs));
+                    maybePegWithdraw();                // feed down too long → pull the order + disarm the guard
+                }
                 maybeAutoRepublish();                  // nonce-serialized, so the poller may run alongside it.
                 maybeRepublishOtc();                   // keep my OTC availability live too
                 if (engine != null && prefs.getBoolean("auto_publish", false))
@@ -237,7 +246,9 @@ public class MainActivity extends AppCompatActivity {
             @Override public void note(String title, String body) { postNotification(title, body); }
         });
         engine.setNetwork(rpc, net);
-        engine.setMyOrder(loadOrder());
+        // armSafe: if a pegged order was withdrawn (stale MEXC feed), arm an EMPTY order — decline every
+        // take — rather than the saved ladder, whose prices the market may have left behind.
+        engine.setMyOrder(PriceOracle.armSafe(loadOrder(), prefs));
     }
 
     @Override public void onBackPressed() {
@@ -682,8 +693,24 @@ public class MainActivity extends AppCompatActivity {
     private void publishOrder() {
         if (identity == null || myMinimaPk == null) { toast("Still connecting to your node…"); return; }
         if (!wallet.ready()) { toast("ETH wallet not ready yet"); return; }
+        if (prefs.getBoolean(PriceOracle.P_ENABLE, false) && !PriceOracle.fresh()) {
+            // Pegged: grab a live price first so a user-tapped Publish never quotes a stale one.
+            orderStatus = "Fetching " + PriceOracle.SOURCE + " price…"; render();
+            io.execute(() -> { PriceOracle.refreshSync(); ui.post(this::publishOrderNow); });
+            return;
+        }
+        publishOrderNow();
+    }
+
+    private void publishOrderNow() {
         final Order o = baseOrder();
         if (o == null) { toast("Enable at least one pair in your order first"); return; }
+        // Pegged ladders are regenerated around the live oracle mid at EVERY publish; a stale feed never publishes.
+        final int peg = PriceOracle.applyPeg(o, prefs);
+        if (peg == PriceOracle.PEG_STALE) {
+            orderStatus = "✗ " + PriceOracle.SOURCE + " price unavailable — not publishing at a stale price";
+            render(); return;
+        }
         prefs.edit().putBoolean("auto_publish", true).apply();   // opt in to keep it live + fresh
         orderStatus = "Publishing your order…";
         render();
@@ -694,25 +721,61 @@ public class MainActivity extends AppCompatActivity {
             @Override public void onSent(String txpowid) {
                 prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();
                 engine.setMyOrder(o);
-                orderStatus = "✓ Order published — auto-refreshes every 30 min";
+                orderStatus = peg == PriceOracle.PEG_APPLIED
+                        ? "✓ Order live — pegged to " + PriceOracle.SOURCE + " (mid " + fmtPrice(PriceOracle.mid()) + "), auto-reprices"
+                        : "✓ Order published — auto-refreshes every 30 min";
                 render(); ui.postDelayed(MainActivity.this::scanOrderBook, 2000);
             }
             @Override public void onFailed(String message) { orderStatus = "Publish failed: " + message; render(); }
         }));
     }
 
-    /** Keep a published order live + its advertised size current: re-publish ~every 30 min (fresh sendable). */
+    /** Keep a published order live + its advertised size current: re-publish ~every 30 min (fresh sendable),
+     *  or NOW when the pegged oracle price has moved past the reprice threshold / the feed just recovered. */
     private void maybeAutoRepublish() {
         if (identity == null || myMinimaPk == null || !wallet.ready()) return;
         if (!prefs.getBoolean("auto_publish", false)) return;
-        if (System.currentTimeMillis() - prefs.getLong("last_publish", 0) < REPUBLISH_INTERVAL_MS) return;
+        boolean reprice = PriceOracle.shouldReprice(prefs, prefs.getLong("last_publish", 0));
+        if (!reprice && System.currentTimeMillis() - prefs.getLong("last_publish", 0) < REPUBLISH_INTERVAL_MS) return;
         final Order o = baseOrder();
         if (o == null) return;   // all pairs disabled → nothing to keep live
+        final boolean restored = prefs.getBoolean(PriceOracle.P_WITHDRAWN, false);
+        final int peg = PriceOracle.applyPeg(o, prefs);
+        if (peg == PriceOracle.PEG_STALE) return;   // never republish at a stale oracle price (withdraw runs on the tick)
         prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();   // stamp now to avoid re-entry
         engine.ensureLadderCoins(o, !SWEEP_ACTIVE, () -> SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
-            @Override public void onSent(String txpowid) { engine.setMyOrder(o); }
+            @Override public void onSent(String txpowid) {
+                engine.setMyOrder(o);
+                if (restored && peg == PriceOracle.PEG_APPLIED) {
+                    orderStatus = "✓ " + PriceOracle.SOURCE + " feed recovered — pegged order is live again";
+                    postNotification(PriceOracle.SOURCE + " feed recovered", "Your pegged order is live again.");
+                    render();
+                }
+            }
             @Override public void onFailed(String message) { /* retried next interval */ }
         }));
+    }
+
+    /** FUND-SAFETY: the oracle feed has been down past the safety window → publish a TOMBSTONE and DISARM the
+     *  responder guard, so we stop auto-accepting takes at a price the market may have left behind. auto_publish
+     *  stays ON — the order re-publishes (freshly priced) automatically as soon as the feed recovers. */
+    private void maybePegWithdraw() {
+        if (identity == null || myMinimaPk == null || !wallet.ready() || engine == null) return;
+        if (!PriceOracle.feedDownPastLimit() || prefs.getBoolean(PriceOracle.P_WITHDRAWN, false)) return;
+        prefs.edit().putBoolean(PriceOracle.P_WITHDRAWN, true).apply();
+        engine.setMyOrder(new Order());   // disarm NOW — an empty order declines every take — even if the publish fails
+        Order o = loadOrder();            // tombstone: the saved order with no liquidity (freshest-per-signer wins)
+        for (Order.Pair p : o.pairs.values()) p.enable = false;
+        o.minimaPublicKey = myMinimaPk;
+        o.ethAddress = wallet.address();
+        SwapOrderBook.publish(node, ls, identity, o, new CommsTransport.SendCb() {
+            @Override public void onSent(String txpowid) {}
+            @Override public void onFailed(String message) { /* guard already disarmed; peers age the order out */ }
+        });
+        orderStatus = "⚠ " + PriceOracle.SOURCE + " feed lost — pegged order withdrawn until it recovers";
+        postNotification(PriceOracle.SOURCE + " price feed lost",
+                "Your pegged order was withdrawn for safety. It re-publishes automatically when the feed recovers.");
+        render();
     }
 
     /** Push a just-saved order to the book NOW so an edit — especially DISABLE — takes effect in seconds, not
@@ -722,6 +785,10 @@ public class MainActivity extends AppCompatActivity {
     private void pushOrderEdit(Order o) {
         if (identity == null || myMinimaPk == null || !wallet.ready()) return;
         final boolean live = o.hasLiquidity();
+        if (live && PriceOracle.applyPeg(o, prefs) == PriceOracle.PEG_STALE) {
+            orderStatus = "Saved. " + PriceOracle.SOURCE + " price unavailable — publishes when the feed recovers.";
+            render(); return;
+        }
         if (!live) prefs.edit().putBoolean("auto_publish", false).apply();   // disabled/emptied → stop keeping it live
         orderStatus = live ? "Updating your order…" : "Withdrawing your order…";
         render();
@@ -746,7 +813,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void saveOrder(Order o) {
         prefs.edit().putString("order_config", Order.toConfigJson(o)).apply();
-        if (engine != null) engine.setMyOrder(o);   // arm the responder match guard immediately
+        if (engine != null) engine.setMyOrder(PriceOracle.armSafe(o, prefs));   // arm the responder match guard immediately
     }
 
     private void editOrderDialog() {
@@ -770,10 +837,47 @@ public class MainActivity extends AppCompatActivity {
         sw.setText("Enabled"); sw.setTextColor(Design.DIM()); sw.setChecked(p.enable);
         box.addView(sw);
 
+        // ---- auto-MM: peg the ladder to the live MEXC MINIMA/USDT market ----
+        box.addView(fieldLabel("AUTO MARKET-MAKE — PEG TO " + PriceOracle.SOURCE));
+        final SwitchCompat pegSw = new SwitchCompat(this);
+        pegSw.setText("Peg ladder to " + PriceOracle.SOURCE + " (auto-reprice)");
+        pegSw.setTextColor(Design.DIM());
+        pegSw.setChecked(prefs.getBoolean(PriceOracle.P_ENABLE, false));
+        box.addView(pegSw);
+        final TextView pegPx = new TextView(this);
+        pegPx.setTextColor(Design.DIM()); pegPx.setTextSize(11.5f); pegPx.setTypeface(Design.mono());
+        pegPx.setPadding(0, dp(2), 0, dp(2));
+        pegPx.setText(PriceOracle.describe());
+        box.addView(pegPx);
+        TextView pegHint = new TextView(this);
+        pegHint.setText("While pegged, the ladder regenerates around the " + PriceOracle.SOURCE + " mid (± step %, "
+                + "your size per level) at every publish, and re-publishes when the market moves ≥ your threshold. "
+                + "If the feed goes down your order is withdrawn for safety, then restored when it recovers.");
+        pegHint.setTextColor(Design.DIM2()); pegHint.setTextSize(11f); pegHint.setTypeface(Design.sans());
+        pegHint.setLineSpacing(dp(2), 1f); pegHint.setPadding(0, 0, 0, dp(4));
+        box.addView(pegHint);
+        LinearLayout pegRow = new LinearLayout(this);
+        pegRow.setOrientation(LinearLayout.HORIZONTAL); pegRow.setGravity(Gravity.CENTER_VERTICAL); pegRow.setPadding(0, dp(2), 0, dp(2));
+        final EditText biasE = genField("skew ±%"), repE = genField("reprice ≥ %");
+        biasE.setFilters(new InputFilter[]{ (source, start, end, dest, dstart, dend) -> {   // skew may be negative
+            String r = dest.toString().substring(0, dstart) + source.subSequence(start, end) + dest.toString().substring(dend);
+            return (r.isEmpty() || r.matches("-?[0-9]*\\.?[0-9]*")) ? null : "";
+        }});
+        biasE.setText(prefs.getString(PriceOracle.P_BIAS, ""));
+        repE.setText(prefs.getString(PriceOracle.P_REPRICE, "1"));
+        LinearLayout.LayoutParams pr1 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); pr1.rightMargin = dp(6);
+        LinearLayout.LayoutParams pr2 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        pegRow.addView(biasE, pr1); pegRow.addView(repE, pr2);
+        box.addView(pegRow);
+
         // quick-generate
         box.addView(fieldLabel("QUICK GENERATE (mid · step % · size)"));
         LinearLayout gen = new LinearLayout(this); gen.setOrientation(LinearLayout.HORIZONTAL); gen.setGravity(Gravity.CENTER_VERTICAL); gen.setPadding(0, dp(4), 0, dp(2));
         final EditText midE = genField("mid"), stepE = genField("step %"), sizeE = genField("size");
+        if (pegSw.isChecked()) {   // step/size double as the peg's ladder parameters — show the saved ones
+            stepE.setText(prefs.getString(PriceOracle.P_STEP, ""));
+            sizeE.setText(prefs.getString(PriceOracle.P_SIZE, ""));
+        }
         LinearLayout.LayoutParams g1 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); g1.rightMargin = dp(6);
         LinearLayout.LayoutParams g2 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); g2.rightMargin = dp(6);
         LinearLayout.LayoutParams g3 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
@@ -825,8 +929,59 @@ public class MainActivity extends AppCompatActivity {
         for (EditText[] row : bidRows) { row[0].addTextChangedListener(w); row[1].addTextChangedListener(w); }
         upd.run();
 
+        // ---- peg wiring: preview the rows from the live oracle price; poll the price line while open ----
+        final boolean[] dlgOpen = { true };
+        final boolean[] pegAwaitFill = { false };
+        final Runnable fillFromPeg = () -> {
+            double m = PriceOracle.mid();
+            if (!(m > 0) || !PriceOracle.fresh()) return;
+            double bias = Math.max(-20, Math.min(20, parseD(biasE.getText().toString(), 0)));
+            double quoted = m * (1 + bias / 100.0);
+            midE.setText(trimSig(quoted));
+            double step = parseD(stepE.getText().toString(), 0), size = parseD(sizeE.getText().toString(), 0);
+            if (step <= 0 || size <= 0) return;   // mid shown; rows need step + size
+            for (int i = 0; i < Order.MAX_LEVELS; i++) {
+                askRows[i][0].setText(trimSig(quoted * (1 + (i + 1) * step / 100.0))); askRows[i][1].setText(trimSig(size));
+                bidRows[i][0].setText(trimSig(quoted * (1 - (i + 1) * step / 100.0))); bidRows[i][1].setText(trimSig(size));
+            }
+            pegAwaitFill[0] = false;
+            upd.run();
+        };
+        final Runnable pegModeUi = () -> {
+            boolean on = pegSw.isChecked();
+            midE.setEnabled(!on); midE.setAlpha(on ? 0.5f : 1f);   // the mid comes from the oracle while pegged
+        };
+        pegModeUi.run();
+        final Runnable[] pegTick = new Runnable[1];
+        pegTick[0] = () -> {
+            if (!dlgOpen[0]) return;   // dialog dismissed → stop polling
+            pegPx.setText(PriceOracle.describe());
+            if (pegSw.isChecked()) {
+                PriceOracle.refreshAsync();
+                if (pegAwaitFill[0]) fillFromPeg.run();   // fill once the first price lands
+            }
+            ui.postDelayed(pegTick[0], 2000);
+        };
+        ui.postDelayed(pegTick[0], 1000);
+        PriceOracle.refreshAsync();
+        pegSw.setOnCheckedChangeListener((btn, on) -> {
+            pegModeUi.run();
+            if (on) {
+                PriceOracle.refreshAsync();
+                if (PriceOracle.fresh()) fillFromPeg.run();
+                else { pegAwaitFill[0] = true; toast("Fetching " + PriceOracle.SOURCE + " price…"); }
+            }
+        });
+
         genBtn.setOnClickListener(v -> {
-            double mid = parseD(midE.getText().toString(), 0), step = parseD(stepE.getText().toString(), 0), size = parseD(sizeE.getText().toString(), 0);
+            double step = parseD(stepE.getText().toString(), 0), size = parseD(sizeE.getText().toString(), 0);
+            if (pegSw.isChecked()) {   // pegged: generate a preview around the LIVE oracle mid
+                if (step <= 0 || size <= 0) { toast("Enter step % and size to generate"); return; }
+                if (!PriceOracle.fresh()) { pegAwaitFill[0] = true; PriceOracle.refreshAsync(); toast("Fetching " + PriceOracle.SOURCE + " price…"); return; }
+                fillFromPeg.run();
+                return;
+            }
+            double mid = parseD(midE.getText().toString(), 0);
             if (mid <= 0 || step <= 0 || size <= 0) { toast("Enter mid price, step % and size to generate"); return; }
             for (int i = 0; i < Order.MAX_LEVELS; i++) {
                 askRows[i][0].setText(trimSig(mid * (1 + (i + 1) * step / 100.0))); askRows[i][1].setText(trimSig(size));
@@ -851,6 +1006,20 @@ public class MainActivity extends AppCompatActivity {
                     // legacy price live — otherwise the engine's empty-ladder fallback would keep trading it.
                     p.buy = 0; p.sell = 0;
                     Order.sanitize(p);   // drop blanks/invalids, cap 6, sort, derive best-level scalars for non-empty sides
+                    // Persist the auto-MM peg config (SwapService republishes from the same prefs). Step/size are
+                    // the quick-generate fields — the peg reuses them as its ladder parameters.
+                    boolean pegOn = pegSw.isChecked();
+                    double pStep = parseD(stepE.getText().toString(), 0), pSize = parseD(sizeE.getText().toString(), 0);
+                    if (pegOn && (pStep <= 0 || pSize <= 0)) { pegOn = false; toast("Peg needs a step % and size — saved with peg OFF"); }
+                    double pBias = Math.max(-20, Math.min(20, parseD(biasE.getText().toString(), 0)));
+                    double pRep = Math.max(0.1, parseD(repE.getText().toString(), 1));
+                    prefs.edit().putBoolean(PriceOracle.P_ENABLE, pegOn)
+                            .putString(PriceOracle.P_STEP, pStep > 0 ? trimSig(pStep) : "")
+                            .putString(PriceOracle.P_SIZE, pSize > 0 ? trimSig(pSize) : "")
+                            .putString(PriceOracle.P_BIAS, pBias != 0 ? trimSig(pBias) : "")
+                            .putString(PriceOracle.P_REPRICE, trimSig(pRep))
+                            .putBoolean(PriceOracle.P_WITHDRAWN, pegOn && prefs.getBoolean(PriceOracle.P_WITHDRAWN, false))
+                            .apply();
                     saveOrder(o);
                     if (p.enable && p.asks.isEmpty() && p.bids.isEmpty())
                         toast("Enabled, but no levels set — add a bid or ask to publish");
@@ -861,7 +1030,7 @@ public class MainActivity extends AppCompatActivity {
                     if (prefs.getBoolean("auto_publish", false)) pushOrderEdit(o);
                 })
                 .setNegativeButton("Cancel", null)
-                .setOnDismissListener(d -> { modalOpen = false; render(); })
+                .setOnDismissListener(d -> { dlgOpen[0] = false; modalOpen = false; render(); })
                 .show();
     }
 
@@ -2097,6 +2266,14 @@ public class MainActivity extends AppCompatActivity {
         hint.setText("The live order book. Tap a price to trade, or publish your own offer.");
         hint.setTextColor(Design.DIM()); hint.setTextSize(12.5f); hint.setTypeface(Design.sans()); hint.setPadding(0, dp(2), 0, dp(2));
         col.addView(hint);
+
+        PriceOracle.refreshAsync();   // keep the reference price current while the tab is watched (rate-limited)
+        if (PriceOracle.mid() > 0) {
+            TextView mexc = new TextView(this);
+            mexc.setText(PriceOracle.describe());
+            mexc.setTextColor(Design.DIM()); mexc.setTextSize(11.5f); mexc.setTypeface(Design.mono()); mexc.setPadding(0, dp(2), 0, dp(2));
+            col.addView(mexc);
+        }
 
         LinearLayout obHeader = new LinearLayout(this);
         obHeader.setOrientation(LinearLayout.HORIZONTAL);

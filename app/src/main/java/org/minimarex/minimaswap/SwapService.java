@@ -37,6 +37,7 @@ import org.minimarex.minimaswap.swap.OtcController;
 import org.minimarex.minimaswap.swap.OtcDb;
 import org.minimarex.minimaswap.swap.OtcMessage;
 import org.minimarex.minimaswap.swap.OtcOffer;
+import org.minimarex.minimaswap.swap.PriceOracle;
 import org.minimarex.minimaswap.swap.SwapDb;
 import org.minimarex.minimaswap.swap.SwapEngine;
 import org.minimarex.minimaswap.swap.SwapOrderBook;
@@ -99,7 +100,8 @@ public class SwapService extends Service {
             @Override public void note(String title, String body) { alert(title, body); }
         });
         engine.setNetwork(rpc, net);
-        engine.setMyOrder(loadOrder());
+        // armSafe: while a pegged order is withdrawn (stale MEXC feed) arm an EMPTY order — decline every take.
+        engine.setMyOrder(PriceOracle.armSafe(loadOrder(), prefs));
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) { return START_STICKY; }
@@ -182,7 +184,18 @@ public class SwapService extends Service {
         @Override public void run() {
             // Also stand down while the Activity is running a market sweep — its sequential legs own the ETH
             // "pending" nonce / MINIMA coin selection, and a Service poll here could submit a colliding tx.
-            if (!MainActivity.FOREGROUND && !MainActivity.SWEEP_ACTIVE && engine != null) { engine.poll(); maybeAutoRepublish(); if (prefs.getBoolean("auto_publish", false)) engine.maintainLadderCoins(true); }
+            if (!MainActivity.FOREGROUND && !MainActivity.SWEEP_ACTIVE && engine != null) {
+                engine.poll();
+                if (prefs.getBoolean(PriceOracle.P_ENABLE, false) && prefs.getBoolean("auto_publish", false)) {
+                    PriceOracle.refreshAsync();   // keep the peg's price fresh in the background (rate-limited)
+                    // Re-sync THIS engine's guard from the shared config each tick: a withdraw/restore done by
+                    // the Activity's engine must disarm/re-arm this one too (armSafe → empty while withdrawn).
+                    engine.setMyOrder(PriceOracle.armSafe(loadOrder(), prefs));
+                    maybePegWithdraw();           // feed down too long → pull the order + disarm the guard
+                }
+                maybeAutoRepublish();
+                if (prefs.getBoolean("auto_publish", false)) engine.maintainLadderCoins(true);
+            }
             h.postDelayed(this, INTERVAL_MS);
         }
     };
@@ -245,11 +258,13 @@ public class SwapService extends Service {
         return set;
     }
 
-    /** Keep a published order live + its size current while the app is closed (~30 min, fresh sendable). */
+    /** Keep a published order live + its size current while the app is closed (~30 min, fresh sendable) —
+     *  or NOW when the pegged oracle price moved past the reprice threshold / the feed just recovered. */
     private void maybeAutoRepublish() {
         if (identity == null || myMinimaPk == null || !wallet.ready()) return;
         if (!prefs.getBoolean("auto_publish", false)) return;
-        if (System.currentTimeMillis() - prefs.getLong("last_publish", 0) < MainActivity.REPUBLISH_INTERVAL_MS) return;
+        boolean reprice = PriceOracle.shouldReprice(prefs, prefs.getLong("last_publish", 0));
+        if (!reprice && System.currentTimeMillis() - prefs.getLong("last_publish", 0) < MainActivity.REPUBLISH_INTERVAL_MS) return;
         Order o = loadOrder();
         o.minimaPublicKey = myMinimaPk;
         o.ethAddress = wallet.address();
@@ -257,11 +272,38 @@ public class SwapService extends Service {
         boolean anyEnabled = false;
         for (Order.Pair p : o.pairs.values()) if (p.enable) { anyEnabled = true; break; }
         if (!anyEnabled) return;
+        final boolean restored = prefs.getBoolean(PriceOracle.P_WITHDRAWN, false);
+        final int peg = PriceOracle.applyPeg(o, prefs);
+        if (peg == PriceOracle.PEG_STALE) return;   // never republish at a stale oracle price (withdraw runs on the tick)
         prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();
         engine.ensureLadderCoins(o, !MainActivity.SWEEP_ACTIVE, () -> SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
-            @Override public void onSent(String txpowid) { engine.setMyOrder(o); }
+            @Override public void onSent(String txpowid) {
+                engine.setMyOrder(o);
+                if (restored && peg == PriceOracle.PEG_APPLIED)
+                    alert(PriceOracle.SOURCE + " feed recovered", "Your pegged order is live again.");
+            }
             @Override public void onFailed(String message) {}
         }));
+    }
+
+    /** FUND-SAFETY (mirrors MainActivity.maybePegWithdraw): oracle feed down past the safety window → publish a
+     *  TOMBSTONE and DISARM the responder guard so we stop auto-accepting takes at a price the market may have
+     *  left behind. auto_publish stays ON — the order re-publishes automatically when the feed recovers. */
+    private void maybePegWithdraw() {
+        if (identity == null || myMinimaPk == null || !wallet.ready() || engine == null) return;
+        if (!PriceOracle.feedDownPastLimit() || prefs.getBoolean(PriceOracle.P_WITHDRAWN, false)) return;
+        prefs.edit().putBoolean(PriceOracle.P_WITHDRAWN, true).apply();
+        engine.setMyOrder(new Order());   // disarm NOW — an empty order declines every take — even if the publish fails
+        Order o = loadOrder();            // tombstone: the saved order with no liquidity (freshest-per-signer wins)
+        for (Order.Pair p : o.pairs.values()) p.enable = false;
+        o.minimaPublicKey = myMinimaPk;
+        o.ethAddress = wallet.address();
+        SwapOrderBook.publish(node, ls, identity, o, new CommsTransport.SendCb() {
+            @Override public void onSent(String txpowid) {}
+            @Override public void onFailed(String message) { /* guard already disarmed; peers age the order out */ }
+        });
+        alert(PriceOracle.SOURCE + " price feed lost",
+                "Your pegged order was withdrawn for safety. It re-publishes automatically when the feed recovers.");
     }
 
     // ----- engine notifier: OS notifications only (no UI here); SwapDb carries state to the Activity -----
