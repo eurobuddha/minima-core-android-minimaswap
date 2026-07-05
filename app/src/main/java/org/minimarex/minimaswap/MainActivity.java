@@ -56,6 +56,11 @@ import org.minimarex.minimaswap.eth.EthRpc;
 import org.minimarex.minimaswap.eth.EthWallet;
 import org.minimarex.minimaswap.swap.MinimaHtlc;
 import org.minimarex.minimaswap.swap.Order;
+import org.minimarex.minimaswap.swap.OtcBook;
+import org.minimarex.minimaswap.swap.OtcController;
+import org.minimarex.minimaswap.swap.OtcDb;
+import org.minimarex.minimaswap.swap.OtcMessage;
+import org.minimarex.minimaswap.swap.OtcOffer;
 import org.minimarex.minimaswap.swap.SwapDb;
 import org.minimarex.minimaswap.swap.SwapEngine;
 import org.minimarex.minimaswap.swap.SwapOrderBook;
@@ -112,14 +117,18 @@ public class MainActivity extends AppCompatActivity {
     private SwapDb db;
     private SwapEngine engine;
     private final LinkedHashMap<String, Order> orderBook = new LinkedHashMap<>();
+    private final LinkedHashMap<String, OtcOffer> otcBook = new LinkedHashMap<>();   // other LPs' availability
+    private OtcDb otcDb;
+    private OtcController otc;
+    private CommsScanner otcScanner;    // receives OTC negotiation messages
     private String orderStatus = null;
     private CommsScanner takeScanner;   // maker side: receives buyers' hashlock handshakes
     private int historyTab = 0;         // Activity sub-tab: 0 = my swaps, 1 = market
     // ---- tabs ----
-    private static final int TAB_SWAP = 0, TAB_WALLET = 1, TAB_ACTIVITY = 2, TAB_MARKET = 3;
-    private static final String[] TAB_LABELS = {"Swap", "Wallet", "Activity", "Market"};
+    private static final int TAB_SWAP = 0, TAB_WALLET = 1, TAB_ACTIVITY = 2, TAB_MARKET = 3, TAB_OTC = 4;
+    private static final String[] TAB_LABELS = {"Swap", "Wallet", "Activity", "Market", "OTC"};
     private int currentTab = TAB_SWAP;
-    private final TextView[] tabPills = new TextView[4];
+    private final TextView[] tabPills = new TextView[5];
     private boolean swapSell = true;    // Swap tab direction: true = Sell MINIMA, false = Buy MINIMA
     private String swapAmount = "";     // Swap tab "you send" amount — persists across tree rebuilds
     private boolean swapInputFocused = false;   // suppress background render() while typing the swap amount
@@ -155,8 +164,8 @@ public class MainActivity extends AppCompatActivity {
     private LinearLayout root;
     private ScrollView scroller;
     private LinearLayout tabBar;
-    private final ImageView[] tabIcons = new ImageView[4];
-    private final LinearLayout[] tabCells = new LinearLayout[4];
+    private final ImageView[] tabIcons = new ImageView[5];
+    private final LinearLayout[] tabCells = new LinearLayout[5];
     private TextView pairingBanner;
     private boolean animateTab = false;   // fade in ONLY on a tab switch, never on a background refresh
     private boolean watching = false;
@@ -171,6 +180,7 @@ public class MainActivity extends AppCompatActivity {
             if (sweepRun == null || !sweepRun.sell) {  // stand down only mid-SELL-sweep — a poll republish/claim
                 if (engine != null) engine.poll();     // could re-select a sell leg's MINIMA coins. A BUY sweep is
                 maybeAutoRepublish();                  // nonce-serialized, so the poller may run alongside it.
+                maybeRepublishOtc();                   // keep my OTC availability live too
                 if (engine != null && prefs.getBoolean("auto_publish", false))
                     engine.maintainLadderCoins(!SWEEP_ACTIVE);   // replenish coins consumed by fills (rate-limited)
             }
@@ -185,6 +195,7 @@ public class MainActivity extends AppCompatActivity {
     private final Runnable discoveryTick = new Runnable() {
         @Override public void run() {
             scanTakeRequests();
+            scanOtc();
             ui.postDelayed(this, DISCOVERY_INTERVAL_MS);
         }
     };
@@ -219,6 +230,12 @@ public class MainActivity extends AppCompatActivity {
         node = new NodeApi(this, this::onPaired);
         minima = new MinimaHtlc(node);
         engine = new SwapEngine(node, minima, db, wallet, ui, notifier);
+        otcDb = new OtcDb(this);
+        engine.setOtcDb(otcDb);
+        otc = new OtcController(node, otcDb, engine, new OtcController.Ui() {
+            @Override public void onDealsChanged() { ui.post(() -> { if (currentTab == TAB_OTC && !modalOpen) render(); }); }
+            @Override public void note(String title, String body) { postNotification(title, body); }
+        });
         engine.setNetwork(rpc, net);
         engine.setMyOrder(loadOrder());
     }
@@ -390,7 +407,7 @@ public class MainActivity extends AppCompatActivity {
             try {
                 byte[] seed = ikm.startsWith("0x") ? Hex.from(ikm) : ikm.getBytes(StandardCharsets.UTF_8);
                 CommsIdentity id = CommsIdentity.fromSeed(ls, seed);
-                ui.post(() -> { identity = id; crypto = new LocalEcCryptoProvider(ls, id); render(); scanOrderBook(); });
+                ui.post(() -> { identity = id; crypto = new LocalEcCryptoProvider(ls, id); render(); scanOrderBook(); scanOtc(); });
             } catch (Exception e) {
                 ui.post(() -> toast("Identity error: " + e.getMessage()));
             }
@@ -569,6 +586,31 @@ public class MainActivity extends AppCompatActivity {
                 },
                 err -> { orderStatus = "Book scan: " + err; render(); });
         scanTakeRequests();
+    }
+
+    /** Scan the OTC availability board (other LPs) + drive the OTC negotiation-message receiver. Light + bounded. */
+    private void scanOtc() {
+        if (!paired || ls == null || identity == null) return;
+        refreshOtcSelf();
+        OtcBook.scan(node, ls, book -> {
+            book.remove("0x" + org.minimarex.comms.Hex.to(identity.signPk));   // exclude my own offer from the LP list
+            otcBook.clear(); otcBook.putAll(book);
+            if (currentTab == TAB_OTC && !modalOpen) render();
+        }, err -> {});
+        if (otc != null && crypto != null) {
+            if (otcScanner == null)
+                otcScanner = new CommsScanner(node, crypto, new PrefsMeta(prefs), OtcMessage.ADDRESS, otc::route, (ok, n) -> {});
+            otcScanner.scan(chainBlock);
+            otc.expireStale(System.currentTimeMillis());
+        }
+    }
+
+    private void refreshOtcSelf() {
+        if (otc != null && crypto != null && identity != null && myMinimaPk != null && ethAddr != null) {
+            otc.setSelf(crypto, identity, myMinimaPk, ethAddr);
+            otc.setMyOffer(prefs.getBoolean("otc_enable", false),
+                    prefs.getString("otc_side", OtcOffer.LP_SELLS_MINIMA), parseD(prefs.getString("otc_size", "0"), 0));
+        }
     }
 
     // ---- buy handshake (maker side): receive buyers' hashlocks so we can getContract their USDT lock ----
@@ -1150,7 +1192,7 @@ public class MainActivity extends AppCompatActivity {
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setBackgroundColor(Design.SURFACE());
         bar.setPadding(dp(6), dp(7), dp(6), dp(9));
-        final int[] icons = {R.drawable.ic_tab_swap, R.drawable.ic_tab_wallet, R.drawable.ic_tab_activity, R.drawable.ic_tab_market};
+        final int[] icons = {R.drawable.ic_tab_swap, R.drawable.ic_tab_wallet, R.drawable.ic_tab_activity, R.drawable.ic_tab_market, R.drawable.ic_tab_otc};
         for (int i = 0; i < TAB_LABELS.length; i++) {
             final int idx = i;
             boolean sel = idx == currentTab;
@@ -1224,6 +1266,7 @@ public class MainActivity extends AppCompatActivity {
             case TAB_WALLET:   renderWalletTab(col); break;
             case TAB_ACTIVITY: renderActivityTab(col); break;
             case TAB_MARKET:   renderMarketTab(col); break;
+            case TAB_OTC:      renderOtcTab(col); break;
             case TAB_SWAP:
             default:           renderSwapTab(col); break;
         }
@@ -2775,6 +2818,225 @@ public class MainActivity extends AppCompatActivity {
         return Util.tidyAmount(new BigDecimal(v, new java.math.MathContext(10)).stripTrailingZeros().toPlainString());
     }
     private static double parseD(String s, double def) { try { return Double.parseDouble(s.trim()); } catch (Exception e) { return def; } }
+
+    // ============================================================ OTC deals tab
+
+    private void renderOtcTab(LinearLayout col) {
+        TextView intro = new TextView(this);
+        intro.setText("Negotiate a custom size + price directly with a liquidity provider, then settle as a trustless HTLC swap.");
+        intro.setTextColor(Design.DIM()); intro.setTextSize(12f); intro.setTypeface(Design.sans());
+        intro.setLineSpacing(dp(2), 1f); intro.setPadding(0, 0, 0, dp(10));
+        col.addView(intro);
+        renderOtcAvailability(col);
+        renderOtcProviders(col);
+        renderOtcDeals(col);
+    }
+
+    private LinearLayout otcCardBox(LinearLayout col) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setBackground(Design.card(this, 18));
+        box.setPadding(dp(16), dp(14), dp(16), dp(14));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = dp(10); box.setLayoutParams(lp);
+        col.addView(box);
+        return box;
+    }
+
+    private void otcSectionHead(LinearLayout col, String s) {
+        TextView t = new TextView(this);
+        t.setText(s); t.setTextColor(Design.DIM()); t.setTextSize(12f); t.setTypeface(Design.sansBold()); t.setLetterSpacing(0.05f);
+        t.setPadding(0, dp(8), 0, dp(6)); col.addView(t);
+    }
+
+    private void renderOtcAvailability(LinearLayout col) {
+        otcSectionHead(col, "MY AVAILABILITY");
+        LinearLayout box = otcCardBox(col);
+        final boolean enabled = prefs.getBoolean("otc_enable", false);
+        final String[] side = { prefs.getString("otc_side", OtcOffer.LP_SELLS_MINIMA) };
+
+        LinearLayout sideRow = new LinearLayout(this); sideRow.setOrientation(LinearLayout.HORIZONTAL); sideRow.setPadding(0, 0, 0, dp(8));
+        final TextView sell = Design.pill(this, "I SELL MINIMA", Design.SURFACE2(), Design.TEXT());
+        final TextView buy = Design.pill(this, "I BUY MINIMA", Design.SURFACE2(), Design.TEXT());
+        final Runnable paint = () -> {
+            boolean s = OtcOffer.LP_SELLS_MINIMA.equals(side[0]);
+            sell.setBackground(Design.roundBg(this, s ? Design.ACCENT() : Design.SURFACE2(), 16)); sell.setTextColor(s ? Design.ON_ACCENT() : Design.TEXT());
+            buy.setBackground(Design.roundBg(this, !s ? Design.ACCENT() : Design.SURFACE2(), 16)); buy.setTextColor(!s ? Design.ON_ACCENT() : Design.TEXT());
+        };
+        sell.setOnClickListener(v -> { side[0] = OtcOffer.LP_SELLS_MINIMA; paint.run(); });
+        buy.setOnClickListener(v -> { side[0] = OtcOffer.LP_BUYS_MINIMA; paint.run(); });
+        Design.pressable(sell); Design.pressable(buy);
+        LinearLayout.LayoutParams s1 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f); s1.rightMargin = dp(6);
+        LinearLayout.LayoutParams s2 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        sideRow.addView(sell, s1); sideRow.addView(buy, s2); box.addView(sideRow); paint.run();
+
+        final EditText sizeE = new EditText(this); decimalInput(sizeE);
+        sizeE.setHint("max MINIMA per deal"); sizeE.setHintTextColor(Design.DIM2());
+        sizeE.setText(prefs.getString("otc_size", "")); sizeE.setTextColor(Design.TEXT()); sizeE.setTextSize(15f); sizeE.setTypeface(Design.mono());
+        box.addView(sizeE);
+
+        TextView st = new TextView(this);
+        st.setText(enabled ? "● Live — LPs can negotiate with you" : "○ Off"); st.setTextColor(enabled ? Design.IN() : Design.DIM());
+        st.setTextSize(12f); st.setTypeface(Design.sans()); st.setPadding(0, dp(8), 0, dp(8)); box.addView(st);
+
+        LinearLayout btns = new LinearLayout(this); btns.setOrientation(LinearLayout.HORIZONTAL);
+        TextView pubBtn = Design.pill(this, enabled ? "Update" : "Go live", Design.ACCENT(), Design.ON_ACCENT());
+        pubBtn.setOnClickListener(v -> {
+            double sz = parseD(sizeE.getText().toString(), 0);
+            if (sz <= 0) { toast("Enter a max MINIMA size"); return; }
+            prefs.edit().putString("otc_side", side[0]).putString("otc_size", trim(sz)).putBoolean("otc_enable", true).putBoolean("otc_auto", true).apply();
+            publishOtcOffer(side[0], sz);
+        });
+        Design.pressable(pubBtn); btns.addView(pubBtn);
+        if (enabled) {
+            TextView wd = Design.pill(this, "Withdraw", Design.SURFACE2(), Design.TEXT());
+            wd.setOnClickListener(v -> withdrawOtcOffer()); Design.pressable(wd);
+            LinearLayout.LayoutParams wlp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT); wlp.leftMargin = dp(8);
+            btns.addView(wd, wlp);
+        }
+        box.addView(btns);
+    }
+
+    private void renderOtcProviders(LinearLayout col) {
+        otcSectionHead(col, "LIQUIDITY PROVIDERS");
+        boolean any = false;
+        for (final OtcOffer o : otcBook.values()) {
+            if (!o.hasLiquidity() || o.commsPublicId == null || o.commsPublicId.isEmpty()) continue;
+            any = true;
+            LinearLayout box = otcCardBox(col);
+            TextView t = new TextView(this);
+            t.setText((OtcOffer.LP_SELLS_MINIMA.equals(o.side) ? "SELLS MINIMA" : "BUYS MINIMA") + " · up to " + trimSig(o.size) + " MINIMA");
+            t.setTextColor(Design.TEXT()); t.setTextSize(15f); t.setTypeface(Design.sansBold()); box.addView(t);
+            TextView who = new TextView(this); who.setText("LP " + shortAddr(o.signerPk) + " · tap to negotiate");
+            who.setTextColor(Design.DIM()); who.setTextSize(12f); who.setTypeface(Design.sans()); who.setPadding(0, dp(4), 0, 0); box.addView(who);
+            box.setOnClickListener(v -> otcProposeDialog(o)); Design.pressable(box);
+        }
+        if (!any) { TextView none = new TextView(this); none.setText("No OTC LPs online right now."); none.setTextColor(Design.DIM()); none.setTextSize(13f); none.setTypeface(Design.sans()); none.setPadding(0, 0, 0, dp(10)); col.addView(none); }
+    }
+
+    private void renderOtcDeals(LinearLayout col) {
+        otcSectionHead(col, "MY DEALS");
+        java.util.List<OtcDb.Deal> deals = otcDb == null ? new java.util.ArrayList<>() : otcDb.allDeals();
+        boolean any = false;
+        for (final OtcDb.Deal d : deals) {
+            any = true;
+            LinearLayout box = otcCardBox(col);
+            String dir = OtcOffer.LP_SELLS_MINIMA.equals(d.side)
+                    ? (OtcDb.ROLE_INSTIGATOR.equals(d.role) ? "BUY " : "SELL ")
+                    : (OtcDb.ROLE_INSTIGATOR.equals(d.role) ? "SELL " : "BUY ");
+            TextView t = new TextView(this);
+            t.setText(dir + d.amount + " MINIMA @ " + d.price + " USDT");
+            t.setTextColor(Design.TEXT()); t.setTextSize(15f); t.setTypeface(Design.sansBold()); box.addView(t);
+            TextView st = new TextView(this);
+            st.setText(otcStatusText(d)); st.setTextColor(otcStatusColor(d)); st.setTextSize(12.5f); st.setTypeface(Design.sans()); st.setPadding(0, dp(4), 0, dp(2)); box.addView(st);
+            if (otc != null && OtcDb.TURN_ME.equals(d.whoseTurn) && (OtcDb.ST_PROPOSED.equals(d.status) || OtcDb.ST_COUNTERED.equals(d.status))) {
+                LinearLayout row = new LinearLayout(this); row.setOrientation(LinearLayout.HORIZONTAL); row.setPadding(0, dp(8), 0, 0);
+                TextView acc = Design.pill(this, "Accept", Design.IN(), Design.ON_ACCENT());
+                acc.setOnClickListener(v -> otc.accept(d, otcRes("Accepted")));
+                TextView cnt = Design.pill(this, "Counter", Design.SURFACE2(), Design.TEXT());
+                cnt.setOnClickListener(v -> otcCounterDialog(d));
+                TextView rej = Design.pill(this, "Reject", Design.SURFACE2(), Design.RED());
+                rej.setOnClickListener(v -> otc.reject(d, otcRes("Rejected")));
+                Design.pressable(acc); Design.pressable(cnt); Design.pressable(rej);
+                LinearLayout.LayoutParams m = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT); m.rightMargin = dp(8);
+                row.addView(acc, m); row.addView(cnt, m); row.addView(rej); box.addView(row);
+            }
+        }
+        if (!any) { TextView none = new TextView(this); none.setText("No OTC deals yet."); none.setTextColor(Design.DIM()); none.setTextSize(13f); none.setTypeface(Design.sans()); col.addView(none); }
+    }
+
+    private OtcController.SendResult otcRes(String okMsg) {
+        return new OtcController.SendResult() {
+            @Override public void ok() { ui.post(() -> { toast(okMsg); if (currentTab == TAB_OTC && !modalOpen) render(); }); }
+            @Override public void err(String m) { ui.post(() -> toast("OTC: " + m)); }
+        };
+    }
+
+    private String otcStatusText(OtcDb.Deal d) {
+        if (OtcDb.ST_PROPOSED.equals(d.status) || OtcDb.ST_COUNTERED.equals(d.status))
+            return OtcDb.TURN_ME.equals(d.whoseTurn) ? "Your move — accept, counter or reject" : "Waiting for the counterparty…";
+        if (OtcDb.ST_AGREED.equals(d.status)) return "Agreed — settling";
+        if (OtcDb.ST_EXECUTING.equals(d.status)) return "Executing — HTLC legs locking";
+        if (OtcDb.ST_COMPLETE.equals(d.status)) return "Complete";
+        if (OtcDb.ST_REJECTED.equals(d.status)) return "Rejected";
+        if (OtcDb.ST_EXPIRED.equals(d.status)) return "Expired";
+        return d.status;
+    }
+    private int otcStatusColor(OtcDb.Deal d) {
+        if (OtcDb.ST_COMPLETE.equals(d.status)) return Design.IN();
+        if (OtcDb.ST_REJECTED.equals(d.status) || OtcDb.ST_EXPIRED.equals(d.status)) return Design.RED();
+        return Design.DIM();
+    }
+
+    private void otcProposeDialog(final OtcOffer lp) {
+        LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(dp(4), dp(4), dp(4), dp(4));
+        box.addView(fieldLabel("MINIMA amount (≤ " + trimSig(lp.size) + ")"));
+        final EditText amtE = new EditText(this); decimalInput(amtE); amtE.setTextColor(Design.TEXT()); amtE.setTextSize(16f); amtE.setTypeface(Design.mono()); box.addView(amtE);
+        box.addView(fieldLabel("Price (USDT per MINIMA)"));
+        final EditText prE = new EditText(this); decimalInput(prE); prE.setTextColor(Design.TEXT()); prE.setTextSize(16f); prE.setTypeface(Design.mono()); box.addView(prE);
+        modalOpen = true;
+        dialog().setTitle(OtcOffer.LP_SELLS_MINIMA.equals(lp.side) ? "Propose a BUY" : "Propose a SELL")
+                .setView(wrapScroll(box))
+                .setPositiveButton("Send offer", (dg, w) -> {
+                    double a = parseD(amtE.getText().toString(), 0), p = parseD(prE.getText().toString(), 0);
+                    if (a <= 0 || p <= 0) { toast("Enter amount + price"); return; }
+                    if (a > lp.size + 1e-9) { toast("Above the LP's max size"); return; }
+                    if (otc != null) otc.propose(lp, trim(a), trimSig(p), otcRes("Offer sent"));
+                })
+                .setNegativeButton("Cancel", null)
+                .setOnDismissListener(dg -> { modalOpen = false; render(); })
+                .show();
+    }
+
+    private void otcCounterDialog(final OtcDb.Deal d) {
+        LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(dp(4), dp(4), dp(4), dp(4));
+        box.addView(fieldLabel("MINIMA amount"));
+        final EditText amtE = new EditText(this); decimalInput(amtE); amtE.setText(d.amount); amtE.setTextColor(Design.TEXT()); amtE.setTextSize(16f); amtE.setTypeface(Design.mono()); box.addView(amtE);
+        box.addView(fieldLabel("Price (USDT per MINIMA)"));
+        final EditText prE = new EditText(this); decimalInput(prE); prE.setText(d.price); prE.setTextColor(Design.TEXT()); prE.setTextSize(16f); prE.setTypeface(Design.mono()); box.addView(prE);
+        modalOpen = true;
+        dialog().setTitle("Counter-offer").setView(wrapScroll(box))
+                .setPositiveButton("Send counter", (dg, w) -> {
+                    double a = parseD(amtE.getText().toString(), 0), p = parseD(prE.getText().toString(), 0);
+                    if (a <= 0 || p <= 0) { toast("Enter amount + price"); return; }
+                    if (otc != null) otc.counter(d, trim(a), trimSig(p), otcRes("Counter sent"));
+                })
+                .setNegativeButton("Cancel", null)
+                .setOnDismissListener(dg -> { modalOpen = false; render(); })
+                .show();
+    }
+
+    private void publishOtcOffer(String side, double size) {
+        if (identity == null || myMinimaPk == null || !wallet.ready()) { toast("Still connecting…"); return; }
+        OtcOffer o = new OtcOffer();
+        o.side = side; o.size = size; o.enable = true;
+        o.minimaPublicKey = myMinimaPk; o.ethAddress = ethAddr == null ? "" : ethAddr; o.commsPublicId = identity.publicId();
+        OtcBook.publish(node, ls, identity, o, new CommsTransport.SendCb() {
+            @Override public void onSent(String txpowid) { prefs.edit().putLong("otc_last_publish", System.currentTimeMillis()).apply(); ui.post(() -> { toast("You're live for OTC"); render(); }); }
+            @Override public void onFailed(String message) { ui.post(() -> toast("OTC publish failed: " + message)); }
+        });
+    }
+
+    private void withdrawOtcOffer() {
+        prefs.edit().putBoolean("otc_enable", false).putBoolean("otc_auto", false).apply();
+        if (identity == null || myMinimaPk == null) { render(); return; }
+        OtcOffer o = new OtcOffer();
+        o.side = prefs.getString("otc_side", OtcOffer.LP_SELLS_MINIMA); o.size = 0; o.enable = false;
+        o.minimaPublicKey = myMinimaPk; o.ethAddress = ethAddr == null ? "" : ethAddr; o.commsPublicId = identity.publicId();
+        OtcBook.publish(node, ls, identity, o, new CommsTransport.SendCb() {
+            @Override public void onSent(String txpowid) { ui.post(() -> { toast("Withdrawn"); render(); }); }
+            @Override public void onFailed(String message) { ui.post(() -> render()); }
+        });
+    }
+
+    /** Keep my OTC availability live (it ages out of the board after ~1h) — republish on the same cadence as the order. */
+    private void maybeRepublishOtc() {
+        if (identity == null || myMinimaPk == null || !wallet.ready()) return;
+        if (!prefs.getBoolean("otc_auto", false)) return;
+        if (System.currentTimeMillis() - prefs.getLong("otc_last_publish", 0) < REPUBLISH_INTERVAL_MS) return;
+        prefs.edit().putLong("otc_last_publish", System.currentTimeMillis()).apply();
+        publishOtcOffer(prefs.getString("otc_side", OtcOffer.LP_SELLS_MINIMA), parseD(prefs.getString("otc_size", "0"), 0));
+    }
 
     private int dp(int v) { return Design.dp(this, v); }
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show(); }

@@ -82,6 +82,7 @@ public final class SwapEngine {
     private volatile String myMinimaPk;                         // my persisted swap identity (one of 64)
     private volatile Set<String> myPubkeys = Collections.emptySet();  // all 64 default keys (owner/refund match)
     private volatile Order myOrder;                 // my published order — the responder-side match guard
+    private volatile OtcDb otcDb;                   // OTC deal store — the OTC responder's agreed-terms gate
 
     private volatile long lastSecretBlock = -1;     // ETH block bookmark (checkETHNewSecrets)
     private volatile long lastEthScanned = -1;      // ETH block bookmark (New-contract discovery)
@@ -107,6 +108,8 @@ public final class SwapEngine {
     /** The node's full 64-key set, so refunds work for a coin locked under any default key. */
     public void setMyPubkeys(Set<String> keys) { this.myPubkeys = keys == null ? Collections.emptySet() : keys; }
     public void setMyOrder(Order o) { this.myOrder = o; }
+    public void setOtcDb(OtcDb o) { this.otcDb = o; }
+    public String swapStatus(String hash) { SwapDb.Swap s = db.getSwap(hash); return s == null ? null : s.status; }
 
     // ── maker coin-readiness: keep the ask ladder backed by enough separately-spendable MINIMA coins ──────────
     // Minima is UTXO-based: locking N concurrent counter-legs for a swept N-tranche ask ladder needs N coins each
@@ -227,6 +230,12 @@ public final class SwapEngine {
 
     /** I give MINIMA, want an ERC20 token. I lock MINIMA FIRST (block+144) and generate the secret. */
     public void startMinimaToErc20(Order maker, String sellMinima, String tokenSymbol, String buyTokenAmount, StartCb cb) {
+        startMinimaToErc20(maker, sellMinima, tokenSymbol, buyTokenAmount, false, cb);
+    }
+
+    /** As above, with the OTC bit: {@code otc=true} sets HTLC state[7]=TRUE so the ladder auto-responder skips it
+     *  and only the negotiated OTC responder locks the counter-leg. */
+    public void startMinimaToErc20(Order maker, String sellMinima, String tokenSymbol, String buyTokenAmount, boolean otc, StartCb cb) {
         if (!ready()) { cb.err("Not ready"); return; }
         final EthNet.Token token = net.token(tokenSymbol);
         if (token == null) { cb.err("Unknown token " + tokenSymbol); return; }
@@ -237,7 +246,7 @@ public final class SwapEngine {
                     @Override public void ok(int block) {
                         final int timelock = block + TIMELOCK_BLOCKS;
                         minima.lock(sellMinima, buyTokenAmount, token.address, maker.minimaPublicKey,
-                                myEth(), hash, timelock, "FALSE", new MinimaHtlc.PostCb() {
+                                myEth(), hash, timelock, otc ? "TRUE" : "FALSE", new MinimaHtlc.PostCb() {
                             @Override public void ok(String txpowid) {
                                 db.insertSecret(hash, secret);
                                 db.logEvent(hash, SwapDb.EV_STARTED, "minima", sellMinima, txpowid);
@@ -261,6 +270,27 @@ public final class SwapEngine {
 
     /** I give an ERC20 token, want MINIMA. I lock the ERC20 FIRST (now+7200s) and generate the secret. */
     public void startErc20ToMinima(Order maker, String tokenSymbol, String sellTokenAmount, String buyMinima, StartCb cb) {
+        startErc20ToMinima(maker, tokenSymbol, sellTokenAmount, buyMinima, false, cb);
+    }
+
+    /** Instigator side: on an AGREED OTC deal, start the HTLC swap against the LP with otc=TRUE. Direction is
+     *  derived from the LP's side; amounts from the negotiated terms (USDT = amount × price, at 6-dp). Returns the
+     *  hashlock via cb — the caller then sends an EXECUTE message so the LP responds against this exact hash. */
+    public void executeOtcDeal(OtcDb.Deal deal, StartCb cb) {
+        Order lp = new Order();
+        lp.minimaPublicKey = deal.peerMinimaPk;
+        lp.ethAddress = deal.peerEthAddr;
+        lp.commsPublicId = deal.peerCommsId;
+        String usdt = dec(deal.amount).multiply(dec(deal.price)).setScale(6, java.math.RoundingMode.DOWN).toPlainString();
+        if (OtcOffer.LP_SELLS_MINIMA.equals(deal.side))
+            startErc20ToMinima(lp, "USDT", usdt, deal.amount, true, cb);   // LP sells MINIMA → I BUY: lock USDT
+        else
+            startMinimaToErc20(lp, deal.amount, "USDT", usdt, true, cb);    // LP buys MINIMA → I SELL: lock MINIMA
+    }
+
+    /** As above, with the OTC bit: {@code otc=true} sets the ETH contract's otc flag so the ladder auto-responder
+     *  skips it and only the negotiated OTC responder locks the counter-leg. */
+    public void startErc20ToMinima(Order maker, String tokenSymbol, String sellTokenAmount, String buyMinima, boolean otc, StartCb cb) {
         if (!ready()) { cb.err("Not ready"); return; }
         final EthNet.Token token = net.token(tokenSymbol);
         if (token == null) { cb.err("Unknown token " + tokenSymbol); return; }
@@ -289,7 +319,7 @@ public final class SwapEngine {
                             notifier.onSwapsChanged();
                         });
                         String txhash = eth.newContract(myMinimaPk, maker.ethAddress, hash,
-                                BigInteger.valueOf(timelock), token.address, sellRaw, reqRaw, false);
+                                BigInteger.valueOf(timelock), token.address, sellRaw, reqRaw, otc);
                         ui.post(() -> {
                             db.logEvent(hash, SwapDb.EV_STARTED, "ETH:" + token.address, sellTokenAmount, txhash);
                             cb.ok(hash);
@@ -539,10 +569,14 @@ public final class SwapEngine {
         }
 
         // I don't know the secret → I'm a MINIMA→ERC20 responder; lock the ETH counter-leg.
-        if ("TRUE".equals(MinimaHtlc.stateAt(coin, 7))) return;            // OTC: manual only
         if (db.haveSentCounterParty(hash)) return;
         if (timelock - block < CP_BLOCKS_CHECK) return;                    // first leg too close to expiry
-        if (!acceptTakerSellMinima(coin, reqTokenAddr)) return;          // must match my published order
+        if ("TRUE".equals(MinimaHtlc.stateAt(coin, 7))) {
+            // OTC: respond ONLY if I'm the LP of an AGREED deal whose on-chain lock EXACTLY matches (otcVerifySell
+            // is the fund-safety boundary), replacing the ladder acceptance gate.
+            OtcDb.Deal d = otcLpDeal(hash);
+            if (d == null || !otcVerifySell(coin, d, reqTokenAddr)) return;
+        } else if (!acceptTakerSellMinima(coin, reqTokenAddr)) return;   // must match my published order
         if (!inflight.add("cpEth:" + hash)) return;
         io.execute(() -> lockEthCounterLeg(coin, hash, reqTokenAddr));
     }
@@ -782,15 +816,22 @@ public final class SwapEngine {
         }
 
         // I don't know the secret → I'm an ERC20→MINIMA responder; lock the MINIMA counter-leg.
-        if (c.otc) return;
         if (db.haveSentCounterParty(hash)) return;
         // Persistent dedup (survives a restart / a lost txnpost response that the in-memory CP_LOCKING can't):
         // lockMinimaCounterLeg records the swap row BEFORE broadcast, so a row here means this hash is already
         // being (or was) locked — never re-lock it (the MINIMA leg has no on-chain hash-uniqueness).
         if (db.getSwap(hash) != null) return;
-        if (c.timelock - nowUnix() < CP_SECS_CHECK) { declineNote(hash, "their USDT lock is too close to its timeout"); return; }
-        if (myOrder == null) return;                                      // order not loaded yet — retry next cycle
-        if (!acceptTakerBuyMinima(c)) { declineNote(hash, "it didn't fit any level of your ladder (price, level size, or minimum)"); return; }
+        if (c.timelock - nowUnix() < CP_SECS_CHECK) { if (!c.otc) declineNote(hash, "their USDT lock is too close to its timeout"); return; }
+        if (c.otc) {
+            // OTC: the ladder gate doesn't apply. Respond ONLY if I'm the LP of an AGREED deal whose on-chain lock
+            // EXACTLY matches the agreed terms (otcVerifyBuy = the fund-safety boundary). Then use the SAME dedup +
+            // lock path below — c's own request-amount/pubkey (already verified == agreed) drive the counter-leg.
+            OtcDb.Deal d = otcLpDeal(hash);
+            if (d == null || !otcVerifyBuy(c, d)) return;
+        } else {
+            if (myOrder == null) return;                                  // order not loaded yet — retry next cycle
+            if (!acceptTakerBuyMinima(c)) { declineNote(hash, "it didn't fit any level of your ladder (price, level size, or minimum)"); return; }
+        }
         // Claim a burst slot AND the cross-engine per-hash marker atomically (under the shared CP_LOCKING monitor):
         // up to CP_LOCK_BURST distinct-hash locks in flight (each gets a DISTINCT coin in lockMinimaCounterLeg),
         // and no OTHER engine can re-lock this same hash mid-flight. Both released together in releaseCpLeg.
@@ -933,6 +974,64 @@ public final class SwapEngine {
             if (recvUsdt.compareTo(giveMinima.multiply(BigDecimal.valueOf(t.price))) >= 0) return true;
         }
         return false;
+    }
+
+    // ---- OTC responder gate: an AGREED deal REPLACES the ladder acceptance above (the fund-safety boundary) ----
+
+    /** An AGREED/EXECUTING OTC deal I'm the LP for, keyed by this hash; null ⇒ do NOT respond to this otc lock. */
+    private OtcDb.Deal otcLpDeal(String hash) {
+        if (otcDb == null) return null;
+        OtcDb.Deal d = otcDb.dealByHash(hash);
+        if (d == null || !OtcDb.ROLE_LP.equals(d.role)) return null;
+        if (!OtcDb.ST_AGREED.equals(d.status) && !OtcDb.ST_EXECUTING.equals(d.status)) return null;
+        String ss = swapStatus(hash);   // never re-respond to a hash whose swap already finished
+        if (SwapDb.ST_COMPLETE.equals(ss) || SwapDb.ST_REFUNDED.equals(ss) || SwapDb.ST_ERROR.equals(ss)) return null;
+        return d;
+    }
+
+    /** Compare two pubkeys/hex tolerantly of a 0x prefix / case, matching the rest of the engine (normKey). */
+    private static boolean keyEq(String a, String b) {
+        if (a == null || b == null) return false;
+        return MinimaHtlc.normKey(a).equals(MinimaHtlc.normKey(b));
+    }
+
+    private static boolean approxEq(BigDecimal a, BigDecimal b) {
+        if (a == null || b == null) return false;
+        // Tolerance covers USDT's 6-dp truncation of amount×price (≤1e-6); ~1e-5 absolute caps any discrepancy at
+        // a negligible fraction of a cent / a MINIMA while never rejecting a correctly-rounded on-chain lock.
+        return a.subtract(b).abs().compareTo(new BigDecimal("0.00001")) <= 0;
+    }
+
+    /** Verify an incoming ERC20 lock (instigator BUYS MINIMA, I'm the LP selling) EXACTLY matches the agreed deal
+     *  before I lock the MINIMA counter-leg: the USDT must be addressed to me, the MINIMA must go to the agreed
+     *  counterparty, and both amounts must equal the negotiated terms. */
+    private boolean otcVerifyBuy(EthHtlc.Contract c, OtcDb.Deal d) {
+        if (!OtcOffer.LP_SELLS_MINIMA.equals(d.side)) return false;
+        EthNet.Token usdt = net.token("USDT");
+        if (usdt == null || c.tokenContract == null || !c.tokenContract.equalsIgnoreCase(usdt.address)) return false;  // MUST settle in real USDT
+        if (c.receiver == null || !c.receiver.equalsIgnoreCase(myEth())) return false;                       // USDT to me
+        if (!keyEq(c.minimaPublicKey, d.peerMinimaPk)) return false;                                         // MINIMA to the agreed peer
+        BigDecimal wantMinima = dec(d.amount), wantUsdt = dec(d.amount).multiply(dec(d.price));
+        BigDecimal gotMinima = dec(EthWallet.format(c.requestAmount, 18, 18));                        // MINIMA they request = what I lock
+        BigDecimal gotUsdt = dec(EthWallet.format(c.amount, decimalsOf(c.tokenContract), 18));        // USDT they locked
+        return approxEq(gotMinima, wantMinima) && approxEq(gotUsdt, wantUsdt);
+    }
+
+    /** Verify an incoming Minima lock (instigator SELLS MINIMA, I'm the LP buying) EXACTLY matches the agreed deal
+     *  before I lock the USDT counter-leg: I must be the coin receiver, the USDT must go to the agreed eth, the
+     *  token must be the agreed USDT, and both amounts must equal the negotiated terms. */
+    private boolean otcVerifySell(JSONObject coin, OtcDb.Deal d, String reqTokenAddr) {
+        if (!OtcOffer.LP_BUYS_MINIMA.equals(d.side)) return false;
+        if (!"0x00".equalsIgnoreCase(coin.optString("tokenid", "0x00"))) return false;                // native MINIMA only
+        if (!keyEq(MinimaHtlc.stateAt(coin, 4), myMinimaPk)) return false;                            // MINIMA to me
+        String payEth = MinimaHtlc.stateAt(coin, 6);
+        if (payEth == null || !payEth.equalsIgnoreCase(d.peerEthAddr)) return false;                  // I'll pay USDT to the agreed eth
+        EthNet.Token usdt = net.token("USDT");
+        if (usdt == null || reqTokenAddr == null || !reqTokenAddr.equalsIgnoreCase(usdt.address)) return false;  // agreed token
+        BigDecimal wantMinima = dec(d.amount), wantUsdt = dec(d.amount).multiply(dec(d.price));
+        BigDecimal gotMinima = dec(coin.optString("amount", "0"));                    // MINIMA they locked
+        BigDecimal gotUsdt = dec(MinimaHtlc.stateAt(coin, 1));                        // USDT they request = what I lock
+        return approxEq(gotMinima, wantMinima) && approxEq(gotUsdt, wantUsdt);
     }
 
     private Order.Pair pairFor(String tokenAddr) {

@@ -32,6 +32,11 @@ import org.minimarex.minimaswap.eth.EthRpc;
 import org.minimarex.minimaswap.eth.EthWallet;
 import org.minimarex.minimaswap.swap.MinimaHtlc;
 import org.minimarex.minimaswap.swap.Order;
+import org.minimarex.minimaswap.swap.OtcBook;
+import org.minimarex.minimaswap.swap.OtcController;
+import org.minimarex.minimaswap.swap.OtcDb;
+import org.minimarex.minimaswap.swap.OtcMessage;
+import org.minimarex.minimaswap.swap.OtcOffer;
 import org.minimarex.minimaswap.swap.SwapDb;
 import org.minimarex.minimaswap.swap.SwapEngine;
 import org.minimarex.minimaswap.swap.SwapOrderBook;
@@ -65,6 +70,9 @@ public class SwapService extends Service {
     private CommsIdentity identity;       // to sign order-book republishes in the background
     private CryptoProvider crypto;        // to open buyers' sealed hashlock handshakes
     private CommsScanner takeScanner;
+    private CommsScanner otcScanner;
+    private OtcDb otcDb;
+    private OtcController otc;
     private String myMinimaPk;
     private boolean booted = false;
 
@@ -84,6 +92,12 @@ public class SwapService extends Service {
         node = new NodeApi(this, this::onPaired);
         minima = new MinimaHtlc(node);
         engine = new SwapEngine(node, minima, db, wallet, h, notifier);
+        otcDb = new OtcDb(this);
+        engine.setOtcDb(otcDb);
+        otc = new OtcController(node, otcDb, engine, new OtcController.Ui() {
+            @Override public void onDealsChanged() {}
+            @Override public void note(String title, String body) { alert(title, body); }
+        });
         engine.setNetwork(rpc, net);
         engine.setMyOrder(loadOrder());
     }
@@ -177,7 +191,7 @@ public class SwapService extends Service {
      *  buyer is seen in ~1 block, not up to a 90s poll. Stands down when the Activity is foreground/sweeping. */
     private final Runnable discoveryTick = new Runnable() {
         @Override public void run() {
-            if (!MainActivity.FOREGROUND && !MainActivity.SWEEP_ACTIVE && engine != null) scanTakeRequests();
+            if (!MainActivity.FOREGROUND && !MainActivity.SWEEP_ACTIVE && engine != null) { scanTakeRequests(); scanOtc(); }
             h.postDelayed(this, DISCOVERY_INTERVAL_MS);
         }
     };
@@ -191,6 +205,20 @@ public class SwapService extends Service {
             for (String hh : incomingHashlocks()) engine.addIncomingHashlock(hh);   // re-arm persisted handshakes
         }
         takeScanner.scan(0);   // bounded depth-grow scan; block number only affects bookmarking
+    }
+
+    /** Background OTC negotiation receiver: drive the shared state machine so deals progress with the app closed. */
+    private void scanOtc() {
+        if (crypto == null || identity == null || engine == null || otc == null) return;
+        if (myMinimaPk != null && wallet.ready()) {
+            otc.setSelf(crypto, identity, myMinimaPk, wallet.address());
+            double sz; try { sz = Double.parseDouble(prefs.getString("otc_size", "0")); } catch (Exception e) { sz = 0; }
+            otc.setMyOffer(prefs.getBoolean("otc_enable", false), prefs.getString("otc_side", OtcOffer.LP_SELLS_MINIMA), sz);
+        }
+        if (otcScanner == null)
+            otcScanner = new CommsScanner(node, crypto, new PrefsMeta(prefs), OtcMessage.ADDRESS, otc::route, (ok, n) -> {});
+        otcScanner.scan(0);
+        otc.expireStale(System.currentTimeMillis());
     }
 
     private boolean routeTakeRequest(String coinid, Opened opened, JSONObject coin) {
