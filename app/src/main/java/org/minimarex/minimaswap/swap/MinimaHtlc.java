@@ -174,12 +174,25 @@ public final class MinimaHtlc {
     public void lockFromCoin(String coinid, String coinAmount, String amount, String requestAmount, String reqToken,
                              String receiverPubkey, String ownerEthKey, String hashlock, int timelockBlock,
                              String otc, PostCb cb) {
+        List<String> one = new ArrayList<>(); one.add(coinid);
+        lockFromCoins(one, coinAmount, amount, requestAmount, reqToken, receiverPubkey, ownerEthKey, hashlock, timelockBlock, otc, cb);
+    }
+
+    /** Lock the HTLC counter-leg from MULTIPLE pinned coins (combined), so the responder can fill a deal larger than
+     *  any single coin — the way a wallet {@code send} auto-selects UTXOs, but with the coins pinned by the caller
+     *  (no node coin-selection, so concurrent burst locks can't double-select). One {@code txninput} per coinid,
+     *  one HTLC output ({@code amount}), change ({@code totalSelected − amount}) → myAddress. Same state[0..7],
+     *  record-before-broadcast ordering and "POSTED:"-tag safety as the single-coin path. */
+    public void lockFromCoins(List<String> coinids, String totalSelected, String amount, String requestAmount,
+                              String reqToken, String receiverPubkey, String ownerEthKey, String hashlock,
+                              int timelockBlock, String otc, PostCb cb) {
         if (!ready()) { cb.err("Minima wallet not ready"); return; }
-        String change = subtract(coinAmount, amount);
+        if (coinids == null || coinids.isEmpty()) { cb.err("no coins to lock"); return; }
+        String change = subtract(totalSelected, amount);
         String id = txnId();
         List<String> seq = new ArrayList<>();
         seq.add("txncreate id:" + id);
-        seq.add("txninput id:" + id + " coinid:" + coinid);
+        for (String cid : coinids) seq.add("txninput id:" + id + " coinid:" + cid);
         seq.add("txnstate id:" + id + " port:0 value:" + myPubkey);
         seq.add("txnstate id:" + id + " port:1 value:" + requestAmount);
         seq.add("txnstate id:" + id + " port:2 value:[" + reqToken + "]");

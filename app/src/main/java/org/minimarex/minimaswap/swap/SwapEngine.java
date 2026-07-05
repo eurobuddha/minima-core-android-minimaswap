@@ -124,7 +124,8 @@ public final class SwapEngine {
     // as double-spends but still look "locked", and the taker could never discover them). A slot frees when its
     // lock confirms on-chain (or a watchdog fires — that one leg refunds). Serial (K=1) was correct but ~1
     // leg/cycle; this is ~CP_LOCK_BURST× faster with the same coin-collision safety.
-    private static final int  CP_LOCK_BURST = 2;            // max concurrent responder locks (each on a distinct coin)
+    private static final int  CP_LOCK_BURST = 2;            // max concurrent responder locks (each on a distinct coin-set)
+    private static final int  MAX_LOCK_COINS = 50;          // cap UTXOs combined into ONE counter-leg lock (tx-size bound)
     private static final long CP_LOCK_TIMEOUT_SECS = 600;   // per-leg watchdog (its leg refunds if it never confirms); ≫ a normal ~2-block confirm
     private final Map<String,String> cpInFlight  = Collections.synchronizedMap(new HashMap<>());  // hash → pinned coinid ("" = slot reserved, coin not yet picked)
     private final Map<String,Long>   cpLockSince = Collections.synchronizedMap(new HashMap<>());  // hash → lock time (watchdog)
@@ -136,6 +137,14 @@ public final class SwapEngine {
 
     // All cpInFlight/CP_LOCKING mutations go through the shared CP_LOCKING monitor (single lock, one invariant:
     // cpInFlight.size() ≤ CP_LOCK_BURST) — never two monitors on the same state.
+    private final java.util.Set<String> cpNoted = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+    /** One-time notify when the MINIMA counter-leg can't be locked (insufficient / too-fragmented) — replaces the
+     *  old silent return so an unfillable deal is visible to the LP instead of a mystery hang. */
+    private void declineCpNote(String hash, String reason) {
+        if (!cpNoted.add(hash)) return;
+        ui.post(() -> notifier.notify("Can't lock your MINIMA", reason));
+    }
+
     private void releaseCpLeg(String hash) {
         synchronized (CP_LOCKING) { cpInFlight.remove(hash); cpLockSince.remove(hash); CP_LOCKING.remove(hash); }
     }
@@ -888,21 +897,40 @@ public final class SwapEngine {
         final String reqMinimaHuman = EthWallet.format(c.requestAmount, 18, 18);   // MINIMA they want from me
         final String receiverPubkey = c.minimaPublicKey;                           // initiator's Minima pubkey
         ui.post(() -> minima.myFreeCoins(coins -> {
-            // Pin a DISTINCT confirmed coin ≥ the lock amount, not already reserved by another in-flight lock —
-            // so this burst lock can't double-select with its siblings. Pick + reserve atomically.
-            final java.math.BigDecimal need = new java.math.BigDecimal(reqMinimaHuman);   // exact ≥ compare (no float edge)
-            String pickId = null, pickAmt = null;
+            // Gather DISTINCT confirmed coins totalling ≥ the lock amount (largest-first → fewest inputs), skipping
+            // any coin reserved by another in-flight burst lock. This fills a deal larger than any SINGLE coin (like
+            // a wallet send auto-selecting UTXOs) while burst siblings still never double-select. Pick + reserve atomically.
+            final java.math.BigDecimal need = new java.math.BigDecimal(reqMinimaHuman);
+            final java.util.List<String> pickIds = new java.util.ArrayList<>();
+            java.math.BigDecimal pickSumTmp = java.math.BigDecimal.ZERO, freeTotal = java.math.BigDecimal.ZERO;
             synchronized (CP_LOCKING) {                       // single monitor for all cpInFlight mutations
-                java.util.Collection<String> used = cpInFlight.values();
+                java.util.Set<String> used = new java.util.HashSet<>();   // coinids reserved by other in-flight locks (values are comma-joined lists)
+                for (String v : cpInFlight.values()) if (v != null && !v.isEmpty()) for (String u : v.split(",")) if (!u.isEmpty()) used.add(u);
+                java.util.List<String> ids = new java.util.ArrayList<>();
+                java.util.List<java.math.BigDecimal> amts = new java.util.ArrayList<>();
                 for (int i = 0; i < coins.length(); i++) {
-                    JSONObject cc = coins.optJSONObject(i);
-                    if (cc == null) continue;
+                    JSONObject cc = coins.optJSONObject(i); if (cc == null) continue;
                     String cid = cc.optString("coinid", ""), amt = cc.optString("amount", "0");
                     if (cid.isEmpty() || used.contains(cid)) continue;
-                    try { if (new java.math.BigDecimal(amt).compareTo(need) >= 0) { pickId = cid; pickAmt = amt; cpInFlight.put(hash, cid); break; } } catch (Exception ignore) {}
+                    try { java.math.BigDecimal a = new java.math.BigDecimal(amt); ids.add(cid); amts.add(a); freeTotal = freeTotal.add(a); } catch (Exception ignore) {}
                 }
+                Integer[] ord = new Integer[ids.size()];
+                for (int i = 0; i < ord.length; i++) ord[i] = i;
+                java.util.Arrays.sort(ord, (x, y) -> amts.get(y).compareTo(amts.get(x)));   // largest-first
+                for (int oi = 0; oi < ord.length && pickSumTmp.compareTo(need) < 0 && pickIds.size() < MAX_LOCK_COINS; oi++) {
+                    pickIds.add(ids.get(ord[oi])); pickSumTmp = pickSumTmp.add(amts.get(ord[oi]));
+                }
+                if (pickSumTmp.compareTo(need) >= 0) cpInFlight.put(hash, android.text.TextUtils.join(",", pickIds));
+                else pickIds.clear();
             }
-            if (pickId == null) { releaseCpLeg(hash); inflight.remove("cpMin:" + hash); return; }   // no free coin now — retry next cycle
+            if (pickIds.isEmpty()) {   // can't cover `need` right now — DON'T hang silently; tell the LP why
+                releaseCpLeg(hash); inflight.remove("cpMin:" + hash);
+                declineCpNote(hash, freeTotal.compareTo(need) < 0
+                        ? "Can't fill deal — need " + reqMinimaHuman + " MINIMA, only " + freeTotal.toPlainString() + " free"
+                        : "MINIMA too fragmented to lock " + reqMinimaHuman + " in one tx — consolidate your coins");
+                return;
+            }
+            final String totalSel = pickSumTmp.toPlainString();
             // RECORD-BEFORE-BROADCAST (mirrors lockEthCounterLeg's Fix D): persist the swap row NOW, so a process
             // kill or a lost txnpost response between broadcast and ok() can't re-lock this hash on restart. The
             // row (gated in checkCanCollectEth via getSwap!=null) is the only restart-proof dedup the MINIMA leg
@@ -916,7 +944,7 @@ public final class SwapEngine {
             s.status = SwapDb.ST_LOCKED;
             db.upsertSwap(s);
             notifier.onSwapsChanged();
-            minima.lockFromCoin(pickId, pickAmt, reqMinimaHuman, reqMinimaHuman, "minima", receiverPubkey,
+            minima.lockFromCoins(pickIds, totalSel, reqMinimaHuman, reqMinimaHuman, "minima", receiverPubkey,
                     myEth(), hash, timelock, "FALSE", new MinimaHtlc.PostCb() {
                 @Override public void ok(String txpowid) {
                     db.logEvent(hash, SwapDb.EV_CPSENT, "minima", reqMinimaHuman, txpowid);
