@@ -19,5 +19,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Minima Mail"
+rootProject.name = "minimaSwap"
 include ':app'
