@@ -665,6 +665,18 @@ public final class SwapEngine {
             try { checkEthContractFor(eth, s, myEth); } catch (Exception ignore) {}
         }
 
+        // Re-arm OTC buy-responder hashes from persisted EXECUTING deals. The EXECUTE that first added a hash to the
+        // in-memory `incoming` set may have been handled by the OTHER engine (fg vs bg service) or a prior process,
+        // leaving THIS engine's set empty after a restart/handoff. Deriving from the shared OtcDb makes the responder
+        // fire regardless of which engine polls (and lets a stuck deal recover after an update).
+        if (otcDb != null) {
+            for (OtcDb.Deal d : otcDb.allDeals()) {
+                if (OtcDb.ROLE_LP.equals(d.role) && OtcDb.ST_EXECUTING.equals(d.status)
+                        && OtcOffer.LP_SELLS_MINIMA.equals(d.side) && d.hash != null && !d.hash.isEmpty())
+                    incoming.add(d.hash);
+            }
+        }
+
         // BUY handshake (free-RPC-safe): a buyer told us the hashlock of a USDT lock addressed to us. Find it by
         // deterministic contractId via getContract (no eth_getLogs) and run the normal responder path (lock the
         // MINIMA counter-leg). Once it becomes a known swap, the loop above + the secondary path take over.

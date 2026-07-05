@@ -57,12 +57,20 @@ public final class OtcDb {
     private final Helper helper;
     public OtcDb(Context ctx) { helper = new Helper(ctx.getApplicationContext()); }
 
+    /** Canonical hashlock form (lowercase, no 0x) — matches {@code SwapDb.norm} so a Minima-UPPERCASE hash lines up
+     *  with the web3j-lowercase on-chain hashlock the ETH responder looks up with. */
+    static String normHash(String h) {
+        if (h == null) return "";
+        String s = h.trim().toLowerCase();
+        return s.startsWith("0x") ? s.substring(2) : s;
+    }
+
     public synchronized void upsertDeal(Deal d) {
         ContentValues v = new ContentValues();
         v.put("ref", d.ref); v.put("role", d.role); v.put("peercid", d.peerCommsId);
         v.put("peermpk", d.peerMinimaPk); v.put("peereth", d.peerEthAddr);
         v.put("side", d.side); v.put("amount", d.amount); v.put("price", d.price);
-        v.put("status", d.status); v.put("whoseturn", d.whoseTurn); v.put("hash", d.hash == null ? "" : d.hash);
+        v.put("status", d.status); v.put("whoseturn", d.whoseTurn); v.put("hash", normHash(d.hash));
         if (d.created == 0) d.created = System.currentTimeMillis();
         v.put("created", d.created); v.put("updated", System.currentTimeMillis());
         helper.getWritableDatabase().insertWithOnConflict("otc_deals", null, v, SQLiteDatabase.CONFLICT_REPLACE);
@@ -78,8 +86,12 @@ public final class OtcDb {
     /** Find the deal whose execution hashlock matches — the OTC responder's link from an on-chain leg back to terms.
      *  Deterministic (newest-first) so a self-griefer reusing one hash across two of their own deals can't randomise it. */
     public synchronized Deal dealByHash(String hash) {
-        if (hash == null || hash.isEmpty()) return null;
-        try (Cursor c = helper.getReadableDatabase().rawQuery("SELECT * FROM otc_deals WHERE hash=? ORDER BY updated DESC LIMIT 1", new String[]{hash})) {
+        String h = normHash(hash);
+        if (h.isEmpty()) return null;
+        // Normalize the query param AND the stored column, so the lookup matches regardless of case/0x — including
+        // rows written by an older build (lets a currently in-flight deal recover after an update).
+        try (Cursor c = helper.getReadableDatabase().rawQuery(
+                "SELECT * FROM otc_deals WHERE replace(lower(hash),'0x','')=? ORDER BY updated DESC LIMIT 1", new String[]{h})) {
             return c.moveToFirst() ? readDeal(c) : null;
         }
     }

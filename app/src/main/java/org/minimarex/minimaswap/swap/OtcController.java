@@ -26,6 +26,9 @@ public final class OtcController {
     private static final long EXPIRE_MS = 60L * 60 * 1000;        // a deal awaiting the PEER this long is abandoned
     private static final long PRUNE_MS  = 24L * 60 * 60 * 1000;   // drop finished deals after this (bound the table)
     private static final long NOTE_MIN_GAP_MS = 30_000;          // coalesce inbound-PROPOSE notification spam
+    private static final long EXEC_RESEND_GAP_MS = 90_000;              // resend a lost EXECUTE at most this often
+    private static final long EXEC_RESEND_WINDOW_MS = 90L * 60 * 1000;  // keep retrying EXECUTE well into the ~2h timelock
+                                                                        // so a slow LP recovery still completes (not refunds)
 
     private final NodeApi node;
     private final OtcDb otcDb;
@@ -39,6 +42,7 @@ public final class OtcController {
     private volatile boolean myOfferEnabled = false;
     private volatile double myOfferSellSize = 0, myOfferBuySize = 0;
     private volatile long lastProposeNote = 0;
+    private final java.util.Map<String, Long> lastExecResend = new java.util.concurrent.ConcurrentHashMap<>();
 
     public OtcController(NodeApi node, OtcDb otcDb, SwapEngine engine, Ui ui) {
         this.node = node; this.otcDb = otcDb; this.engine = engine; this.ui = ui;
@@ -79,8 +83,15 @@ public final class OtcController {
         if (m == null || m.ref.isEmpty() || m.randomid.isEmpty()) return false;
         if (identity == null || !identity.publicId().equals(m.to)) return false;               // not for me
         if (opened.fromPublicId == null || !opened.fromPublicId.equals(m.from)) return false;   // bind envelope sender
-        OtcDb.Msg row = toRow(m);
-        if (!otcDb.addMsg(row)) return false;   // dedup by randomid
+        if (OtcMessage.PROPOSE.equals(m.type)) {
+            // A PROPOSE I can't act on yet (my offer not loaded/live) must NOT burn its dedup slot — the comms coin is
+            // re-scanned, so a later delivery can retry once I'm live. Only record it once it actually creates a deal.
+            if (otcDb.getDeal(m.ref) != null) return false;   // already have this deal
+            boolean created = applyPropose(m);
+            if (created) otcDb.addMsg(toRow(m));
+            return created;
+        }
+        if (!otcDb.addMsg(toRow(m))) return false;   // dedup by randomid
         apply(m);
         return true;
     }
@@ -92,26 +103,28 @@ public final class OtcController {
         return r;
     }
 
+    /** Handle an inbound PROPOSE. Returns true iff it created a deal (I'm a live LP on that side, within size). A
+     *  false result leaves NO dedup trace so a re-scan can retry once my offer is live (see {@link #route}). */
+    private boolean applyPropose(OtcMessage m) {
+        if (otcDb.getDeal(m.ref) != null) return false;                // first PROPOSE only (ref is unique)
+        double cap = OtcOffer.LP_SELLS_MINIMA.equals(m.side) ? myOfferSellSize : myOfferBuySize;
+        if (!myOfferEnabled || cap <= 0) return false;                 // I must be a LIVE LP on THIS side
+        if (parseD(m.amount) <= 0 || parseD(m.amount) > cap + 1e-9 || parseD(m.price) <= 0) return false;
+        OtcDb.Deal d = new OtcDb.Deal();
+        d.ref = m.ref; d.role = OtcDb.ROLE_LP;
+        d.peerCommsId = m.from; d.peerMinimaPk = m.minimaPk; d.peerEthAddr = m.ethAddr;
+        d.side = m.side; d.amount = m.amount; d.price = m.price;
+        d.status = OtcDb.ST_PROPOSED; d.whoseTurn = OtcDb.TURN_ME;
+        otcDb.upsertDeal(d);
+        noteProposeRateLimited(m.amount + " MINIMA @ " + m.price + " — your call");
+        ui.onDealsChanged();
+        return true;
+    }
+
     private void apply(OtcMessage m) {
         OtcDb.Deal d = otcDb.getDeal(m.ref);
-        if (OtcMessage.PROPOSE.equals(m.type)) {
-            if (d != null) return;                                         // first PROPOSE only (ref is unique)
-            double cap = OtcOffer.LP_SELLS_MINIMA.equals(m.side) ? myOfferSellSize : myOfferBuySize;
-            if (!myOfferEnabled || cap <= 0) return;                       // I must be a LIVE LP on THIS side
-            if (parseD(m.amount) <= 0 || parseD(m.amount) > cap + 1e-9) return;   // within my advertised size for that side
-            if (parseD(m.price) <= 0) return;
-            d = new OtcDb.Deal();
-            d.ref = m.ref; d.role = OtcDb.ROLE_LP;
-            d.peerCommsId = m.from; d.peerMinimaPk = m.minimaPk; d.peerEthAddr = m.ethAddr;
-            d.side = m.side; d.amount = m.amount; d.price = m.price;
-            d.status = OtcDb.ST_PROPOSED; d.whoseTurn = OtcDb.TURN_ME;
-            otcDb.upsertDeal(d);
-            noteProposeRateLimited(m.amount + " MINIMA @ " + m.price + " — your call");
-            ui.onDealsChanged();
-            return;
-        }
-        // CONSENT + AUTHENTICITY: every other transition needs an existing deal AND must genuinely come from that
-        // deal's counterparty (not just any sealed sender). Without this, a hostile instigator could self-ACCEPT.
+        // CONSENT + AUTHENTICITY: every non-PROPOSE transition needs an existing deal AND must genuinely come from
+        // that deal's counterparty (not just any sealed sender). Without this, a hostile instigator could self-ACCEPT.
         if (d == null || m.from == null || !m.from.equals(d.peerCommsId)) return;
         if (OtcMessage.REJECT.equals(m.type)) {
             if (isTerminal(d.status)) return;
@@ -246,12 +259,25 @@ public final class OtcController {
                 if (SwapDb.ST_COMPLETE.equals(ss)) { d.status = OtcDb.ST_COMPLETE; otcDb.upsertDeal(d); ui.onDealsChanged(); }
                 else if (SwapDb.ST_REFUNDED.equals(ss) || SwapDb.ST_ERROR.equals(ss)) { d.status = OtcDb.ST_REJECTED; otcDb.upsertDeal(d); ui.onDealsChanged(); }
                 else if (ss == null && stale) { d.status = OtcDb.ST_EXPIRED; otcDb.upsertDeal(d); ui.onDealsChanged(); }   // a mismatched EXECUTE never produced a swap
+                else if (OtcDb.ROLE_INSTIGATOR.equals(d.role) && SwapDb.ST_STARTED.equals(ss)
+                        && now - d.created < EXEC_RESEND_WINDOW_MS) resendExecute(d, now);   // leg 1 locked but LP silent → my EXECUTE may have been lost
             } else if (stale && (OtcDb.ST_AGREED.equals(d.status)
                     || (OtcDb.ST_EXECUTING.equals(d.status) && (d.hash == null || d.hash.isEmpty()))   // execute never produced a hash
                     || ((OtcDb.ST_PROPOSED.equals(d.status) || OtcDb.ST_COUNTERED.equals(d.status)) && OtcDb.TURN_PEER.equals(d.whoseTurn)))) {
                 d.status = OtcDb.ST_EXPIRED; otcDb.upsertDeal(d); ui.onDealsChanged();   // no progress → abandon (any locked leg refunds at timelock)
             }
-            if (isTerminal(d.status) && now - d.updated > PRUNE_MS) otcDb.deleteDeal(d.ref);
+            if (isTerminal(d.status) && now - d.updated > PRUNE_MS) { otcDb.deleteDeal(d.ref); lastExecResend.remove(d.ref); }
         }
+    }
+
+    /** Leg 1 is locked but the counterparty still hasn't responded — my one-shot EXECUTE may have failed to send.
+     *  Resend it (throttled per deal) so a lost notification doesn't strand the deal until refund. Each resend is a
+     *  fresh message (new randomid); the LP's apply(EXECUTE) is idempotent, and re-recording the same hash is harmless. */
+    private void resendExecute(OtcDb.Deal d, long now) {
+        if (!ready()) return;
+        Long last = lastExecResend.get(d.ref);
+        if (last != null && now - last < EXEC_RESEND_GAP_MS) return;
+        lastExecResend.put(d.ref, now);
+        sendMsg(d, OtcMessage.EXECUTE, d.hash, new SendResult() { public void ok() {} public void err(String m) {} });
     }
 }
