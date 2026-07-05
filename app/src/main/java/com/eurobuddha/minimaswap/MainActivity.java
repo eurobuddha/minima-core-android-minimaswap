@@ -2357,7 +2357,10 @@ public class MainActivity extends AppCompatActivity {
                         + "•  Minima Core running, with minimaSwap enabled in Apps\n"
                         + "•  Some MINIMA to sell — or USDT plus a little ETH (for gas) to buy MINIMA\n\n"
                         + "Your keys are derived from your Minima node seed, so it's the same wallet on any device.\n\n"
-                        + "Tabs:  Swap (quick trade)  ·  Wallet (your money)  ·  Activity (your swaps)  ·  Market (full order book).")
+                        + "Tabs:  Swap (quick trade)  ·  Wallet (your money)  ·  Activity (your swaps)  ·  "
+                        + "Market (full order book)  ·  OTC (private deals).\n\n"
+                        + "OTC lets you negotiate a size + price directly with a liquidity provider — propose, "
+                        + "counter, accept — and the agreed deal settles as the same trustless atomic swap.")
                 .setPositiveButton("Get started", null)
                 .show();
     }

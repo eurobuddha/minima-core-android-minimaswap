@@ -11,6 +11,18 @@
         <item name="android:textColorSecondary">#8B909C</item>
         <item name="android:colorAccent">#F7931A</item>
         <item name="android:windowBackground">@drawable/dialog_bg_dark</item>
+        <!-- Pin button text WHITE: without this, appcompat-built dialogs fall back to the Activity's
+             Material3 baseline purple — unreadable on the dark background. Both attrs so the framework
+             AND appcompat resolution paths land on the same style. -->
+        <item name="android:buttonBarButtonStyle">@style/SwapDialogBtnDark</item>
+        <item name="buttonBarButtonStyle">@style/SwapDialogBtnDarkCompat</item>
+    </style>
+
+    <style name="SwapDialogBtnDark" parent="android:Widget.Material.Button.Borderless">
+        <item name="android:textColor">#FFFFFF</item>
+    </style>
+    <style name="SwapDialogBtnDarkCompat" parent="Widget.AppCompat.Button.Borderless">
+        <item name="android:textColor">#FFFFFF</item>
     </style>
 
     <style name="SwapDialogLight" parent="android:Theme.Material.Light.Dialog.Alert">
@@ -19,5 +31,14 @@
         <item name="android:textColorSecondary">#8B909C</item>
         <item name="android:colorAccent">#F7931A</item>
         <item name="android:windowBackground">@drawable/dialog_bg_light</item>
+        <item name="android:buttonBarButtonStyle">@style/SwapDialogBtnLight</item>
+        <item name="buttonBarButtonStyle">@style/SwapDialogBtnLightCompat</item>
+    </style>
+
+    <style name="SwapDialogBtnLight" parent="android:Widget.Material.Light.Button.Borderless">
+        <item name="android:textColor">#181B22</item>
+    </style>
+    <style name="SwapDialogBtnLightCompat" parent="Widget.AppCompat.Button.Borderless">
+        <item name="android:textColor">#181B22</item>
     </style>
 </resources>
