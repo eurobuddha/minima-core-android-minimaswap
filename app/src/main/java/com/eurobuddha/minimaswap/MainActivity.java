@@ -891,8 +891,8 @@ public class MainActivity extends AppCompatActivity {
         pegRow.addView(biasE, pr1); pegRow.addView(repE, pr2);
         box.addView(pegRow);
 
-        // quick-generate
-        box.addView(fieldLabel("QUICK GENERATE (mid · step % · size)"));
+        // ladder params — the 6+6 rows regenerate automatically as these change (no Generate button)
+        box.addView(fieldLabel("LADDER (mid · step % · size — fills the rows as you type)"));
         LinearLayout gen = new LinearLayout(this); gen.setOrientation(LinearLayout.HORIZONTAL); gen.setGravity(Gravity.CENTER_VERTICAL); gen.setPadding(0, dp(4), 0, dp(2));
         final EditText midE = genField("mid"), stepE = genField("step %"), sizeE = genField("size");
         if (pegSw.isChecked()) {   // step/size double as the peg's ladder parameters — show the saved ones
@@ -904,10 +904,6 @@ public class MainActivity extends AppCompatActivity {
         LinearLayout.LayoutParams g3 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
         gen.addView(midE, g1); gen.addView(stepE, g2); gen.addView(sizeE, g3);
         box.addView(gen);
-        TextView genBtn = Design.pill(this, "Generate 6 + 6", Design.SURFACE2(), Design.TEXT());
-        LinearLayout.LayoutParams gblp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        gblp.topMargin = dp(6); genBtn.setLayoutParams(gblp);
-        box.addView(genBtn);
 
         // Live balances — used to seed a pre-ladder (0.8.x) order's synthetic size so a no-op Save keeps it live.
         final double liveMinima = parseD(minimaBal, 0);
@@ -953,19 +949,23 @@ public class MainActivity extends AppCompatActivity {
         // ---- peg wiring: preview the rows from the live oracle price; poll the price line while open ----
         final boolean[] dlgOpen = { true };
         final boolean[] pegAwaitFill = { false };
+        final boolean[] filling = { false };   // programmatic setText below must not re-trigger the param auto-gen watcher
         final Runnable fillFromPeg = () -> {
             double m = PriceOracle.mid();
             if (!(m > 0) || !PriceOracle.fresh()) return;
             double bias = Math.max(-20, Math.min(20, parseD(biasE.getText().toString(), 0)));
             double quoted = m * (1 + bias / 100.0);
-            midE.setText(trimSig(quoted));
-            double step = parseD(stepE.getText().toString(), 0), size = parseD(sizeE.getText().toString(), 0);
-            if (step <= 0 || size <= 0) return;   // mid shown; rows need step + size
-            for (int i = 0; i < Order.MAX_LEVELS; i++) {
-                askRows[i][0].setText(trimSig(quoted * (1 + (i + 1) * step / 100.0))); askRows[i][1].setText(trimSig(size));
-                bidRows[i][0].setText(trimSig(quoted * (1 - (i + 1) * step / 100.0))); bidRows[i][1].setText(trimSig(size));
-            }
-            pegAwaitFill[0] = false;
+            filling[0] = true;
+            try {
+                midE.setText(trimSig(quoted));
+                double step = parseD(stepE.getText().toString(), 0), size = parseD(sizeE.getText().toString(), 0);
+                if (step <= 0 || size <= 0) return;   // mid shown; rows need step + size
+                for (int i = 0; i < Order.MAX_LEVELS; i++) {
+                    askRows[i][0].setText(trimSig(quoted * (1 + (i + 1) * step / 100.0))); askRows[i][1].setText(trimSig(size));
+                    bidRows[i][0].setText(trimSig(quoted * (1 - (i + 1) * step / 100.0))); bidRows[i][1].setText(trimSig(size));
+                }
+                pegAwaitFill[0] = false;
+            } finally { filling[0] = false; }
             upd.run();
         };
         final Runnable pegModeUi = () -> {
@@ -994,23 +994,35 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-        genBtn.setOnClickListener(v -> {
-            double step = parseD(stepE.getText().toString(), 0), size = parseD(sizeE.getText().toString(), 0);
-            if (pegSw.isChecked()) {   // pegged: generate a preview around the LIVE oracle mid
-                if (step <= 0 || size <= 0) { toast("Enter step % and size to generate"); return; }
-                if (!PriceOracle.fresh()) { pegAwaitFill[0] = true; PriceOracle.refreshAsync(); toast("Fetching " + PriceOracle.SOURCE + " price…"); return; }
-                fillFromPeg.run();
-                return;
-            }
+        // Manual generation (unpegged): silent — it fires per keystroke, so invalid/partial params just
+        // pause row updates rather than toasting on every character.
+        final Runnable genManual = () -> {
             double mid = parseD(midE.getText().toString(), 0);
-            if (mid <= 0 || step <= 0 || size <= 0) { toast("Enter mid price, step % and size to generate"); return; }
-            for (int i = 0; i < Order.MAX_LEVELS; i++) {
-                askRows[i][0].setText(trimSig(mid * (1 + (i + 1) * step / 100.0))); askRows[i][1].setText(trimSig(size));
-                bidRows[i][0].setText(trimSig(mid * (1 - (i + 1) * step / 100.0))); bidRows[i][1].setText(trimSig(size));
-            }
+            double step = parseD(stepE.getText().toString(), 0), size = parseD(sizeE.getText().toString(), 0);
+            if (mid <= 0 || step <= 0 || size <= 0) return;
+            filling[0] = true;
+            try {
+                for (int i = 0; i < Order.MAX_LEVELS; i++) {
+                    askRows[i][0].setText(trimSig(mid * (1 + (i + 1) * step / 100.0))); askRows[i][1].setText(trimSig(size));
+                    bidRows[i][0].setText(trimSig(mid * (1 - (i + 1) * step / 100.0))); bidRows[i][1].setText(trimSig(size));
+                }
+            } finally { filling[0] = false; }
             upd.run();
-        });
-        Design.pressable(genBtn);
+        };
+        // AUTO-GENERATE: any ladder-param edit rebuilds the 6+6 rows — the old "Generate 6 + 6" button was
+        // easy to miss. Watchers attach AFTER all initial seeding, so opening the dialog never stomps a
+        // saved (possibly hand-tuned) ladder; only an actual edit regenerates. repE isn't watched (the
+        // reprice threshold doesn't shape the rows).
+        final Runnable autoGen = () -> {
+            if (filling[0]) return;
+            if (pegSw.isChecked()) {
+                if (PriceOracle.fresh()) fillFromPeg.run();
+                else { pegAwaitFill[0] = true; PriceOracle.refreshAsync(); }   // pegTick fills once the price lands
+            } else genManual.run();
+        };
+        TextWatcher gw = onChange(autoGen);
+        midE.addTextChangedListener(gw); stepE.addTextChangedListener(gw);
+        sizeE.addTextChangedListener(gw); biasE.addTextChangedListener(gw);
 
         modalOpen = true;
         dialog()
