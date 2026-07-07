@@ -23,6 +23,9 @@
          separate process). Battery exemption keeps the OS from doze-killing it. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- specialUse is NOT time-boxed like dataSync (Android 14/15 caps dataSync FGS ~6h/day, which was
+         killing the overnight order-keeper). Same fix minima-limit uses. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
@@ -50,7 +53,11 @@
             android:name=".SwapService"
             android:exported="false"
             android:stopWithTask="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="specialUse|dataSync">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the user's pegged market published on-chain and progresses in-flight atomic swaps while the app is closed" />
+        </service>
     </application>
 
 </manifest>

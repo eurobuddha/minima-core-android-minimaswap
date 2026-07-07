@@ -82,7 +82,9 @@ public class SwapService extends Service {
     @Override public void onCreate() {
         super.onCreate();
         createChannels();
-        startForegroundCompat();
+        // If the OS refuses the foreground service (e.g. a residual dataSync time-budget on Android 14),
+        // bail gracefully instead of crashing — WorkManager/AlarmManager relaunch will retry.
+        if (!startForegroundCompat()) { stopSelf(); return; }
 
         prefs = getSharedPreferences("minimaswap", MODE_PRIVATE);
         PriceOracle.init(prefs);   // restore the persisted last-good stamp — the withdraw clock survives restarts
@@ -115,7 +117,9 @@ public class SwapService extends Service {
             android.app.PendingIntent pi = android.app.PendingIntent.getForegroundService(
                     getApplicationContext(), 11, new Intent(getApplicationContext(), SwapService.class),
                     android.app.PendingIntent.FLAG_ONE_SHOT | android.app.PendingIntent.FLAG_IMMUTABLE);
-            if (am != null) am.set(android.app.AlarmManager.RTC, System.currentTimeMillis() + 2000, pi);
+            // RTC_WAKEUP + AllowWhileIdle so the relaunch fires even under Doze (the old inexact RTC alarm
+            // was deferred to the maintenance window, leaving the market dark for hours).
+            if (am != null) am.setAndAllowWhileIdle(android.app.AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 2000, pi);
         } catch (Exception ignored) {}
         super.onTaskRemoved(rootIntent);
     }
@@ -276,12 +280,13 @@ public class SwapService extends Service {
         if (!anyEnabled) return;
         final boolean restored = prefs.getBoolean(PriceOracle.P_WITHDRAWN, false);
         final int peg = PriceOracle.applyPeg(o, prefs);
-        if (peg == PriceOracle.PEG_STALE) return;   // never republish at a stale oracle price (withdraw runs on the tick)
+        if (peg == PriceOracle.PEG_STALE) return;   // NO usable price at all → don't publish (withdraw runs on the tick)
+        final boolean wide = peg == PriceOracle.PEG_WIDE;
         final double pegMid = PriceOracle.appliedMid();
         prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();
         engine.ensureLadderCoins(o, !MainActivity.SWEEP_ACTIVE, () -> SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
             @Override public void onSent(String txpowid) {
-                if (peg == PriceOracle.PEG_APPLIED) PriceOracle.commitPeg(prefs, pegMid);   // baseline moves only on a CONFIRMED publish
+                if (peg == PriceOracle.PEG_APPLIED || wide) PriceOracle.commitPeg(prefs, pegMid, wide);   // baseline moves only on a CONFIRMED publish
                 engine.setMyOrder(o);
                 if (restored && peg == PriceOracle.PEG_APPLIED)
                     alert(PriceOracle.SOURCE + " feed recovered", "Your pegged order is live again.");
@@ -290,15 +295,15 @@ public class SwapService extends Service {
         }));
     }
 
-    /** FUND-SAFETY (mirrors MainActivity.maybePegWithdraw): oracle feed down past the safety window → publish a
-     *  TOMBSTONE and DISARM the responder guard so we stop auto-accepting takes at a price the market may have
-     *  left behind. auto_publish stays ON — the order re-publishes automatically when the feed recovers. */
+    /** FUND-SAFETY, last resort (mirrors MainActivity): only when there is NO usable price AT ALL and the feed's
+     *  been down past the window → tombstone + disarm. With a last-good mid the peg STAYS LIVE at a widened
+     *  defensive spread (PEG_WIDE) so a sleeping phone keeps supplying liquidity. auto_publish stays ON. */
     private void maybePegWithdraw() {
         if (identity == null || myMinimaPk == null || !wallet.ready() || engine == null) return;
         final boolean withdrawn = prefs.getBoolean(PriceOracle.P_WITHDRAWN, false);
         if (withdrawn && prefs.getBoolean(PriceOracle.P_TOMBSTONED, false)) return;   // tombstone confirmed — done
-        if (withdrawn && PriceOracle.fresh()) return;    // feed already back — the restore republish takes over
-        if (!withdrawn && !PriceOracle.feedDownPastLimit()) return;
+        if (PriceOracle.mid() > 0 && !PriceOracle.feedDownPastCeiling()) return;   // have a usable price & within the ceiling → stay live
+        if (!withdrawn && !PriceOracle.feedDownPastLimit()) return;   // no price yet, but not down long enough
         final boolean first = !withdrawn;                // else: retrying a tombstone whose broadcast failed
         if (first) prefs.edit().putBoolean(PriceOracle.P_WITHDRAWN, true)
                 .putBoolean(PriceOracle.P_TOMBSTONED, false).apply();   // withdrawn state FIRST — kill-safe
@@ -350,17 +355,34 @@ public class SwapService extends Service {
         }
     }
 
-    private void startForegroundCompat() {
+    private boolean startForegroundCompat() {
         Notification n = new NotificationCompat.Builder(this, CH_FG)
                 .setContentTitle("minimaSwap")
-                .setContentText("Watching your swaps")
+                .setContentText("Keeping your market live & watching swaps")
                 .setSmallIcon(android.R.drawable.stat_sys_upload_done)
                 .setOngoing(true)
                 .build();
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(FG_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
-        } else {
-            startForeground(FG_ID, n);
+        try {
+            if (Build.VERSION.SDK_INT >= 34) {
+                // specialUse is uncapped, unlike dataSync's ~6h/day Android-14 budget that was killing us overnight.
+                startForeground(FG_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+            } else if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(FG_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+            } else {
+                startForeground(FG_ID, n);
+            }
+            return true;
+        } catch (Exception e) {
+            return false;   // ForegroundServiceStartNotAllowedException etc. — don't crash; relaunch retries
         }
+    }
+
+    /** Android 14+: the OS tells a time-limited FGS to stop. Stop gracefully instead of crashing.
+     *  (specialUse isn't time-limited, but this is belt-and-braces for the dataSync fallback path.) */
+    @Override public void onTimeout(int startId) { stopGracefully(); }
+    @Override public void onTimeout(int startId, int fgsType) { stopGracefully(); }
+    private void stopGracefully() {
+        try { stopForeground(STOP_FOREGROUND_REMOVE); } catch (Exception ignored) {}
+        stopSelf();
     }
 }

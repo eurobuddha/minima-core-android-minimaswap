@@ -395,13 +395,15 @@ public class MainActivity extends AppCompatActivity {
     /** Ask once to be exempt from battery optimisation so the watcher keeps running while the app is closed. */
     private void requestBatteryExemption() {
         try {
-            if (prefs.getBoolean("asked_batt", false)) return;
-            prefs.edit().putBoolean("asked_batt", true).apply();
             android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
-            if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
-                startActivity(new android.content.Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                        android.net.Uri.parse("package:" + getPackageName())));
-            }
+            if (pm == null || pm.isIgnoringBatteryOptimizations(getPackageName())) return;   // already exempt — nothing to do
+            // Re-prompt (at most weekly) until it's actually granted, instead of asking once and giving up —
+            // an unexempt phone is a leading cause of the overnight market disappearing.
+            long last = prefs.getLong("batt_asked_at", 0), now = System.currentTimeMillis();
+            if (last != 0 && now - last < 7L * 24 * 60 * 60_000L) return;   // asked recently — don't nag every launch
+            prefs.edit().putLong("batt_asked_at", now).apply();
+            startActivity(new android.content.Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    android.net.Uri.parse("package:" + getPackageName())));
         } catch (Exception ignored) {}
     }
 
@@ -708,12 +710,14 @@ public class MainActivity extends AppCompatActivity {
     private void publishOrderNow() {
         final Order o = baseOrder();
         if (o == null) { toast("Enable at least one pair in your order first"); return; }
-        // Pegged ladders are regenerated around the live oracle mid at EVERY publish; a stale feed never publishes.
+        // Pegged ladders are regenerated around the oracle mid at EVERY publish. Only when there's NO usable
+        // price at all does it refuse; a stale-but-known price publishes a widened defensive ladder (stay-live).
         final int peg = PriceOracle.applyPeg(o, prefs);
         if (peg == PriceOracle.PEG_STALE) {
-            orderStatus = "✗ " + PriceOracle.SOURCE + " price unavailable — not publishing at a stale price";
+            orderStatus = "✗ " + PriceOracle.SOURCE + " price unavailable — can't peg yet (no price)";
             render(); return;
         }
+        final boolean wide = peg == PriceOracle.PEG_WIDE;
         final double pegMid = PriceOracle.appliedMid();
         prefs.edit().putBoolean("auto_publish", true).apply();   // opt in to keep it live + fresh
         orderStatus = "Publishing your order…";
@@ -724,9 +728,11 @@ public class MainActivity extends AppCompatActivity {
         engine.ensureLadderCoins(o, !SWEEP_ACTIVE, () -> SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
             @Override public void onSent(String txpowid) {
                 prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();
-                if (peg == PriceOracle.PEG_APPLIED) PriceOracle.commitPeg(prefs, pegMid);   // baseline moves only on a CONFIRMED publish
+                if (peg == PriceOracle.PEG_APPLIED || wide) PriceOracle.commitPeg(prefs, pegMid, wide);   // baseline moves only on a CONFIRMED publish
                 engine.setMyOrder(o);
-                orderStatus = peg == PriceOracle.PEG_APPLIED
+                orderStatus = wide
+                        ? "✓ Order live — pegged to " + PriceOracle.SOURCE + " (feed stale — defensive spread; auto-tightens when it recovers)"
+                        : peg == PriceOracle.PEG_APPLIED
                         ? "✓ Order live — pegged to " + PriceOracle.SOURCE + " (mid " + fmtPrice(PriceOracle.mid()) + "), auto-reprices"
                         : "✓ Order published — auto-refreshes every 30 min";
                 render(); ui.postDelayed(MainActivity.this::scanOrderBook, 2000);
@@ -746,12 +752,13 @@ public class MainActivity extends AppCompatActivity {
         if (o == null) return;   // all pairs disabled → nothing to keep live
         final boolean restored = prefs.getBoolean(PriceOracle.P_WITHDRAWN, false);
         final int peg = PriceOracle.applyPeg(o, prefs);
-        if (peg == PriceOracle.PEG_STALE) return;   // never republish at a stale oracle price (withdraw runs on the tick)
+        if (peg == PriceOracle.PEG_STALE) return;   // NO usable price at all → don't publish (withdraw runs on the tick)
+        final boolean wide = peg == PriceOracle.PEG_WIDE;   // stale but priced from the last-good mid, defensive spread
         final double pegMid = PriceOracle.appliedMid();
         prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();   // stamp now to avoid re-entry
         engine.ensureLadderCoins(o, !SWEEP_ACTIVE, () -> SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
             @Override public void onSent(String txpowid) {
-                if (peg == PriceOracle.PEG_APPLIED) PriceOracle.commitPeg(prefs, pegMid);   // baseline moves only on a CONFIRMED publish
+                if (peg == PriceOracle.PEG_APPLIED || wide) PriceOracle.commitPeg(prefs, pegMid, wide);   // baseline moves only on a CONFIRMED publish
                 engine.setMyOrder(o);
                 if (restored && peg == PriceOracle.PEG_APPLIED) {
                     orderStatus = "✓ " + PriceOracle.SOURCE + " feed recovered — pegged order is live again";
@@ -763,15 +770,16 @@ public class MainActivity extends AppCompatActivity {
         }));
     }
 
-    /** FUND-SAFETY: the oracle feed has been down past the safety window → publish a TOMBSTONE and DISARM the
-     *  responder guard, so we stop auto-accepting takes at a price the market may have left behind. auto_publish
-     *  stays ON — the order re-publishes (freshly priced) automatically as soon as the feed recovers. */
+    /** FUND-SAFETY, last resort: only when there is NO usable price AT ALL (never fetched, none persisted) and
+     *  the feed's been down past the window do we publish a TOMBSTONE + DISARM the guard. With a last-good mid
+     *  the peg STAYS LIVE at a widened defensive spread instead (see applyPeg / PEG_WIDE), so a sleeping phone
+     *  keeps supplying liquidity overnight. auto_publish stays ON either way. */
     private void maybePegWithdraw() {
         if (identity == null || myMinimaPk == null || !wallet.ready() || engine == null) return;
         final boolean withdrawn = prefs.getBoolean(PriceOracle.P_WITHDRAWN, false);
         if (withdrawn && prefs.getBoolean(PriceOracle.P_TOMBSTONED, false)) return;   // tombstone confirmed — done
-        if (withdrawn && PriceOracle.fresh()) return;    // feed already back — the restore republish takes over
-        if (!withdrawn && !PriceOracle.feedDownPastLimit()) return;
+        if (PriceOracle.mid() > 0 && !PriceOracle.feedDownPastCeiling()) return;   // have a usable price & within the ceiling → stay live
+        if (!withdrawn && !PriceOracle.feedDownPastLimit()) return;   // no price yet, but not down long enough
         final boolean first = !withdrawn;                // else: retrying a tombstone whose broadcast failed
         if (first) prefs.edit().putBoolean(PriceOracle.P_WITHDRAWN, true)
                 .putBoolean(PriceOracle.P_TOMBSTONED, false).apply();   // withdrawn state FIRST — kill-safe
@@ -803,9 +811,10 @@ public class MainActivity extends AppCompatActivity {
         final boolean live = o.hasLiquidity();
         final int peg = live ? PriceOracle.applyPeg(o, prefs) : PriceOracle.PEG_OFF;
         if (peg == PriceOracle.PEG_STALE) {
-            orderStatus = "Saved. " + PriceOracle.SOURCE + " price unavailable — publishes when the feed recovers.";
+            orderStatus = "Saved. " + PriceOracle.SOURCE + " price unavailable — publishes when a price arrives.";
             render(); return;
         }
+        final boolean wide = peg == PriceOracle.PEG_WIDE;
         final double pegMid = PriceOracle.appliedMid();
         if (!live) prefs.edit().putBoolean("auto_publish", false).apply();   // disabled/emptied → stop keeping it live
         orderStatus = live ? "Updating your order…" : "Withdrawing your order…";
@@ -813,7 +822,7 @@ public class MainActivity extends AppCompatActivity {
         final CommsTransport.SendCb cb = new CommsTransport.SendCb() {
             @Override public void onSent(String txpowid) {
                 prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();
-                if (peg == PriceOracle.PEG_APPLIED) PriceOracle.commitPeg(prefs, pegMid);   // baseline moves only on a CONFIRMED publish
+                if (peg == PriceOracle.PEG_APPLIED || wide) PriceOracle.commitPeg(prefs, pegMid, wide);   // baseline moves only on a CONFIRMED publish
                 engine.setMyOrder(o);
                 orderStatus = live ? "✓ Order updated" : "✓ Order withdrawn — removed from the book";
                 render(); ui.postDelayed(MainActivity.this::scanOrderBook, 2000);

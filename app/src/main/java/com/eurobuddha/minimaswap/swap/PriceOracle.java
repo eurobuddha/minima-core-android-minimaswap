@@ -38,13 +38,22 @@ public final class PriceOracle {
     private static final String DEPTH_URL = "https://api.mexc.com/api/v3/depth?symbol=MINIMAUSDT&limit=20";
     private static final String BOOK_URL = "https://api.mexc.com/api/v3/ticker/bookTicker?symbol=MINIMAUSDT";
 
-    public static final long FRESH_MS = 5 * 60_000;          // max age a price may still price an order
-    public static final long WITHDRAW_MS = 10 * 60_000;      // feed down this long → withdraw the pegged order
+    public static final long FRESH_MS = 5 * 60_000;          // ≤ this old → peg TIGHT at the configured step
+    public static final long WITHDRAW_MS = 10 * 60_000;      // feed down this long AND no usable price → withdraw
     private static final long WITHDRAW_GRACE_MS = 60_000;    // must have been TRYING this long (this process) first
     private static final long FETCH_GAP_MS = 30_000;         // min gap between fetch attempts
     private static final long MIN_REPRICE_GAP_MS = 3 * 60_000;   // chain-spam floor between peg republishes
     private static final double JUMP_FRACTION = 0.5;         // a >50% move needs two consecutive agreeing reads
     private static final double DEPTH_MIN_USDT = 25;         // effective bid/ask = book level where cumulative notional ≥ this
+
+    // Stay-live-with-defensive-widening: when the feed is STALE but we still have a last-good mid, keep the
+    // market up (so a phone that sleeps overnight keeps supplying liquidity) but widen the spread the longer
+    // the feed's been down, so any stale-price fill is at a price that favours the maker. Snaps back to tight
+    // the moment MEXC is reachable again. Only when there is NO usable price at all — OR the feed's been down
+    // past the HARD CEILING (truly abandoned) — do we withdraw, so a multi-day outage can't drain the balance.
+    private static final long STALE_WIDEN_FULL_MS = 90 * 60_000;      // spread reaches MAX_WIDEN after this long stale
+    private static final double MAX_WIDEN = 10.0;                     // max spread multiplier when long-stale
+    private static final long HARD_STALE_MS = 12 * 60 * 60_000;       // feed down THIS long → withdraw even with a last price
 
     // peg config — shared "minimaswap" prefs so MainActivity + SwapService read one source of truth
     public static final String P_ENABLE = "peg_enable";      // boolean: ladder pegged to the oracle
@@ -53,13 +62,16 @@ public final class PriceOracle {
     public static final String P_BIAS = "peg_bias_pct";      // string double: skew, ±% shift of the quoted mid
     public static final String P_REPRICE = "peg_reprice_pct";// string double: republish when moved ≥ this %
     public static final String P_LAST_MID = "peg_last_mid";  // string double: oracle mid at the last pegged publish
-    public static final String P_WITHDRAWN = "peg_withdrawn";// boolean: order pulled because the feed went stale
+    public static final String P_WITHDRAWN = "peg_withdrawn";// boolean: order pulled because there was NO usable price
     public static final String P_TOMBSTONED = "peg_tombstoned"; // boolean: the withdraw tombstone CONFIRMED on the wire
     public static final String P_LAST_OK = "peg_last_ok";    // long: when the last good read landed (survives restarts)
+    public static final String P_LAST_PRICE = "peg_last_price"; // string double: last-good oracle price (survives restart → stay-live)
+    public static final String P_WIDE = "peg_wide";          // boolean: last publish used a widened (stale) spread
 
     public static final int PEG_OFF = 0;      // not pegged (or unconfigured) — order left untouched
-    public static final int PEG_APPLIED = 1;  // ladder regenerated from a fresh oracle price
-    public static final int PEG_STALE = 2;    // pegged but NO fresh price — caller must not publish
+    public static final int PEG_APPLIED = 1;  // ladder regenerated from a FRESH oracle price (tight)
+    public static final int PEG_STALE = 2;    // pegged but NO usable price at all — caller must not publish (withdraw)
+    public static final int PEG_WIDE = 3;     // stale but priced from the last-good mid with a WIDENED defensive spread
 
     private static final Object LOCK = new Object();
     private static final ExecutorService EXEC = Executors.newSingleThreadExecutor(r -> {
@@ -82,7 +94,14 @@ public final class PriceOracle {
         synchronized (LOCK) {
             sPrefs = prefs;
             long t = prefs.getLong(P_LAST_OK, 0), now = System.currentTimeMillis();
-            if (goodAtMs == 0 && t > 0 && t <= now) goodAtMs = t;   // timestamp only: price stays 0, so nothing quotes from it
+            if (goodAtMs == 0 && t > 0 && t <= now) goodAtMs = t;   // restore the staleness clock
+            // Restore the last-good PRICE too so a cold start (overnight process kill) can keep the market
+            // LIVE around it — widened by the staleness clock above rather than pulled. A brand-new fetch
+            // replaces it as soon as the network is back.
+            if (price <= 0) {
+                try { double lp = Double.parseDouble(prefs.getString(P_LAST_PRICE, "0"));
+                      if (lp > 0 && !Double.isInfinite(lp)) price = lp; } catch (Exception ignore) {}
+            }
         }
     }
 
@@ -91,10 +110,18 @@ public final class PriceOracle {
     public static double mid() { synchronized (LOCK) { return price; } }
 
     public static long ageMs() {
-        synchronized (LOCK) { return goodAtMs > 0 ? System.currentTimeMillis() - goodAtMs : Long.MAX_VALUE; }
+        synchronized (LOCK) {
+            if (goodAtMs <= 0) return Long.MAX_VALUE;
+            long a = System.currentTimeMillis() - goodAtMs;
+            return a < 0 ? Long.MAX_VALUE : a;   // backward clock jump (NTP/manual) must read as STALE, never fresh
+        }
     }
 
     public static boolean fresh() { return mid() > 0 && ageMs() <= FRESH_MS; }
+
+    /** Feed down past the HARD ceiling: withdraw even with a last-good price (bounds a multi-day-outage
+     *  pick-off). Distinct from {@link #feedDownPastLimit} (the no-price tombstone window). */
+    public static boolean feedDownPastCeiling() { return ageMs() > HARD_STALE_MS; }
 
     /** No good read for longer than the safety window. The baseline is the persisted last-good stamp (via
      *  init), so process restarts don't reset the clock; and we require ≥ one grace period of actual TRYING
@@ -119,7 +146,11 @@ public final class PriceOracle {
             String s = SOURCE + " mid " + fmt(price)
                     + (bid > 0 ? "  (bid " + fmt(bid) + " / ask " + fmt(ask) + ")" : "")
                     + "  ·  " + (age / 1000) + "s ago";
-            return age > FRESH_MS ? s + "  — STALE" : s;
+            if (age > FRESH_MS) {
+                double w = wideningFactor(age);
+                return s + "  — STALE · defensive spread ×" + new BigDecimal(w, new MathContext(2)).stripTrailingZeros().toPlainString();
+            }
+            return s;
         }
     }
 
@@ -194,7 +225,9 @@ public final class PriceOracle {
                 price = m; bid = b; ask = a;
                 goodAtMs = System.currentTimeMillis();
                 lastError = null;
-                if (sPrefs != null) sPrefs.edit().putLong(P_LAST_OK, goodAtMs).apply();   // withdraw clock survives restarts
+                // Persist BOTH the clock and the price so a restart can keep the market live around the last mid.
+                if (sPrefs != null) sPrefs.edit().putLong(P_LAST_OK, goodAtMs)
+                        .putString(P_LAST_PRICE, Double.toString(m)).apply();
             }
         } catch (Exception e) {
             synchronized (LOCK) { lastError = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(); }
@@ -261,33 +294,49 @@ public final class PriceOracle {
         double step = prefD(prefs, P_STEP, 0), size = prefD(prefs, P_SIZE, 0);
         double bias = Math.max(-20, Math.min(20, prefD(prefs, P_BIAS, 0)));
         if (!(step > 0) || !(size > 0)) return PEG_OFF;   // unconfigured peg behaves like a manual ladder
-        double m;
-        synchronized (LOCK) { m = price; }
-        if (!(m > 0) || ageMs() > FRESH_MS) return PEG_STALE;
+        double m; long age;
+        synchronized (LOCK) { m = price; age = ageMs(); }
+        if (!(m > 0)) return PEG_STALE;   // NO usable price at all (never fetched, none persisted) → don't publish
+        if (age > HARD_STALE_MS) return PEG_STALE;   // feed down past the hard ceiling → stop publishing, let withdraw stand
+        // STAY LIVE: fresh → tight; stale → keep the market up but widen the spread the longer the feed's down,
+        // so an overnight stale-price fill is defensive. wide = MAX_WIDEN once feed's been down ≥ STALE_WIDEN_FULL_MS.
+        boolean stale = age > FRESH_MS;
+        double effStep = step * wideningFactor(age);
         double quoted = m * (1 + bias / 100.0);
         p.bids.clear(); p.asks.clear();
         for (int i = 1; i <= Order.MAX_LEVELS; i++) {
-            p.asks.add(new Order.Level(quoted * (1 + i * step / 100.0), size));
-            p.bids.add(new Order.Level(quoted * (1 - i * step / 100.0), size));
+            p.asks.add(new Order.Level(quoted * (1 + i * effStep / 100.0), size));
+            p.bids.add(new Order.Level(quoted * (1 - i * effStep / 100.0), size));
         }
         p.buy = 0; p.sell = 0;   // re-derived from the fresh levels (editor-authoritative pattern)
         Order.sanitize(p);       // drops any bid a huge step pushed ≤ 0
         if (p.asks.isEmpty() && p.bids.isEmpty()) return PEG_STALE;   // belt: nothing valid → don't publish
         prefs.edit().putString("order_config", Order.toConfigJson(o)).apply();
         synchronized (LOCK) { appliedMid = m; }
-        return PEG_APPLIED;
+        return stale ? PEG_WIDE : PEG_APPLIED;
+    }
+
+    /** Spread multiplier by feed staleness: 1× while fresh, ramping linearly to {@link #MAX_WIDEN} once the
+     *  feed's been down {@link #STALE_WIDEN_FULL_MS}. Keeps a sleeping phone's market live but defensive. */
+    private static double wideningFactor(long ageMs) {
+        if (ageMs <= FRESH_MS) return 1.0;
+        double t = (double) (ageMs - FRESH_MS) / (STALE_WIDEN_FULL_MS - FRESH_MS);
+        if (t < 0) t = 0; else if (t > 1) t = 1;
+        return 1.0 + (MAX_WIDEN - 1.0) * t;
     }
 
     /** The mid the LAST {@link #applyPeg} priced from. Capture into a final local immediately after a
      *  PEG_APPLIED return (all callers run on the main thread) and hand it to {@link #commitPeg}. */
     public static double appliedMid() { synchronized (LOCK) { return appliedMid; } }
 
-    /** Commit a pegged publish that CONFIRMED on the wire: advance the reprice baseline and clear the
-     *  withdrawn/tombstoned state. Call ONLY from the publish onSent — never before. */
-    public static void commitPeg(SharedPreferences prefs, double mid) {
+    /** Commit a pegged publish that CONFIRMED on the wire: advance the reprice baseline, clear the
+     *  withdrawn/tombstoned state, and record whether the published spread was WIDENED (stale) so the next
+     *  fresh read tightens immediately. Call ONLY from the publish onSent — never before. */
+    public static void commitPeg(SharedPreferences prefs, double mid, boolean wide) {
         prefs.edit().putString(P_LAST_MID, Double.toString(mid))
                 .putBoolean(P_WITHDRAWN, false)
-                .putBoolean(P_TOMBSTONED, false).apply();
+                .putBoolean(P_TOMBSTONED, false)
+                .putBoolean(P_WIDE, wide).apply();
     }
 
     /**
@@ -297,10 +346,13 @@ public final class PriceOracle {
      */
     public static boolean shouldReprice(SharedPreferences prefs, long lastPublishMs) {
         if (!prefs.getBoolean(P_ENABLE, false)) return false;
-        double m;
-        synchronized (LOCK) { m = price; }
-        if (!(m > 0) || ageMs() > FRESH_MS) return false;
-        if (prefs.getBoolean(P_WITHDRAWN, false)) return true;   // feed recovered → restore the order now
+        double m; long age;
+        synchronized (LOCK) { m = price; age = ageMs(); }
+        if (!(m > 0)) return false;                             // no price → keep-alive/withdraw handles it
+        boolean fresh = age <= FRESH_MS;
+        if (prefs.getBoolean(P_WITHDRAWN, false)) return fresh;  // a no-price withdrawal restores once fresh
+        if (fresh && prefs.getBoolean(P_WIDE, false)) return true;  // was WIDE, now fresh → tighten NOW
+        if (!fresh) return false;                               // stale: stay-live via the 30-min keep-alive, no urgent reprice
         if (System.currentTimeMillis() - lastPublishMs < MIN_REPRICE_GAP_MS) return false;
         double last = prefD(prefs, P_LAST_MID, 0);
         if (!(last > 0)) return true;                            // pegged but never stamped → publish
