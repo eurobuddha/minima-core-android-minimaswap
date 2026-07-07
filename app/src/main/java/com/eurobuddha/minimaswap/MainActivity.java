@@ -62,6 +62,7 @@ import com.eurobuddha.minimaswap.swap.OtcDb;
 import com.eurobuddha.minimaswap.swap.OtcMessage;
 import com.eurobuddha.minimaswap.swap.OtcOffer;
 import com.eurobuddha.minimaswap.swap.PriceOracle;
+import com.eurobuddha.minimaswap.swap.PublishGate;
 import com.eurobuddha.minimaswap.swap.SwapDb;
 import com.eurobuddha.minimaswap.swap.SwapEngine;
 import com.eurobuddha.minimaswap.swap.SwapOrderBook;
@@ -176,17 +177,30 @@ public class MainActivity extends AppCompatActivity {
     public static volatile boolean FOREGROUND = false;
     public static volatile boolean SWEEP_ACTIVE = false;   // a market sweep owns the wire — SwapService must also stand down
 
+    private long lastRegisterMs = 0;   // pairing-retry throttle while the node is unreachable
+
     private final Runnable watchTick = new Runnable() {
         @Override public void run() {
+            if (!paired) {
+                // The constructor's one-shot REGISTER is lost if the node app isn't running yet (post-reboot,
+                // force-stopped) — keep re-sending until the node answers. Recovery flips onPaired(true).
+                if (System.currentTimeMillis() - lastRegisterMs >= 30_000) {
+                    lastRegisterMs = System.currentTimeMillis();
+                    node.reRegister();
+                }
+            } else if (identity == null || !wallet.ready() || !minima.ready()) {
+                ensureDerivations();   // retry any derivation that failed transiently (was one-shot before)
+            }
             if (sweepRun == null || !sweepRun.sell) {  // stand down only mid-SELL-sweep — a poll republish/claim
                                                        // could re-select a sell leg's MINIMA coins. (A BUY sweep is
                                                        // nonce-serialized, so the poller may run alongside it.)
-                // Peg housekeeping BEFORE poll(): the armSafe guard re-sync must land before this engine can act
-                // on takes — after a fg/bg handoff the OTHER host may have withdrawn/restored while our engine
-                // still held the pre-handoff order (armSafe → empty order while withdrawn = decline every take).
+                // Re-arm the responder guard from the PERSISTED config on EVERY pass, BEFORE poll() — a
+                // cancel/edit (in either host) must reach this engine's guard (disabled pairs decline every
+                // take), and after a fg/bg handoff the OTHER host may have withdrawn/restored while our
+                // engine still held the pre-handoff order (armSafe → empty order while withdrawn).
+                if (engine != null) engine.setMyOrder(PriceOracle.armSafe(loadOrder(), prefs));
                 if (prefs.getBoolean(PriceOracle.P_ENABLE, false) && prefs.getBoolean("auto_publish", false)) {
                     PriceOracle.refreshAsync();        // keep the peg's price fresh (rate-limited inside)
-                    if (engine != null) engine.setMyOrder(PriceOracle.armSafe(loadOrder(), prefs));
                     maybePegWithdraw();                // feed down too long → pull the order + disarm the guard
                 }
                 if (engine != null) engine.poll();
@@ -240,6 +254,7 @@ public class MainActivity extends AppCompatActivity {
         render();
         if (!prefs.getBoolean("seen_welcome", false)) ui.post(this::showWelcome);
         node = new NodeApi(this, this::onPaired);
+        lastRegisterMs = System.currentTimeMillis();   // the constructor's REGISTER counts as attempt #1
         minima = new MinimaHtlc(node);
         engine = new SwapEngine(node, minima, db, wallet, ui, notifier);
         otcDb = new OtcDb(this);
@@ -335,40 +350,53 @@ public class MainActivity extends AppCompatActivity {
     private void onPaired(boolean enabled) {
         paired = enabled;
         pairingBanner.setVisibility(enabled ? View.GONE : View.VISIBLE);
+        SwapLog.d("fg paired=" + enabled);
         if (enabled) {
             fetchMinimaBalance();
-            if (!wallet.ready()) {
-                wallet.deriveFromNode(node, ui, new EthWallet.Cb() {
-                    @Override public void ok(String address) { ethAddr = address; ethErr = null; render(); fetchEthBalances(true); maybeStartEngine(); }
-                    @Override public void err(String msg) { ethErr = msg; render(); }
-                });
-            } else {
-                fetchEthBalances(true);
-            }
-            if (identity == null) setupIdentity();
-            if (!minima.ready()) {
-                // Reuse a persisted identity — getaddress rotates through 64 keys, so a fresh one each
-                // session would break discovery/resume (the maker's published key must stay constant).
-                String savedAddr = prefs.getString("swap_addr", "");
-                String savedPk = prefs.getString("swap_pk", "");
-                minima.setup(savedAddr, savedPk, new MinimaHtlc.SetupCb() {
-                    @Override public void ok(String a, String pk) {
-                        myMinimaPk = pk;
-                        prefs.edit().putString("swap_addr", a).putString("swap_pk", pk).apply();
-                        engine.setMyMinimaPk(pk);
-                        minima.loadMyKeys(new MinimaHtlc.KeysCb() {
-                            @Override public void ok(java.util.Set<String> keys) { engine.setMyPubkeys(keys); }
-                            @Override public void err(String m) { /* refund still works for the publish key */ }
-                        });
-                        maybeStartEngine(); render();
-                    }
-                    @Override public void err(String m) { /* surfaced lazily */ }
-                });
-            }
+            if (wallet.ready()) fetchEthBalances(true);
+            ensureDerivations();
             scanOrderBook();
             startWatcher();
         }
         render();
+    }
+
+    /** True while an async derivation is in flight — so retries never stack duplicate calls. */
+    private boolean walletDeriving = false, minimaSettingUp = false, identityRequesting = false;
+
+    /** Idempotent, retrying bootstrap (was one-shot with silent error callbacks — a transient failure
+     *  left publish/identity dead for the session). Safe to call every tick; each block re-fires only
+     *  while its target isn't ready and nothing is in flight. */
+    private void ensureDerivations() {
+        if (!wallet.ready() && !walletDeriving) {
+            walletDeriving = true;
+            wallet.deriveFromNode(node, ui, new EthWallet.Cb() {
+                @Override public void ok(String address) { walletDeriving = false; ethAddr = address; ethErr = null; render(); fetchEthBalances(true); maybeStartEngine(); }
+                @Override public void err(String msg) { walletDeriving = false; ethErr = msg; SwapLog.w("fg eth wallet derive failed"); render(); }   // msg may echo key material — screen only, never logcat
+            });
+        }
+        if (identity == null && !identityRequesting) setupIdentity();
+        if (!minima.ready() && !minimaSettingUp) {
+            minimaSettingUp = true;
+            // Reuse a persisted identity — getaddress rotates through 64 keys, so a fresh one each
+            // session would break discovery/resume (the maker's published key must stay constant).
+            String savedAddr = prefs.getString("swap_addr", "");
+            String savedPk = prefs.getString("swap_pk", "");
+            minima.setup(savedAddr, savedPk, new MinimaHtlc.SetupCb() {
+                @Override public void ok(String a, String pk) {
+                    minimaSettingUp = false;
+                    myMinimaPk = pk;
+                    prefs.edit().putString("swap_addr", a).putString("swap_pk", pk).apply();
+                    engine.setMyMinimaPk(pk);
+                    minima.loadMyKeys(new MinimaHtlc.KeysCb() {
+                        @Override public void ok(java.util.Set<String> keys) { engine.setMyPubkeys(keys); }
+                        @Override public void err(String m) { SwapLog.w("fg loadMyKeys: " + m); /* refund still works for the publish key */ }
+                    });
+                    maybeStartEngine(); render();
+                }
+                @Override public void err(String m) { minimaSettingUp = false; SwapLog.w("fg minima setup: " + m); }
+            });
+        }
     }
 
     /** Once both the ETH wallet and Minima identity are ready, run a first poll to resume any swaps. */
@@ -389,6 +417,7 @@ public class MainActivity extends AppCompatActivity {
         try { androidx.core.content.ContextCompat.startForegroundService(this, new android.content.Intent(this, SwapService.class)); }
         catch (Exception ignored) {}
         try { SwapWorker.schedule(this); } catch (Exception ignored) {}
+        try { HeartbeatReceiver.schedule(this); } catch (Exception ignored) {}   // Doze-proof publish heartbeat
         requestBatteryExemption();
     }
 
@@ -408,13 +437,15 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void setupIdentity() {
+        identityRequesting = true;
         node.cmd("vault action:seed", new NodeApi.Cb() {
             @Override public void onResult(JSONObject j) {
                 JSONObject r = j.optJSONObject("response");
                 String ikm = r == null ? "" : r.optString("seed", r.optString("phrase", ""));
                 if (!ikm.isEmpty()) deriveIdentity(ikm);
+                else { identityRequesting = false; SwapLog.w("fg identity: empty seed reply (vault locked?)"); }
             }
-            @Override public void onError(String m) { /* not enabled yet, etc. */ }
+            @Override public void onError(String m) { identityRequesting = false; SwapLog.w("fg identity seed read: " + m); }
         });
     }
 
@@ -423,9 +454,9 @@ public class MainActivity extends AppCompatActivity {
             try {
                 byte[] seed = ikm.startsWith("0x") ? Hex.from(ikm) : ikm.getBytes(StandardCharsets.UTF_8);
                 CommsIdentity id = CommsIdentity.fromSeed(ls, seed);
-                ui.post(() -> { identity = id; crypto = new LocalEcCryptoProvider(ls, id); render(); scanOrderBook(); scanOtc(); });
+                ui.post(() -> { identity = id; crypto = new LocalEcCryptoProvider(ls, id); identityRequesting = false; SwapLog.d("fg comms identity ready"); render(); scanOrderBook(); scanOtc(); });
             } catch (Exception e) {
-                ui.post(() -> toast("Identity error: " + e.getMessage()));
+                ui.post(() -> { identityRequesting = false; toast("Identity error: " + e.getMessage()); });
             }
         });
     }
@@ -598,6 +629,19 @@ public class MainActivity extends AppCompatActivity {
                     // view until it ages out (~1h) — drop it now. My tombstone withdraws it for peers next block.
                     if (identity != null && !prefs.getBoolean("auto_publish", false))
                         book.remove("0x" + com.eurobuddha.comms.Hex.to(identity.signPk));
+                    // Belt (fg parity with the Service's reconcileBookPresence): the ok-stamp claims a recent
+                    // publish landed but my coin is missing/stale (vault-locked pending / orphaned txn) →
+                    // zero the stamp so the next tick republishes. Only ever FORCES a publish.
+                    if (identity != null && prefs.getBoolean("auto_publish", false)
+                            && !prefs.getBoolean(PriceOracle.P_WITHDRAWN, false)) {
+                        Order mine = book.get("0x" + com.eurobuddha.comms.Hex.to(identity.signPk));
+                        long stamp = prefs.getLong("last_publish_ok", 0), now = System.currentTimeMillis();
+                        if (stamp != 0 && now - stamp > 5 * 60_000 && now - stamp < REPUBLISH_INTERVAL_MS
+                                && (mine == null || now - mine.ts > REPUBLISH_INTERVAL_MS + 10 * 60_000)) {
+                            prefs.edit().putLong("last_publish_ok", 0).apply();
+                            SwapLog.w("fg book-miss — publish claimed OK but isn't on the book; forcing republish");
+                        }
+                    }
                     orderBook.clear(); orderBook.putAll(book); render();
                 },
                 err -> { orderStatus = "Book scan: " + err; render(); });
@@ -719,15 +763,20 @@ public class MainActivity extends AppCompatActivity {
         }
         final boolean wide = peg == PriceOracle.PEG_WIDE;
         final double pegMid = PriceOracle.appliedMid();
+        PublishGate.bumpGen();   // manual supersedes auto: any in-flight AUTO publish result is now stale
+        final long gen = PublishGate.gen();   // …and a LATER user action supersedes THIS one the same way
         prefs.edit().putBoolean("auto_publish", true).apply();   // opt in to keep it live + fresh
         orderStatus = "Publishing your order…";
+        SwapLog.d("fg manual publish attempt");
         render();
         // ensureLadderCoins clamps the ask ladder to the tranches I can actually lock right now (+ splits toward
         // full depth in the background); publishFresh then re-reads the live SENDABLE balance so the advertised
         // size is never a stale snapshot.
         engine.ensureLadderCoins(o, !SWEEP_ACTIVE, () -> SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
             @Override public void onSent(String txpowid) {
-                prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();
+                if (gen != PublishGate.gen()) { SwapLog.d("fg manual publish superseded — result dropped"); return; }
+                prefs.edit().putLong("last_publish_ok", System.currentTimeMillis()).apply();
+                SwapLog.d("fg manual publish OK " + txpowid);
                 if (peg == PriceOracle.PEG_APPLIED || wide) PriceOracle.commitPeg(prefs, pegMid, wide);   // baseline moves only on a CONFIRMED publish
                 engine.setMyOrder(o);
                 orderStatus = wide
@@ -737,37 +786,66 @@ public class MainActivity extends AppCompatActivity {
                         : "✓ Order published — auto-refreshes every 30 min";
                 render(); ui.postDelayed(MainActivity.this::scanOrderBook, 2000);
             }
-            @Override public void onFailed(String message) { orderStatus = "Publish failed: " + message; render(); }
+            @Override public void onFailed(String message) { orderStatus = "Publish failed: " + message; SwapLog.w("fg manual publish FAIL: " + message); render(); }
         }));
     }
 
     /** Keep a published order live + its advertised size current: re-publish ~every 30 min (fresh sendable),
-     *  or NOW when the pegged oracle price has moved past the reprice threshold / the feed just recovered. */
+     *  or NOW when the pegged oracle price has moved past the reprice threshold / the feed just recovered.
+     *  Runs off {@code last_publish_ok} (stamped ONLY on a confirmed publish) — a failed attempt retries on
+     *  the next 90s tick instead of silently suppressing the keep-alive for 30 min. */
     private void maybeAutoRepublish() {
-        if (identity == null || myMinimaPk == null || !wallet.ready()) return;
+        if (identity == null || myMinimaPk == null || !wallet.ready()) { SwapLog.skip("fgpub", "waiting: identity/wallet not ready"); return; }
         if (!prefs.getBoolean("auto_publish", false)) return;
-        boolean reprice = PriceOracle.shouldReprice(prefs, prefs.getLong("last_publish", 0));
-        if (!reprice && System.currentTimeMillis() - prefs.getLong("last_publish", 0) < REPUBLISH_INTERVAL_MS) return;
+        long okStamp = prefs.getLong("last_publish_ok", 0);
+        boolean reprice = PriceOracle.shouldReprice(prefs, okStamp);
+        if (!reprice && System.currentTimeMillis() - okStamp < REPUBLISH_INTERVAL_MS) return;
         final Order o = baseOrder();
         if (o == null) return;   // all pairs disabled → nothing to keep live
+        if (!PublishGate.tryAcquire(PublishGate.ORDER)) { SwapLog.skip("fgpub", "gate busy"); return; }
         final boolean restored = prefs.getBoolean(PriceOracle.P_WITHDRAWN, false);
         final int peg = PriceOracle.applyPeg(o, prefs);
-        if (peg == PriceOracle.PEG_STALE) return;   // NO usable price at all → don't publish (withdraw runs on the tick)
+        if (peg == PriceOracle.PEG_STALE) {   // NO usable price at all → don't publish (withdraw runs on the tick)
+            PublishGate.release(PublishGate.ORDER);
+            SwapLog.skip("fgpub", "peg stale — no usable price");
+            return;
+        }
         final boolean wide = peg == PriceOracle.PEG_WIDE;   // stale but priced from the last-good mid, defensive spread
         final double pegMid = PriceOracle.appliedMid();
-        prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();   // stamp now to avoid re-entry
-        engine.ensureLadderCoins(o, !SWEEP_ACTIVE, () -> SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
+        final long gen = PublishGate.gen();
+        SwapLog.d("fg publish attempt reason=" + (reprice ? "reprice" : "interval"));
+        engine.ensureLadderCoins(o, !SWEEP_ACTIVE, () -> {
+            // Re-check BEFORE the send: a withdraw/edit or peg tombstone during the coin/balance reads
+            // must not be out-freshened on-chain by this stale ladder (its ts is stamped at publish time).
+            if (gen != PublishGate.gen()) {
+                PublishGate.release(PublishGate.ORDER);
+                SwapLog.d("fg publish superseded pre-send — dropped");
+                return;
+            }
+            SwapOrderBook.publishFresh(node, ls, identity, o, new CommsTransport.SendCb() {
             @Override public void onSent(String txpowid) {
+                if (gen != PublishGate.gen()) {   // a user edit/withdraw or peg-tombstone superseded this attempt
+                    PublishGate.release(PublishGate.ORDER);
+                    SwapLog.d("fg publish superseded — result dropped");
+                    return;
+                }
+                prefs.edit().putLong("last_publish_ok", System.currentTimeMillis()).apply();
                 if (peg == PriceOracle.PEG_APPLIED || wide) PriceOracle.commitPeg(prefs, pegMid, wide);   // baseline moves only on a CONFIRMED publish
                 engine.setMyOrder(o);
+                PublishGate.release(PublishGate.ORDER);
+                SwapLog.d("fg publish OK " + txpowid);
                 if (restored && peg == PriceOracle.PEG_APPLIED) {
                     orderStatus = "✓ " + PriceOracle.SOURCE + " feed recovered — pegged order is live again";
                     postNotification(PriceOracle.SOURCE + " feed recovered", "Your pegged order is live again.");
                     render();
                 }
             }
-            @Override public void onFailed(String message) { /* retried next interval */ }
-        }));
+            @Override public void onFailed(String message) {
+                PublishGate.release(PublishGate.ORDER);
+                SwapLog.w("fg publish FAIL: " + message);   // retried on the next 90s tick (ok-stamp untouched)
+            }
+            });
+        });
     }
 
     /** FUND-SAFETY, last resort: only when there is NO usable price AT ALL (never fetched, none persisted) and
@@ -783,7 +861,9 @@ public class MainActivity extends AppCompatActivity {
         final boolean first = !withdrawn;                // else: retrying a tombstone whose broadcast failed
         if (first) prefs.edit().putBoolean(PriceOracle.P_WITHDRAWN, true)
                 .putBoolean(PriceOracle.P_TOMBSTONED, false).apply();   // withdrawn state FIRST — kill-safe
+        PublishGate.bumpGen();            // any in-flight AUTO publish result is now stale — it must not re-arm the ladder
         engine.setMyOrder(new Order());   // disarm NOW — an empty order declines every take — even if the publish fails
+        SwapLog.w("fg peg withdraw — tombstoning (feed unusable)");
         Order o = loadOrder();            // tombstone: the saved order with no liquidity (freshest-per-signer wins)
         for (Order.Pair p : o.pairs.values()) p.enable = false;
         o.minimaPublicKey = myMinimaPk;
@@ -791,8 +871,9 @@ public class MainActivity extends AppCompatActivity {
         SwapOrderBook.publish(node, ls, identity, o, new CommsTransport.SendCb() {
             @Override public void onSent(String txpowid) {   // confirmed on the wire — stop retrying
                 prefs.edit().putBoolean(PriceOracle.P_TOMBSTONED, true).apply();
+                SwapLog.d("fg tombstone confirmed " + txpowid);
             }
-            @Override public void onFailed(String message) { /* still un-TOMBSTONED → retried next tick */ }
+            @Override public void onFailed(String message) { SwapLog.w("fg tombstone publish FAIL: " + message); /* retried next tick */ }
         });
         if (first) {
             orderStatus = "⚠ " + PriceOracle.SOURCE + " feed lost — pegged order withdrawn until it recovers";
@@ -816,12 +897,17 @@ public class MainActivity extends AppCompatActivity {
         }
         final boolean wide = peg == PriceOracle.PEG_WIDE;
         final double pegMid = PriceOracle.appliedMid();
+        PublishGate.bumpGen();   // user edit/withdraw supersedes any in-flight AUTO publish (it must not resurrect old liquidity)
+        final long gen = PublishGate.gen();   // …and a LATER user action / peg tombstone supersedes THIS one
         if (!live) prefs.edit().putBoolean("auto_publish", false).apply();   // disabled/emptied → stop keeping it live
         orderStatus = live ? "Updating your order…" : "Withdrawing your order…";
+        SwapLog.d(live ? "fg order edit publish attempt" : "fg order withdraw (tombstone) attempt");
         render();
         final CommsTransport.SendCb cb = new CommsTransport.SendCb() {
             @Override public void onSent(String txpowid) {
-                prefs.edit().putLong("last_publish", System.currentTimeMillis()).apply();
+                if (gen != PublishGate.gen()) { SwapLog.d("fg order edit/withdraw superseded — result dropped"); return; }
+                prefs.edit().putLong("last_publish_ok", System.currentTimeMillis()).apply();
+                SwapLog.d((live ? "fg order edit OK " : "fg order withdraw OK ") + txpowid);
                 if (peg == PriceOracle.PEG_APPLIED || wide) PriceOracle.commitPeg(prefs, pegMid, wide);   // baseline moves only on a CONFIRMED publish
                 engine.setMyOrder(o);
                 orderStatus = live ? "✓ Order updated" : "✓ Order withdrawn — removed from the book";
@@ -3268,12 +3354,33 @@ public class MainActivity extends AppCompatActivity {
 
     private void publishOtcOffer(double sellSize, double buySize) {
         if (identity == null || myMinimaPk == null || !wallet.ready()) { toast("Still connecting…"); return; }
+        if (!PublishGate.tryAcquire(PublishGate.OTC)) {
+            // A keep-alive publish (old sizes) is in flight. Zero the ok-stamp AND bump the gen: the
+            // in-flight publish's onSent is gen-checked, so it can no longer re-stamp over our zero —
+            // the next 90s tick then republishes with the user's NEW sizes.
+            PublishGate.bumpGen();
+            prefs.edit().putLong("otc_last_publish_ok", 0).apply();
+            SwapLog.d("fg OTC publish deferred — gate busy, stamp zeroed + gen bumped");
+            toast("Publishing busy — your sizes go live shortly");
+            return;
+        }
+        final long gen = PublishGate.gen();
         OtcOffer o = new OtcOffer();
         o.sellSize = Math.max(0, sellSize); o.buySize = Math.max(0, buySize); o.enable = true;
         o.minimaPublicKey = myMinimaPk; o.ethAddress = ethAddr == null ? "" : ethAddr; o.commsPublicId = identity.publicId();
         OtcBook.publish(node, ls, identity, o, new CommsTransport.SendCb() {
-            @Override public void onSent(String txpowid) { prefs.edit().putLong("otc_last_publish", System.currentTimeMillis()).apply(); ui.post(() -> { toast("You're live for OTC"); render(); }); }
-            @Override public void onFailed(String message) { ui.post(() -> toast("OTC publish failed: " + message)); }
+            @Override public void onSent(String txpowid) {
+                PublishGate.release(PublishGate.OTC);
+                if (gen != PublishGate.gen()) { SwapLog.d("fg OTC publish superseded — stamp skipped"); return; }
+                prefs.edit().putLong("otc_last_publish_ok", System.currentTimeMillis()).apply();
+                SwapLog.d("fg OTC publish OK " + txpowid);
+                ui.post(() -> { toast("You're live for OTC"); render(); });
+            }
+            @Override public void onFailed(String message) {
+                PublishGate.release(PublishGate.OTC);
+                SwapLog.w("fg OTC publish FAIL: " + message);
+                ui.post(() -> toast("OTC publish failed: " + message));
+            }
         });
     }
 
@@ -3289,12 +3396,13 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    /** Keep my OTC availability live (it ages out of the board after ~1h) — republish on the same cadence as the order. */
+    /** Keep my OTC availability live (it ages out of the board after ~1h) — republish on the same cadence as
+     *  the order. Runs off {@code otc_last_publish_ok} (stamped only on a confirmed publish inside
+     *  publishOtcOffer) so a failed attempt retries on the next 90s tick instead of waiting 30 min. */
     private void maybeRepublishOtc() {
         if (identity == null || myMinimaPk == null || !wallet.ready()) return;
         if (!prefs.getBoolean("otc_auto", false)) return;
-        if (System.currentTimeMillis() - prefs.getLong("otc_last_publish", 0) < REPUBLISH_INTERVAL_MS) return;
-        prefs.edit().putLong("otc_last_publish", System.currentTimeMillis()).apply();
+        if (System.currentTimeMillis() - prefs.getLong("otc_last_publish_ok", 0) < REPUBLISH_INTERVAL_MS) return;
         publishOtcOffer(parseD(prefs.getString("otc_sell_size", "0"), 0), parseD(prefs.getString("otc_buy_size", "0"), 0));
     }
 
