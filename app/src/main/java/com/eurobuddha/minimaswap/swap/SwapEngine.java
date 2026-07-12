@@ -56,7 +56,7 @@ public final class SwapEngine {
     private static final long SECRETS_BACKLOG           = 50 + (TIMELOCK_SECS / 15);         // ETH blocks
     private static final int  NOTIFY_SCAN_DEPTH         = 256;                               // bounded notify scan
     private static final int  HTLC_SCAN_DEPTH           = 256;                               // bounded HTLC coin scan
-    private static final BigInteger MAX_UINT = BigInteger.TWO.pow(256).subtract(BigInteger.ONE);
+    private static final BigInteger MAX_UINT = BigInteger.valueOf(2).pow(256).subtract(BigInteger.ONE);
 
     public interface Notifier {
         void notify(String title, String body);   // OS notification for a meaningful transition
