@@ -129,6 +129,34 @@ public final class EthRpc {
         return hexToBig(callStr("eth_blockNumber", new JSONArray()));
     }
 
+    /**
+     * The latest block's timestamp in unix seconds — the clock the HTLC vault actually enforces timelocks
+     * against (Solidity {@code block.timestamp}). Basing a lock's timelock on THIS instead of the device
+     * clock immunizes it from phone-clock skew that could otherwise invert the two legs' expiry ordering.
+     */
+    public long latestBlockTimestamp() throws IOException {
+        Object r = call("eth_getBlockByNumber", new JSONArray().put("latest").put(false));
+        if (!(r instanceof JSONObject)) throw new IOException("eth_getBlockByNumber: no block header");
+        String ts = ((JSONObject) r).optString("timestamp", "");
+        if (ts.isEmpty()) throw new IOException("eth_getBlockByNumber: no timestamp");
+        return hexToBig(ts).longValue();
+    }
+
+    /** The latest block's EIP-1559 base fee (wei), or ZERO if unavailable. A LEGACY tx's gasPrice must be ≥ the
+     *  base fee to be minable, so this is used to FLOOR the gas price (F5) — a stale eth_gasPrice or the hardcoded
+     *  fallback could sit below a risen base fee and hang the tx forever. Tolerant: returns ZERO on any failure so
+     *  it can only ever RAISE the gas price, never block a send. */
+    public BigInteger baseFeePerGasOrZero() {
+        try {
+            Object r = call("eth_getBlockByNumber", new JSONArray().put("latest").put(false));
+            if (!(r instanceof JSONObject)) return BigInteger.ZERO;
+            String bf = ((JSONObject) r).optString("baseFeePerGas", "");
+            return bf.isEmpty() ? BigInteger.ZERO : hexToBig(bf);
+        } catch (Exception e) {
+            return BigInteger.ZERO;
+        }
+    }
+
     /** eth_call to a contract; returns the raw hex return data ("0x...."). */
     public String ethCall(String to, String data) throws IOException {
         try {

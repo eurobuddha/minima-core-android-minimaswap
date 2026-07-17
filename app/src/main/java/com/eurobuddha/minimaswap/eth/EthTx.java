@@ -58,6 +58,16 @@ public final class EthTx {
             BigInteger gasPrice = EthRpc.hexToBig(rpc.callStr("eth_gasPrice", new JSONArray()));
             if (gasPrice.signum() <= 0) gasPrice = FALLBACK_GAS_PRICE;
             gasPrice = gasPrice.multiply(BigInteger.valueOf(12)).divide(BigInteger.TEN); // +20% headroom
+            // F5: a legacy tx must pay ≥ the current base fee to be minable. eth_gasPrice usually already includes
+            // it, but a stale value or the 2-gwei fallback can sit below a risen base fee and hang the tx forever
+            // (which, post-F1, would mean endless retries but a swap that never settles). Floor the gasPrice at
+            // 2× base fee for headroom against a rising fee. baseFeePerGasOrZero() returns 0 on failure, so this
+            // can only ever RAISE the price, never block the send.
+            BigInteger baseFee = rpc.baseFeePerGasOrZero();
+            if (baseFee.signum() > 0) {
+                BigInteger floor = baseFee.multiply(BigInteger.valueOf(2));
+                if (gasPrice.compareTo(floor) < 0) gasPrice = floor;
+            }
 
             RawTransaction raw = RawTransaction.createTransaction(
                     BigInteger.valueOf(alloc), gasPrice, gasLimit, to,

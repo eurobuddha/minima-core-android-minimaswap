@@ -162,22 +162,6 @@ public final class MinimaHtlc {
         }, cb::err);
     }
 
-    /** Lock the HTLC counter-leg from a SPECIFIC coin (pinned by coinid) — produces the SAME output coin as
-     *  {@link #lock} (byte-identical state[0..7]) but with NO node coin-selection, so several concurrent burst
-     *  locks each pinned to a DISTINCT coin can never double-select. Change (coinAmount − amount) → myAddress.
-     *  Built via the same txncreate…txnpost sequence claim/refund use, with the exact state values lock() writes.
-     *  <p>COST: this is ~14 node commands vs the 1 a plain {@code send} uses — heavier per lock on the embedded
-     *  node (the price of pinning a distinct coin). If it ever dominates, a 1-command alternative is
-     *  {@code send fromaddress:<addr>} over distinct-address split coins, reusing the proven {@code send state:}
-     *  encoding. The err carries a "POSTED:" prefix iff the failure was at txnpost (broadcast MAY have landed
-     *  with a lost response) so the caller can avoid a re-lock; a build-phase failure has no prefix (safe retry). */
-    public void lockFromCoin(String coinid, String coinAmount, String amount, String requestAmount, String reqToken,
-                             String receiverPubkey, String ownerEthKey, String hashlock, int timelockBlock,
-                             String otc, PostCb cb) {
-        List<String> one = new ArrayList<>(); one.add(coinid);
-        lockFromCoins(one, coinAmount, amount, requestAmount, reqToken, receiverPubkey, ownerEthKey, hashlock, timelockBlock, otc, cb);
-    }
-
     /** Lock the HTLC counter-leg from MULTIPLE pinned coins (combined), so the responder can fill a deal larger than
      *  any single coin — the way a wallet {@code send} auto-selects UTXOs, but with the coins pinned by the caller
      *  (no node coin-selection, so concurrent burst locks can't double-select). One {@code txninput} per coinid,

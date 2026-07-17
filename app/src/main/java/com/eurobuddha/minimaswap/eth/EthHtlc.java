@@ -28,9 +28,6 @@ import java.util.List;
  */
 public final class EthHtlc {
 
-    /** keccak256("HTLCERC20Withdraw(bytes32,bytes32,bytes32)") — topic0 of the reveal event. */
-    public static final String WITHDRAW_TOPIC = "0xae1c384441b246473ee31fdf0bd4cc25284d0cdb2c5258ada6b84b4550b9c058";
-
     /** topic0 of HTLCERC20New(contractId indexed, owner indexed, receiver indexed, …) — verbatim upstream. */
     public static final String NEW_TOPIC = "0x241f395d4e943ea32c5c6e0b8c523cb6fbf735af15880f21756155e7a5d576eb";
 
@@ -99,35 +96,6 @@ public final class EthHtlc {
         }
     }
 
-    /** Read revealed preimages from HTLCERC20Withdraw logs between two block heights. */
-    public List<Reveal> getReveals(BigInteger fromBlock, BigInteger toBlock) throws Exception {
-        JSONObject filter = new JSONObject();
-        try {
-            filter.put("fromBlock", "0x" + fromBlock.toString(16));
-            filter.put("toBlock", "0x" + toBlock.toString(16));
-            filter.put("address", net.htlc);
-            filter.put("topics", new JSONArray().put(WITHDRAW_TOPIC));
-        } catch (Exception e) { throw new Exception("log filter: " + e.getMessage()); }
-
-        JSONArray logs = rpc.getLogs(filter);
-        List<Reveal> out = new ArrayList<>();
-        for (int i = 0; i < logs.length(); i++) {
-            JSONObject log = logs.optJSONObject(i);
-            if (log == null) continue;
-            JSONArray topics = log.optJSONArray("topics");
-            if (topics == null || topics.length() < 4) continue;
-            Reveal r = new Reveal();
-            r.contractId = topics.optString(1);
-            r.secret = topics.optString(2);    // the preimage
-            r.hashlock = topics.optString(3);
-            out.add(r);
-        }
-        return out;
-    }
-
-    public static final class Reveal {
-        public String contractId, secret, hashlock;
-    }
 
     /** Is this HTLC contract still collectable (not yet withdrawn or refunded)? — view call, mirrors upstream. */
     public boolean canCollect(String contractId) throws Exception {
@@ -198,11 +166,6 @@ public final class EthHtlc {
     /** New-contract events where I am the RECEIVER (legs I can claim/respond to). */
     public List<Contract> contractsAsReceiver(BigInteger from, BigInteger to) throws Exception {
         return contracts(from, to, null, padAddr(creds.getAddress()));
-    }
-
-    /** New-contract events where I am the OWNER (legs I locked — for refund discovery). */
-    public List<Contract> contractsAsOwner(BigInteger from, BigInteger to) throws Exception {
-        return contracts(from, to, padAddr(creds.getAddress()), null);
     }
 
     private List<Contract> contracts(BigInteger from, BigInteger to, String ownerTopic, String receiverTopic) throws Exception {

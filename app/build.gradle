@@ -10,8 +10,8 @@ android {
         applicationId "com.eurobuddha.minimaswap"
         minSdk 28
         targetSdk 35
-        versionCode 1701
-        versionName "0.17.1"
+        versionCode 1800
+        versionName "0.18.0"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -32,6 +32,16 @@ android {
     }
     buildFeatures {
         buildConfig true
+    }
+    testOptions {
+        // Local JVM unit tests (src/test) exercise the fund-critical pure logic ported from usdtSwap:
+        // timelock ordering (F2) and the ETH-leg encoding. A REAL org.json goes on the test classpath (see
+        // testImplementation below) so parsing runs against the genuine library, so we do NOT enable
+        // returnDefaultValues.
+        unitTests {
+            returnDefaultValues = false
+            includeAndroidResources = false
+        }
     }
 }
 
@@ -68,4 +78,12 @@ dependencies {
     implementation 'org.web3j:abi:4.9.8'
     implementation 'org.web3j:rlp:4.9.8'
     implementation 'org.web3j:utils:4.9.8'
+
+    // ---- Local JVM unit tests (src/test) ----
+    // JUnit 4 runner + a REAL org.json (Android's bundled one is stubbed to throw in unit tests). Mockito is
+    // available for any test that needs to double the Android-coupled NodeApi. Ported from usdtSwap alongside
+    // the fund-safety fixes.
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
+    testImplementation 'org.mockito:mockito-core:5.12.0'
 }

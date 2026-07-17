@@ -53,9 +53,14 @@ public final class SwapEngine {
     public static final long CP_SECS_CHECK              = TIMELOCK_SECS / 2;                 // 3600
     public static final int  CP_BLOCKS                  = (TIMELOCK_BLOCKS / 2) / 2;         // 36
     public static final long CP_SECS                    = (TIMELOCK_SECS / 2) / 2;           // 1800
-    private static final long SECRETS_BACKLOG           = 50 + (TIMELOCK_SECS / 15);         // ETH blocks
     private static final int  NOTIFY_SCAN_DEPTH         = 256;                               // bounded notify scan
     private static final int  HTLC_SCAN_DEPTH           = 256;                               // bounded HTLC coin scan
+    // F1: an ETH withdraw/refund broadcast is only an ACK, not a mined receipt. We treat a swap as settled
+    // ONLY when the contract's own withdrawn/refunded flag confirms it (read every cycle via getContract);
+    // between broadcast and that confirmation we re-attempt no more often than this. Chosen > EthTx's 120 s
+    // nonce-heal window so a genuinely dropped/replaced tx gets a healed nonce on retry instead of a second
+    // tx wedged behind a stuck one. Without this a dropped refund/withdraw would strand funds forever.
+    private static final long ETH_RETRY_SECS            = 150;
     private static final BigInteger MAX_UINT = BigInteger.valueOf(2).pow(256).subtract(BigInteger.ONE);
 
     public interface Notifier {
@@ -84,12 +89,15 @@ public final class SwapEngine {
     private volatile Order myOrder;                 // my published order — the responder-side match guard
     private volatile OtcDb otcDb;                   // OTC deal store — the OTC responder's agreed-terms gate
 
-    private volatile long lastSecretBlock = -1;     // ETH block bookmark (checkETHNewSecrets)
     private volatile long lastEthScanned = -1;      // ETH block bookmark (New-contract discovery)
     private final Set<String> inflight = Collections.synchronizedSet(new HashSet<>());
     private final Map<String, Long> approvePending = Collections.synchronizedMap(new HashMap<>());
     private final Set<String> incoming = Collections.synchronizedSet(new HashSet<>());   // hashlocks announced by a buyer's handshake
     private final Set<String> declined = Collections.synchronizedSet(new HashSet<>());   // handshake buys we've already notified as declined
+    // F1: last broadcast time (unix secs) of an ETH terminal action, keyed "wdEth:"/"refundE:"+hash. Gates
+    // re-broadcast to ≥ ETH_RETRY_SECS apart. In-memory only: a restart re-drives terminal state from the
+    // on-chain withdrawn/refunded flags anyway, so losing these timestamps just allows an immediate retry.
+    private final Map<String, Long> ethAttempt = new java.util.concurrent.ConcurrentHashMap<>();
 
     public SwapEngine(NodeApi node, MinimaHtlc minima, SwapDb db, EthWallet wallet,
                       Handler ui, Notifier notifier) {
@@ -99,7 +107,6 @@ public final class SwapEngine {
 
     public void setNetwork(EthRpc rpc, EthNet net) {
         this.rpc = rpc; this.net = net;
-        lastSecretBlock = -1;             // re-scan secrets from the backlog on the new chain
         lastEthScanned = -1;
         approvePending.clear();
         EthTx.resetAll();                 // cold-start the nonce serializer against the new node's "pending"
@@ -226,6 +233,11 @@ public final class SwapEngine {
      *  and only the negotiated OTC responder locks the counter-leg. */
     public void startMinimaToErc20(Order maker, String sellMinima, String tokenSymbol, String buyTokenAmount, boolean otc, StartCb cb) {
         if (!ready()) { cb.err("Not ready"); return; }
+        // M3: a responder burst-lock (or a coin-split) draws MINIMA from the SAME coin pool that this
+        // user-initiated node-auto-select lock does; both could pick the same coin → one tx is rejected as a
+        // double-spend (fund-safe) but can leave a phantom LOCKED row. Decline briefly while a responder lock or
+        // split is in flight so the user just retries a moment later instead of racing it.
+        if (!cpInFlight.isEmpty() || isSplitting()) { cb.err("Busy locking another swap — try again in a few seconds"); return; }
         final EthNet.Token token = net.token(tokenSymbol);
         if (token == null) { cb.err("Unknown token " + tokenSymbol); return; }
         final String reqToken = "ETH:" + token.address;
@@ -234,17 +246,23 @@ public final class SwapEngine {
                 minima.currentBlock(new MinimaHtlc.BlockCb() {
                     @Override public void ok(int block) {
                         final int timelock = block + TIMELOCK_BLOCKS;
+                        // M2: record the secret + swap row BEFORE the lock broadcast (parity with
+                        // startErc20ToMinima). If lock() mines but its response is lost, the secret + row survive
+                        // so the swap can still be claimed; the chain-scan refund (scanMyHtlcByKey →
+                        // checkExpiredMinima) reclaims the coin at the timelock regardless of the DB. A row whose
+                        // broadcast never landed is a harmless phantom (no coin at the HTLC address for this hash
+                        // → no responder engages, nothing to refund).
+                        db.insertSecret(hash, secret);
+                        db.insertMyHtlc(hash, buyTokenAmount, reqToken);
+                        SwapDb.Swap s = baseSwap(hash, "INITIATOR", "MINIMA_TO_ERC20",
+                                "MINIMA", sellMinima, tokenSymbol, buyTokenAmount, maker.ethAddress);
+                        s.myTimelock = timelock; s.myLegIsMinima = true; s.status = SwapDb.ST_STARTED;
+                        db.upsertSwap(s);
+                        notifier.onSwapsChanged();
                         minima.lock(sellMinima, buyTokenAmount, token.address, maker.minimaPublicKey,
                                 myEth(), hash, timelock, otc ? "TRUE" : "FALSE", new MinimaHtlc.PostCb() {
                             @Override public void ok(String txpowid) {
-                                db.insertSecret(hash, secret);
                                 db.logEvent(hash, SwapDb.EV_STARTED, "minima", sellMinima, txpowid);
-                                db.insertMyHtlc(hash, buyTokenAmount, reqToken);
-                                SwapDb.Swap s = baseSwap(hash, "INITIATOR", "MINIMA_TO_ERC20",
-                                        "MINIMA", sellMinima, tokenSymbol, buyTokenAmount, maker.ethAddress);
-                                s.myTimelock = timelock; s.myLegIsMinima = true; s.status = SwapDb.ST_STARTED;
-                                db.upsertSwap(s);
-                                notifier.onSwapsChanged();
                                 cb.ok(hash);
                             }
                             @Override public void err(String m) { cb.err(m); }
@@ -292,7 +310,8 @@ public final class SwapEngine {
                         BigInteger sellRaw = parseUnits(sellTokenAmount, token.decimals);
                         BigInteger reqRaw = parseUnits(buyMinima, 18);
                         ensureAllowanceBlocking(eth, token.address, sellRaw);
-                        final long timelock = nowUnix() + TIMELOCK_SECS;
+                        // F2: base the timelock on CHAIN time (what the vault enforces), not the device clock.
+                        final long timelock = ethChainNow() + TIMELOCK_SECS;
                         // Record secret + swap row BEFORE the lock broadcast: if newContract MINES but its RPC
                         // response is lost (send() throws), checkEthContractFor still finds this row in
                         // db.allSwaps() and refunds the USDT at timelock. A row whose broadcast never landed is
@@ -600,7 +619,12 @@ public final class SwapEngine {
             BigInteger sellRaw = parseUnits(tokenHuman, token.decimals);
             BigInteger reqRaw = parseUnits(reqMinimaHuman, 18);
             if (!approveIfReady(eth, token.address, sellRaw)) { inflight.remove("cpEth:" + hash); return; }
-            final long timelock = nowUnix() + CP_SECS;
+            // F2: the counter-leg MUST anchor to CHAIN time (block.timestamp) — STRICTLY. A device-clock
+            // fallback here would re-open the very loss F2 closes: a fast phone clock pushes this leg's expiry
+            // past the taker's first leg, letting them refund their leg AND claim mine. So if the chain read
+            // fails (or is grossly implausible) we THROW → the catch below aborts this lock and the responder
+            // retries next cycle; we never lock the counter-leg on a guessed clock.
+            final long timelock = ethChainNowStrict() + CP_SECS;
             // Record the swap row BEFORE the lock broadcast so a mined-but-response-lost counter-leg is still
             // found + refunded by checkEthContractFor. EV_CPSENT (→ haveSentCounterParty) stays AFTER, so a
             // genuine pre-mine failure still retries; a mined-but-lost lock is dup-guarded by the contract.
@@ -732,9 +756,13 @@ public final class SwapEngine {
         boolean iAmSender = gc.owner != null && gc.owner.equalsIgnoreCase(myEth);
 
         if (iAmReceiver) {
-            if (gc.withdrawn || gc.refunded) return;
+            // gc.withdrawn is AUTHORITATIVE: only the receiver (me) can withdraw, so it means MY claim settled.
+            // Finalize on it — never on the broadcast ack — so a dropped tx retries below instead of being
+            // marked COMPLETE while the tokens are still in the vault.
+            if (gc.withdrawn) { confirmEthWithdrawn(hash, s); return; }
+            if (gc.refunded) { finalizeEthLost(hash); return; }   // counterparty refunded before I claimed — this leg is gone
             String secret = db.getSecret(hash);
-            if (secret == null) return;   // (responder before harvesting the secret — nothing to do yet)
+            if (secret == null) return;            // (responder before harvesting the secret — nothing to do yet)
             String[] req = db.getRequest(hash);
             if (req != null) {
                 String tokenHuman = EthWallet.format(gc.amount, decimalsOf(gc.tokenContract), 18);
@@ -743,51 +771,108 @@ public final class SwapEngine {
                     return;
                 }
             }
-            if (db.haveCollect(hash) || !inflight.add("wdEth:" + hash)) return;
-            db.setSwapStatus(hash, SwapDb.ST_CLAIMING);
-            ui.post(notifier::onSwapsChanged);
-            try {
-                String tx = eth.withdraw(contractId, secret);
-                db.logEvent(hash, SwapDb.EV_COLLECT, "ETH:" + gc.tokenContract, "", tx);
-                db.setSwapStatus(hash, SwapDb.ST_COMPLETE);
-                ui.post(() -> { notifier.notify("Swap complete", "Withdrew your " + s.buyToken); notifier.onSwapsChanged(); });
-            } finally { inflight.remove("wdEth:" + hash); }
+            broadcastEthWithdraw(eth, contractId, hash, secret);   // retryable; confirmed next cycle via gc.withdrawn
         } else if (iAmSender) {
             if (gc.withdrawn) {
                 // The counterparty revealed the preimage IN the contract — read it directly (no eth_getLogs).
                 if (gc.preimage != null && EthRpc.hexToBig(gc.preimage).signum() != 0 && db.insertSecret(hash, gc.preimage)) {
                     ui.post(() -> { notifier.notify("Secret revealed", "Claiming your side of the swap"); notifier.onSwapsChanged(); });
                 }
-            } else if (!gc.refunded && nowUnix() > gc.timelock) {
-                if (db.haveCollectExpired(hash) || !inflight.add("refundE:" + hash)) return;
-                try {
-                    String tx = eth.refund(contractId);
-                    db.logEvent(hash, SwapDb.EV_EXPIRED, "ETH:" + gc.tokenContract, "", tx);
-                    db.setSwapStatus(hash, SwapDb.ST_REFUNDED);
-                    ui.post(() -> { notifier.notify("Swap refunded", "Reclaimed your tokens"); notifier.onSwapsChanged(); });
-                } finally { inflight.remove("refundE:" + hash); }
+            } else if (gc.refunded) {
+                confirmEthRefunded(hash);          // AUTHORITATIVE: the vault says this leg is refunded — finalize
+            } else if (nowUnix() > gc.timelock) {
+                broadcastEthRefund(eth, contractId, hash);   // retryable; confirmed next cycle via gc.refunded
             }
         }
     }
 
-    private void checkEthNewSecrets(EthHtlc eth, long ethBlock) {
+    // ---- F1: broadcast vs. confirmation, split apart -----------------------------------------------------
+    // The bug this fixes: refund()/withdraw() used to write the terminal status (+ the EV_ guard row) right
+    // after eth_sendRawTransaction — a broadcast ACK, not a mined receipt. A dropped or fee-replaced tx (very
+    // possible: the ETH wallet is shared byte-for-byte with usdtSwap, so nonces can collide) then looked
+    // "done", was skipped by allSwaps(), and never retried — stranding funds with no in-app recovery. Now
+    // broadcast is retryable + idempotent, and the terminal status is written ONLY when the contract's own
+    // withdrawn/refunded flag — re-read every cycle by checkEthContractFor — confirms it.
+
+    /** Broadcast a withdraw (reveals the preimage, claims the tokens). Never finalizes — {@code gc.withdrawn}
+     *  does, on a later cycle. Spaced by ETH_RETRY_SECS so a dropped tx re-sends (with a healed nonce) rather
+     *  than stranding, and so a still-pending tx isn't piled behind. */
+    private void broadcastEthWithdraw(EthHtlc eth, String contractId, String hash, String secret) {
+        if (!ethRetryDue("wdEth:" + hash) || !inflight.add("wdEth:" + hash)) return;
         try {
-            if (lastSecretBlock == ethBlock) return;
-            long start = (lastSecretBlock == -1) ? Math.max(0, ethBlock - SECRETS_BACKLOG) : lastSecretBlock + 1;
-            long end = ethBlock;
-            if (start > end) start = end;
-            List<EthHtlc.Reveal> reveals = eth.getReveals(BigInteger.valueOf(start), BigInteger.valueOf(end));
-            lastSecretBlock = end;
-            for (EthHtlc.Reveal r : reveals) {
-                if (db.getSwap(r.hashlock) == null) continue;             // only secrets for swaps I'm in
-                if (db.insertSecret(r.hashlock, r.secret)) {
-                    ui.post(() -> { notifier.notify("Secret revealed", "Claiming your side of the swap");
-                        notifier.onSwapsChanged(); });
-                }
-            }
+            markEthAttempt("wdEth:" + hash);
+            db.setSwapStatus(hash, SwapDb.ST_CLAIMING);
+            ui.post(notifier::onSwapsChanged);
+            eth.withdraw(contractId, secret);      // ack only; success is confirmed on-chain, not here
         } catch (Exception e) {
-            /* leave the bookmark untouched — just retry the same range next cycle */
-        }
+            // pre-mine failure (RPC/nonce) → nothing committed; the next cycle retries after the window
+        } finally { inflight.remove("wdEth:" + hash); }
+    }
+
+    /** Broadcast a refund of my own expired leg. Never finalizes — {@code gc.refunded} does, on a later cycle. */
+    private void broadcastEthRefund(EthHtlc eth, String contractId, String hash) {
+        if (!ethRetryDue("refundE:" + hash) || !inflight.add("refundE:" + hash)) return;
+        try {
+            markEthAttempt("refundE:" + hash);
+            eth.refund(contractId);
+        } catch (Exception e) {
+            // pre-mine failure → nothing committed; retry next cycle after the window
+        } finally { inflight.remove("refundE:" + hash); }
+    }
+
+    /** Finalize a withdraw once the contract confirms it settled. Idempotent (single terminal write + notify). */
+    private void confirmEthWithdrawn(String hash, SwapDb.Swap s) {
+        ethAttempt.remove("wdEth:" + hash);
+        SwapDb.Swap cur = db.getSwap(hash);
+        if (cur != null && SwapDb.ST_COMPLETE.equals(cur.status)) return;
+        if (!db.haveCollect(hash)) db.logEvent(hash, SwapDb.EV_COLLECT, "ETH", "", "confirmed on-chain");
+        db.setSwapStatus(hash, SwapDb.ST_COMPLETE);
+        ui.post(() -> { notifier.notify("Swap complete", "Withdrew your " + s.buyToken); notifier.onSwapsChanged(); });
+    }
+
+    /** Finalize a refund once the contract confirms it. Idempotent (single terminal write + notify). */
+    private void confirmEthRefunded(String hash) {
+        ethAttempt.remove("refundE:" + hash);
+        SwapDb.Swap cur = db.getSwap(hash);
+        if (cur != null && SwapDb.ST_REFUNDED.equals(cur.status)) return;
+        if (!db.haveCollectExpired(hash)) db.logEvent(hash, SwapDb.EV_EXPIRED, "ETH", "", "confirmed on-chain");
+        db.setSwapStatus(hash, SwapDb.ST_REFUNDED);
+        ui.post(() -> { notifier.notify("Swap refunded", "Reclaimed your tokens"); notifier.onSwapsChanged(); });
+    }
+
+    /** The counterparty refunded the ETH leg I was to receive (I missed my claim window), so this swap failed
+     *  for me. Mark it terminal ONCE so checkEthContractFor stops re-polling it forever; my own first leg, if
+     *  any, refunds independently at its own timelock (that path is not gated on this status). */
+    private void finalizeEthLost(String hash) {
+        SwapDb.Swap cur = db.getSwap(hash);
+        if (cur == null || SwapDb.ST_ERROR.equals(cur.status) || SwapDb.ST_REFUNDED.equals(cur.status)
+                || SwapDb.ST_COMPLETE.equals(cur.status)) return;
+        db.setSwapStatus(hash, SwapDb.ST_ERROR);
+        ui.post(notifier::onSwapsChanged);
+    }
+
+    private boolean ethRetryDue(String key) { return nowUnix() - ethAttempt.getOrDefault(key, 0L) >= ETH_RETRY_SECS; }
+    private void markEthAttempt(String key) { ethAttempt.put(key, nowUnix()); }
+
+    /** Unix seconds from the CHAIN (latest block timestamp) for setting an ETH HTLC timelock — the clock the
+     *  vault enforces (F2). Falls back to the device clock only if the chain read fails. Safe ONLY for the
+     *  INITIATOR's first leg, where a fast clock merely makes that leg LONGER (the safe direction) and a slow
+     *  clock is independently rejected by the responder's own half-window gate. NOT for the counter-leg —
+     *  use {@link #ethChainNowStrict()} there. */
+    private long ethChainNow() {
+        try { return rpc.latestBlockTimestamp(); } catch (Exception e) { return nowUnix(); }
+    }
+
+    /** Chain time for the RESPONDER counter-leg — no device-clock fallback. Throws if the chain read fails so
+     *  the caller aborts the lock (retrying next cycle) rather than anchoring a fund-critical timelock to a
+     *  possibly-skewed phone clock. Also refuses a grossly implausible RPC timestamp (>24 h from the device
+     *  clock = a broken/hostile node or a broken device) — catches gross lies while tolerating any realistic
+     *  device skew (the returned value is always chain time; the device clock is only a sanity bound). */
+    private long ethChainNowStrict() throws java.io.IOException {
+        long chain = rpc.latestBlockTimestamp();
+        if (Math.abs(chain - nowUnix()) > 24L * 60 * 60)
+            throw new java.io.IOException("chain/device clock skew too large (" + (chain - nowUnix()) + "s) — not locking");
+        return chain;
     }
 
     /** Port of _checkCanCollectETHCoin: I am the receiver of an ETH HTLC contract. */
@@ -804,15 +889,10 @@ public final class SwapEngine {
                     return;
                 }
             }
-            if (db.haveCollect(hash) || !eth.canCollect(c.contractId) || !inflight.add("wdEth:" + hash)) return;
-            db.setSwapStatus(hash, SwapDb.ST_CLAIMING);   // counterparty leg found — claiming now
-            ui.post(notifier::onSwapsChanged);
-            try {
-                String txhash = eth.withdraw(c.contractId, secret);
-                db.logEvent(hash, SwapDb.EV_COLLECT, "ETH:" + c.tokenContract, "", txhash);
-                db.setSwapStatus(hash, SwapDb.ST_COMPLETE);
-                ui.post(() -> { notifier.notify("Swap complete", "Withdrew your tokens"); notifier.onSwapsChanged(); });
-            } finally { inflight.remove("wdEth:" + hash); }
+            if (!eth.canCollect(c.contractId)) return;   // already withdrawn/refunded on-chain
+            // F1: retryable broadcast; the terminal status is confirmed by checkEthContractFor via gc.withdrawn,
+            // never on this ack (a dropped withdraw must not read as COMPLETE).
+            broadcastEthWithdraw(eth, c.contractId, hash, secret);
             return;
         }
 
@@ -853,21 +933,6 @@ public final class SwapEngine {
     private void declineNote(String hash, String reason) {
         if (!incoming.contains(MinimaHtlc.normKey(hash)) || !declined.add(MinimaHtlc.normKey(hash))) return;
         ui.post(() -> notifier.notify("Buy request declined", reason));
-    }
-
-    private void checkExpiredEth(EthHtlc eth, EthHtlc.Contract c) {
-        try {
-            if (nowUnix() <= c.timelock) return;
-            if (db.haveCollectExpired(c.hashlock) || !eth.canCollect(c.contractId)) return;
-            if (!inflight.add("refundE:" + c.hashlock)) return;
-            try {
-                String txhash = eth.refund(c.contractId);
-                db.logEvent(c.hashlock, SwapDb.EV_EXPIRED, "ETH:" + c.tokenContract, "", txhash);
-                db.setSwapStatus(c.hashlock, SwapDb.ST_REFUNDED);
-                ui.post(() -> { notifier.notify("Swap refunded", "Timelock passed — reclaimed your tokens");
-                    notifier.onSwapsChanged(); });
-            } finally { inflight.remove("refundE:" + c.hashlock); }
-        } catch (Exception ignore) {}
     }
 
     /** Lock the MINIMA counter-leg for an ERC20→MINIMA swap I'm responding to (block+36). */
@@ -1104,7 +1169,15 @@ public final class SwapEngine {
 
     /** Blocking (user-initiated start): approve MAX if needed and wait until the allowance lands. */
     private void ensureAllowanceBlocking(EthHtlc eth, String token, BigInteger needed) throws Exception {
-        if (eth.allowance(token).compareTo(needed) >= 0) return;
+        BigInteger cur = eth.allowance(token);
+        if (cur.compareTo(needed) >= 0) return;
+        // F4: Tether reverts a non-zero → non-zero approve (require value==0 || allowed==0). A residual sub-MAX
+        // allowance — e.g. left by usdtSwap on the shared seed-derived wallet — must be zeroed first, or EVERY
+        // approve reverts and the swap can never start. A fresh wallet (cur==0) skips straight to the MAX approve.
+        if (cur.signum() > 0) {
+            eth.approve(token, BigInteger.ZERO);
+            for (int i = 0; i < 40 && eth.allowance(token).signum() != 0; i++) Thread.sleep(3000);
+        }
         eth.approve(token, MAX_UINT);
         for (int i = 0; i < 40; i++) {                                    // up to ~2 min
             Thread.sleep(3000);
@@ -1116,9 +1189,17 @@ public final class SwapEngine {
     /** Non-blocking (watcher auto-lock): if allowance is short, fire an approve and defer to a later cycle.
      *  Re-fires after a TTL so a dropped/failed approve doesn't strand the swap forever. */
     private boolean approveIfReady(EthHtlc eth, String token, BigInteger needed) throws Exception {
-        if (eth.allowance(token).compareTo(needed) >= 0) { approvePending.remove(token); return true; }
-        Long sent = approvePending.get(token);
+        BigInteger cur = eth.allowance(token);
+        if (cur.compareTo(needed) >= 0) { approvePending.remove(token); approvePending.remove(token + "|0"); return true; }
         long now = System.currentTimeMillis();
+        // F4: Tether can't go non-zero → non-zero. Zero a stale residual first (its own TTL key, so it doesn't
+        // rate-limit against the MAX approve); the next cycle, with cur==0, fires the MAX approve.
+        if (cur.signum() > 0) {
+            Long z = approvePending.get(token + "|0");
+            if (z == null || now - z > APPROVE_TTL_MS) { approvePending.put(token + "|0", now); eth.approve(token, BigInteger.ZERO); }
+            return false;
+        }
+        Long sent = approvePending.get(token);
         if (sent == null || now - sent > APPROVE_TTL_MS) { approvePending.put(token, now); eth.approve(token, MAX_UINT); }
         return false;
     }
