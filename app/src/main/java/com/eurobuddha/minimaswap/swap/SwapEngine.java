@@ -797,7 +797,7 @@ public final class SwapEngine {
         } else if (iAmSender) {
             if (gc.withdrawn) {
                 // The counterparty revealed the preimage IN the contract — read it directly (no eth_getLogs).
-                if (gc.preimage != null && EthRpc.hexToBig(gc.preimage).signum() != 0 && db.insertSecret(hash, gc.preimage)) {
+                if (gc.preimage != null && EthRpc.hexToBig(gc.preimage).signum() != 0 && MinimaHtlc.verifyPreimage(gc.preimage, hash) && db.insertSecret(hash, gc.preimage)) {
                     ui.post(() -> { notifier.notify("Secret revealed", "Claiming your side of the swap"); notifier.onSwapsChanged(); });
                 }
             } else if (gc.refunded) {
@@ -1182,6 +1182,7 @@ public final class SwapEngine {
             String secret = MinimaHtlc.stateAt(coin, 100);
             if (hash.isEmpty() || secret.isEmpty()) continue;
             if (db.getSwap(hash) == null) continue;                       // only my swaps
+            if (!MinimaHtlc.verifyPreimage(secret, hash)) continue;       // FUND-SAFETY: reject forged notify preimages (anyone-can-write sink)
             if (db.insertSecret(hash, secret)) changed = true;
         }
         if (changed) { notifier.notify("Secret revealed", "Claiming your side of the swap"); notifier.onSwapsChanged(); }

@@ -103,6 +103,24 @@ public final class MinimaHtlc {
         return s.startsWith("0X") ? s.substring(2) : s;
     }
 
+    /** FUND-SAFETY: verify a candidate preimage hashes (SHA-256) to the lock BEFORE it is pinned. The NOTIFY sink
+     *  is anyone-can-write and SwapDb.insertSecret is first-write-wins, so an unverified harvest lets a forged
+     *  preimage poison the secret store and permanently block MY claim (fund loss). SHA-256 over the preimage bytes
+     *  is byte-identical to the node's `random type:sha2` hashlock (verified). Returns true iff SHA-256(secret)==hash. */
+    public static boolean verifyPreimage(String secret, String hash) {
+        if (secret == null || hash == null || secret.isEmpty() || hash.isEmpty()) return false;
+        try {
+            String s = normKey(secret);                       // strip 0x, upper — hex nibbles only
+            if ((s.length() & 1) != 0) return false;
+            byte[] pre = new byte[s.length() / 2];
+            for (int i = 0; i < pre.length; i++) pre[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
+            byte[] dig = java.security.MessageDigest.getInstance("SHA-256").digest(pre);
+            StringBuilder sb = new StringBuilder(dig.length * 2);
+            for (byte b : dig) sb.append(String.format("%02X", b));
+            return sb.toString().equals(normKey(hash));
+        } catch (Exception e) { return false; }
+    }
+
     // ---- helpers ----
 
     public void currentBlock(BlockCb cb) {
