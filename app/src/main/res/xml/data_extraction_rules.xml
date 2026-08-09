@@ -1,19 +1,27 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample data extraction rules file; uncomment and customize as necessary.
-   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
-   for details.
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+   Android 12+ backup/transfer rules. Cloud backup AND device transfer (Smart Switch) are
+   governed separately — both are excluded.
+
+   NOTHING in this app may leave the device. allowBackup="false" already disables this, but the excludes are
+   explicit so the intent survives anyone flipping that flag back. What is at stake here:
+   the `secrets` table — HTLC claim preimages, i.e. spend-authorising material — and swap_addr/swap_pk,
+         the node-matched swap identity. A restore re-plants an identity a reseeded node cannot sign for
+         (this exact failure cost real funds in AtomiX, the sibling of this app)
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="external" path="." />
+        <exclude domain="root" path="." />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="external" path="." />
+        <exclude domain="root" path="." />
     </device-transfer>
-    -->
 </data-extraction-rules>

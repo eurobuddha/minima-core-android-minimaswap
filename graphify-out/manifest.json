@@ -1,0 +1,262 @@
+{
+  "app/build.gradle": {
+    "mtime": 1784316846.5292065,
+    "ast_hash": "543f2f05eea3a6ed108e010696f8a245",
+    "semantic_hash": "543f2f05eea3a6ed108e010696f8a245"
+  },
+  "app/src/main/java/com/eurobuddha/comms/Avatars.java": {
+    "mtime": 1783286966.1540952,
+    "ast_hash": "f0ee4fb86d0893e146e12096828c9df5",
+    "semantic_hash": "f0ee4fb86d0893e146e12096828c9df5"
+  },
+  "app/src/main/java/com/eurobuddha/comms/BackupCrypto.java": {
+    "mtime": 1783286966.1570764,
+    "ast_hash": "f990ec6e8293278bf6b5a20765e090a0",
+    "semantic_hash": "f990ec6e8293278bf6b5a20765e090a0"
+  },
+  "app/src/main/java/com/eurobuddha/comms/CommsIdentity.java": {
+    "mtime": 1783286966.1533422,
+    "ast_hash": "8ac269aa054892fd80b472adfc4697bb",
+    "semantic_hash": "8ac269aa054892fd80b472adfc4697bb"
+  },
+  "app/src/main/java/com/eurobuddha/comms/CommsScanner.java": {
+    "mtime": 1783286966.1519482,
+    "ast_hash": "20461d8b6933342b91ee4df9ea5a8087",
+    "semantic_hash": "20461d8b6933342b91ee4df9ea5a8087"
+  },
+  "app/src/main/java/com/eurobuddha/comms/CommsTransport.java": {
+    "mtime": 1783286966.158563,
+    "ast_hash": "e5f91cb0c8b1fd42f84f4e154292365c",
+    "semantic_hash": "e5f91cb0c8b1fd42f84f4e154292365c"
+  },
+  "app/src/main/java/com/eurobuddha/comms/CryptoProvider.java": {
+    "mtime": 1783286966.1581297,
+    "ast_hash": "b5386e1a7eb9f114ad1d06d027ffac07",
+    "semantic_hash": "b5386e1a7eb9f114ad1d06d027ffac07"
+  },
+  "app/src/main/java/com/eurobuddha/comms/Hex.java": {
+    "mtime": 1783286966.153724,
+    "ast_hash": "0aa68c2dd2a4ab9bf94bbb22adcaed01",
+    "semantic_hash": "0aa68c2dd2a4ab9bf94bbb22adcaed01"
+  },
+  "app/src/main/java/com/eurobuddha/comms/Hkdf.java": {
+    "mtime": 1783286966.1524372,
+    "ast_hash": "5d9856e8862faedbe8f9e9262a0e80d2",
+    "semantic_hash": "5d9856e8862faedbe8f9e9262a0e80d2"
+  },
+  "app/src/main/java/com/eurobuddha/comms/Images.java": {
+    "mtime": 1783286966.1564856,
+    "ast_hash": "6e58a0785ae6e08f622b66df79447925",
+    "semantic_hash": "6e58a0785ae6e08f622b66df79447925"
+  },
+  "app/src/main/java/com/eurobuddha/comms/LocalEcCryptoProvider.java": {
+    "mtime": 1783286966.1554484,
+    "ast_hash": "be4b85482386205c1eff15e0b7ca0edb",
+    "semantic_hash": "be4b85482386205c1eff15e0b7ca0edb"
+  },
+  "app/src/main/java/com/eurobuddha/comms/MailText.java": {
+    "mtime": 1783286966.1623514,
+    "ast_hash": "87ea4784adfb1a7389892e462e1359bd",
+    "semantic_hash": "87ea4784adfb1a7389892e462e1359bd"
+  },
+  "app/src/main/java/com/eurobuddha/comms/MerchDb.java": {
+    "mtime": 1783286966.1528218,
+    "ast_hash": "32922df72f35193701b08d7060a303da",
+    "semantic_hash": "32922df72f35193701b08d7060a303da"
+  },
+  "app/src/main/java/com/eurobuddha/comms/MerchMessage.java": {
+    "mtime": 1783286966.1548193,
+    "ast_hash": "2415ec747cf5321bf22e6d004b2ea681",
+    "semantic_hash": "2415ec747cf5321bf22e6d004b2ea681"
+  },
+  "app/src/main/java/com/eurobuddha/comms/NodeApi.java": {
+    "mtime": 1783464733.3232346,
+    "ast_hash": "de342f3f570aefad6afcb87c98b81489",
+    "semantic_hash": "de342f3f570aefad6afcb87c98b81489"
+  },
+  "app/src/main/java/com/eurobuddha/comms/Opened.java": {
+    "mtime": 1783286966.1604865,
+    "ast_hash": "c80559706199630f299f3ebd4e3cbe67",
+    "semantic_hash": "c80559706199630f299f3ebd4e3cbe67"
+  },
+  "app/src/main/java/com/eurobuddha/comms/QrUtil.java": {
+    "mtime": 1783286966.162869,
+    "ast_hash": "9247ce1c783f6bedf555f3428e81c11d",
+    "semantic_hash": "9247ce1c783f6bedf555f3428e81c11d"
+  },
+  "app/src/main/java/com/eurobuddha/comms/Sodium.java": {
+    "mtime": 1783286966.1559558,
+    "ast_hash": "6400264019f0bec3881fe6918254993f",
+    "semantic_hash": "6400264019f0bec3881fe6918254993f"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/BootReceiver.java": {
+    "mtime": 1783463204.3761961,
+    "ast_hash": "31f2fec42adaf7d8d12df1e10fa15fe7",
+    "semantic_hash": "31f2fec42adaf7d8d12df1e10fa15fe7"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/Design.java": {
+    "mtime": 1783286966.1349719,
+    "ast_hash": "88e8b2922414a85e634e8a154ad6964e",
+    "semantic_hash": "88e8b2922414a85e634e8a154ad6964e"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/HeartbeatReceiver.java": {
+    "mtime": 1783463151.2055843,
+    "ast_hash": "78ebefdccaf0cde5a2a2b0d057de144d",
+    "semantic_hash": "78ebefdccaf0cde5a2a2b0d057de144d"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/MainActivity.java": {
+    "mtime": 1783465365.8069224,
+    "ast_hash": "795ad46aa44a160078d1bcd5ef6c1af4",
+    "semantic_hash": "795ad46aa44a160078d1bcd5ef6c1af4"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/MarketChartView.java": {
+    "mtime": 1783286966.1472816,
+    "ast_hash": "dda9c0eb02ca2b414601b93606dff64e",
+    "semantic_hash": "dda9c0eb02ca2b414601b93606dff64e"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/PrefsMeta.java": {
+    "mtime": 1783286966.1478722,
+    "ast_hash": "b513f5ec9e0b6cb0e8204be9880810ad",
+    "semantic_hash": "b513f5ec9e0b6cb0e8204be9880810ad"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/SwapLog.java": {
+    "mtime": 1783462729.1836917,
+    "ast_hash": "244519e55036016ecd0d073bcf76b3c8",
+    "semantic_hash": "244519e55036016ecd0d073bcf76b3c8"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/SwapService.java": {
+    "mtime": 1783465378.938187,
+    "ast_hash": "bcb61943114151f0663caaa5171f4d80",
+    "semantic_hash": "bcb61943114151f0663caaa5171f4d80"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/SwapWorker.java": {
+    "mtime": 1783286966.1515236,
+    "ast_hash": "a71abc0f2c224f63667f76186eb0c56b",
+    "semantic_hash": "a71abc0f2c224f63667f76186eb0c56b"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/Util.java": {
+    "mtime": 1783286966.1356223,
+    "ast_hash": "f1aa320f13a885340e3f8a7e9106edd2",
+    "semantic_hash": "f1aa320f13a885340e3f8a7e9106edd2"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/eth/EthHtlc.java": {
+    "mtime": 1784316532.130042,
+    "ast_hash": "e86272f33f84bd79b72d73d85a016520",
+    "semantic_hash": "e86272f33f84bd79b72d73d85a016520"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/eth/EthNet.java": {
+    "mtime": 1783286966.1484585,
+    "ast_hash": "8fd86f45ee0fb9a0c7704fb5e1eb7269",
+    "semantic_hash": "8fd86f45ee0fb9a0c7704fb5e1eb7269"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/eth/EthRpc.java": {
+    "mtime": 1784315580.0935316,
+    "ast_hash": "3beb5a3418e2e6d5da0a731742718e04",
+    "semantic_hash": "3beb5a3418e2e6d5da0a731742718e04"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/eth/EthTx.java": {
+    "mtime": 1784315598.6112635,
+    "ast_hash": "422c6f86352974eac2e487f6de45e1c6",
+    "semantic_hash": "422c6f86352974eac2e487f6de45e1c6"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/eth/EthWallet.java": {
+    "mtime": 1783286966.150295,
+    "ast_hash": "546be95558579c416831ceee4c485412",
+    "semantic_hash": "546be95558579c416831ceee4c485412"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/swap/MarketCollector.java": {
+    "mtime": 1783286966.1428533,
+    "ast_hash": "1f7f6f62cc79a5d5670f3c97d0b7df3c",
+    "semantic_hash": "1f7f6f62cc79a5d5670f3c97d0b7df3c"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/swap/MinimaHtlc.java": {
+    "mtime": 1784623476.5903013,
+    "ast_hash": "296c372cef443825634e2678665ad98e",
+    "semantic_hash": "296c372cef443825634e2678665ad98e"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/swap/Order.java": {
+    "mtime": 1783286966.1372783,
+    "ast_hash": "ab736b91e1d12a347312888054b6cf6f",
+    "semantic_hash": "ab736b91e1d12a347312888054b6cf6f"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/swap/OtcBook.java": {
+    "mtime": 1783286966.145529,
+    "ast_hash": "b83ec9e0d96bbceb11be9690ed7feb3c",
+    "semantic_hash": "b83ec9e0d96bbceb11be9690ed7feb3c"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/swap/OtcController.java": {
+    "mtime": 1783286966.1387458,
+    "ast_hash": "e03e1c49271e3b1894309f05666429e5",
+    "semantic_hash": "e03e1c49271e3b1894309f05666429e5"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/swap/OtcDb.java": {
+    "mtime": 1783286966.1408992,
+    "ast_hash": "3294a9268f59b098b71d75c5917324ec",
+    "semantic_hash": "3294a9268f59b098b71d75c5917324ec"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/swap/OtcMessage.java": {
+    "mtime": 1783286966.1365948,
+    "ast_hash": "a422b3cdba26909f7e999a500464a9e4",
+    "semantic_hash": "a422b3cdba26909f7e999a500464a9e4"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/swap/OtcOffer.java": {
+    "mtime": 1783286966.1404526,
+    "ast_hash": "544ba184fc2691c81bbd1aae7507829a",
+    "semantic_hash": "544ba184fc2691c81bbd1aae7507829a"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/swap/PriceOracle.java": {
+    "mtime": 1783412875.8196874,
+    "ast_hash": "43ae833e019dfa1c7c02fa0e531cda74",
+    "semantic_hash": "43ae833e019dfa1c7c02fa0e531cda74"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/swap/PublishGate.java": {
+    "mtime": 1783462737.3487976,
+    "ast_hash": "94889e2fd32cdb789ce4352b626a4cc9",
+    "semantic_hash": "94889e2fd32cdb789ce4352b626a4cc9"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/swap/SwapDb.java": {
+    "mtime": 1783286966.1415792,
+    "ast_hash": "0a008671164763ba3808f46fff042b59",
+    "semantic_hash": "0a008671164763ba3808f46fff042b59"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/swap/SwapEngine.java": {
+    "mtime": 1784623495.1724918,
+    "ast_hash": "ba4be1897cf141c4b321e710ba7e1ad7",
+    "semantic_hash": "ba4be1897cf141c4b321e710ba7e1ad7"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/swap/SwapOrderBook.java": {
+    "mtime": 1783286966.1434233,
+    "ast_hash": "171eb2a0105efbeb46080eea4da50088",
+    "semantic_hash": "171eb2a0105efbeb46080eea4da50088"
+  },
+  "app/src/main/java/com/eurobuddha/minimaswap/swap/SwapTake.java": {
+    "mtime": 1783286966.1379766,
+    "ast_hash": "ed64ab888ff19e149aa26114831a3db3",
+    "semantic_hash": "ed64ab888ff19e149aa26114831a3db3"
+  },
+  "app/src/test/java/com/eurobuddha/minimaswap/eth/EthEncodingTest.java": {
+    "mtime": 1784317025.170475,
+    "ast_hash": "917431313a755b8163f150febe36453a",
+    "semantic_hash": "917431313a755b8163f150febe36453a"
+  },
+  "app/src/test/java/com/eurobuddha/minimaswap/swap/TimelockSafetyTest.java": {
+    "mtime": 1784317000.0795615,
+    "ast_hash": "f9820053900b8667d1e43443f7eb187d",
+    "semantic_hash": "f9820053900b8667d1e43443f7eb187d"
+  },
+  "build.gradle": {
+    "mtime": 1782745692.3152862,
+    "ast_hash": "583193a3771192898c84ddef2d926224",
+    "semantic_hash": "583193a3771192898c84ddef2d926224"
+  },
+  "gradlew": {
+    "mtime": 1782745692.3148282,
+    "ast_hash": "02c16663c6f0aa37f98d94d698c22b8c",
+    "semantic_hash": "02c16663c6f0aa37f98d94d698c22b8c"
+  },
+  "settings.gradle": {
+    "mtime": 1783286978.3347213,
+    "ast_hash": "b1b7f812ae3bad76862ebb9b32fe93b2",
+    "semantic_hash": "b1b7f812ae3bad76862ebb9b32fe93b2"
+  }
+}
