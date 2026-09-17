@@ -220,7 +220,10 @@ public final class MinimaHtlc {
     public void myFreeCoins(Consumer<org.json.JSONArray> ok, Consumer<String> err) {
         // coinage:1 → confirmed coins only, matching splitCoins' coinage:1 inputs: the target we compute here is
         // always fundable by the split, so it never fails insufficient-funds on freshly-received (coinage:0) coins.
-        cmd("coins relevant:true sendable:true tokenid:0x00 coinage:1", r -> {
+        // checkmempool:true — as the AtomiX APK's myFreeCoins already does. Without it a coin committed to an
+        // unconfirmed transaction is still counted as free, so the split decision can read "enough free coins"
+        // while they are all in flight and the lock then fails funding. `coins` defaults checkmempool:false.
+        cmd("coins relevant:true sendable:true checkmempool:true tokenid:0x00 coinage:1", r -> {
             Object resp = r.opt("response");
             ok.accept(resp instanceof org.json.JSONArray ? (org.json.JSONArray) resp : new org.json.JSONArray());
         }, err);
