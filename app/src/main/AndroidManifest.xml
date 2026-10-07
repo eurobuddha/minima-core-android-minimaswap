@@ -5,7 +5,7 @@
     <!-- Minima data comes from the local node over broadcast-Intent IPC. Package visibility lets us
          launch the node app + deliver targeted broadcasts. -->
     <queries>
-        <package android:name="org.minimarex.minimacore" />
+        <package android:name="com.eurobuddha.minimacore" />
     </queries>
 
     <!-- Unlike the node-only merch apps, minimaSwap also talks to the Ethereum network directly
