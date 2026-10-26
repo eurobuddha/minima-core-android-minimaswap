@@ -1,5 +1,6 @@
 package com.eurobuddha.minimaswap;
 
+import com.eurobuddha.minimaapi.MinimaAPI;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -581,9 +582,7 @@ public class SwapService extends Service {
         if (nm == null) return;
         // A background service can't launch another app's Activity on Android 10+ — the notification tap
         // IS the legal cross-app launch path (user-initiated PendingIntent).
-        Intent launch = getPackageManager().getLaunchIntentForPackage("com.eurobuddha.minimacore");
-        if (launch == null) launch = getPackageManager().getLaunchIntentForPackage("com.eurobuddha.minimablock");
-        if (launch == null) launch = getPackageManager().getLaunchIntentForPackage("com.eurobuddha.pandamonium");
+        Intent launch = MinimaAPI.launchNode(this);
         android.app.PendingIntent pi = android.app.PendingIntent.getActivity(this, 13,
                 launch != null ? launch : new Intent(this, MainActivity.class),
                 android.app.PendingIntent.FLAG_UPDATE_CURRENT | android.app.PendingIntent.FLAG_IMMUTABLE);
